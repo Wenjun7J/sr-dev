@@ -1,0 +1,215 @@
+#!/bin/bash
+# sr —— 宿主机唯一入口。单容器编所有版本：
+#   版本差异全靠"指路"，容器永不重建（重建会杀掉 scheduler，农场就断了）：
+#     thirdparty  公共目录 $SR_TPDIR/<digest>/ 整体挂成 /tp，编译时 bind 到规范路径，用哪个由 STARROCKS_THIRDPARTY 指
+#     编译器      镜像里备齐 gcc 11/12/13/14，用哪个由 STARROCKS_GCC_HOME 指
+#   镜像由用户显式指定（-v），不自动推断也不自动更新——上游镜像往前走时，
+#   你的代码可能还停在老 commit，跟进会把编译搞坏。
+set -uo pipefail
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# 站点相关的东西（registry、base 镜像、apt 源、公共依赖目录、节点账号）全在 srdev.conf 里，
+# 该文件不进仓库；容器内挂成 /etc/srdev.conf 给 sr-farm 用。模板见 srdev.conf.example。
+CONF_FILE=${SR_CONF:-$HERE/srdev.conf}; [ -f "$CONF_FILE" ] && . "$CONF_FILE"
+CONF=${SR_REGISTRIES:-$HERE/registries.conf}
+BASE=${BASE:-$HOME}
+WORK=${WORK:-$HOME}
+CPUS=${CPUS:-16}
+MEM=${MEM:-48g}
+SR_USER=${SR_USER:-$(id -un)}
+SLICE=${SLICE:-srfarm_${SR_USER}.slice}   # 名字必须用下划线：systemd 把 a-b.slice 当成 a.slice 的子节点
+NAME=${SR_USER}_farm
+IMG=${IMG:-sr-dev:single}
+# 依赖按 digest 存，内容不可变、与用户无关——放公共目录全机共享，别人拉过的你不用再拉。
+# 公共目录不可写时退回自己 $HOME 下。
+SHARED_TP=${SR_TPDIR:-/srv/srdev/thirdparty}
+if mkdir -p "$SHARED_TP" 2>/dev/null && [ -w "$SHARED_TP" ]; then TPDIR=$SHARED_TP; else TPDIR=$BASE/thirdparty; fi
+
+SPEC=""; ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in -v|--version|-p|--profile) SPEC=$2; shift 2;; *) ARGS+=("$1"); shift;; esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+ns_url(){ [ -f "$CONF" ] || { echo "!! 缺少 $CONF：cp registries.conf.example registries.conf 并填上你的 registry" >&2; return 1; }
+  awk -v n="$1" '!/^#/&&$1==n{print $2}' "$CONF"; }
+tags_of(){ local ns=$1 u c; u=$(ns_url "$ns"); [ -n "$u" ] || return 1
+  c=$BASE/farm/tagcache/$ns.txt; mkdir -p "$(dirname "$c")" 2>/dev/null
+  if [ ! -f "$c" ] || [ $(( $(date +%s) - $(stat -c %Y "$c" 2>/dev/null || echo 0) )) -gt 3600 ]; then
+    curl -s --max-time 10 "http://${u%%/*}/v2/${u#*/}/tags/list" 2>/dev/null \
+      | tr ',' '\n' | grep -oE '"[^"]+"' | tr -d '"' | grep -vE '^(name|tags)$' > "$c.tmp" 2>/dev/null
+    [ -s "$c.tmp" ] && mv "$c.tmp" "$c" || rm -f "$c.tmp"
+  fi
+  cat "$c" 2>/dev/null; }
+pick_tag(){ local ns=$1 v=$2 t c; t=$(tags_of "$ns") || return 1
+  for c in "$v" "$v-latest" "$v-ee" "$v-ee-latest"; do
+    printf '%s\n' "$t" | grep -qx -- "$c" && { echo "$c"; return 0; }; done
+  c=$(printf '%s\n' "$t" | grep -E "^${v}-[0-9]{8}$" | sort -r | head -1)
+  [ -n "$c" ] && { echo "$c"; return 0; }; return 1; }
+resolve(){ local v=$1 n
+  case "$v" in *:*) n=${v%%:*}; v=${v#*:}
+      TAG=$(pick_tag "$n" "$v") || return 1; NS=$n; PBASE="$(ns_url "$n"):$TAG"; return 0 ;; esac
+  for n in $(awk '!/^#/&&NF{print $1}' "$CONF"); do
+    TAG=$(pick_tag "$n" "$v" 2>/dev/null) && { NS=$n; PBASE="$(ns_url "$n"):$TAG"; return 0; }
+  done; return 1; }
+# 不 pull 就能拿到内容指纹（实测 ~50ms）。用 digest 当目录名：上游重推同名 tag 也认得出来。
+digest_of(){ local img=$1 h repo tag
+  h=${img%%/*}; repo=$(echo "${img#*/}" | cut -d: -f1); tag=${img##*:}
+  curl -sI --max-time 10 -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+    "http://$h/v2/$repo/manifests/$tag" 2>/dev/null \
+    | grep -i '^docker-content-digest:' | tr -d '\r' | awk '{print $2}' | cut -d: -f2 | cut -c1-12; }
+
+running(){ [ "$(docker inspect -f '{{.State.Running}}' $NAME 2>/dev/null)" = true ]; }
+TTY=(); [ -t 0 ] && [ -t 1 ] && TTY=(-it)
+
+ensure_container(){
+  running && return 0
+  docker image inspect $IMG >/dev/null 2>&1 || { echo "!! 镜像 $IMG 还没建，先跑: sr image"; return 1; }
+  mkdir -p $BASE/ccache $BASE/m2 $BASE/farm $BASE/.tsp $BASE/iceccrun $TPDIR
+  chmod 777 $BASE/farm 2>/dev/null; chmod 777 $BASE/iceccrun 2>/dev/null || true
+  local CGP=() CONF_MOUNT=()
+  [ -f "$CONF_FILE" ] && CONF_MOUNT=(-v "$CONF_FILE":/etc/srdev.conf:ro)
+  if [ -n "$SLICE" ] && command -v systemctl >/dev/null; then
+    sudo -n systemctl set-property --runtime "$SLICE" "CPUQuota=$((CPUS*100))%" \
+      "MemoryMax=$(echo "$MEM" | tr 'gmk' 'GMK')" >/dev/null 2>&1 && CGP=(--cgroup-parent "$SLICE")
+  fi
+  docker rm -f $NAME >/dev/null 2>&1
+  # --init: tini 当 PID1 回收僵尸。否则被杀的 iceccd 留成 <defunct>，探活会误判 daemon 还在，
+  # icecc 随即绕过并发闸门无限制本地编译 -> OOM（踩过）
+  docker run -d --name $NAME --init --network host --privileged \
+    ${CGP[@]+"${CGP[@]}"} --cpus=$CPUS --memory=$MEM \
+    -v $WORK:$WORK -v $BASE/ccache:/ccache -v $BASE/m2:/root/.m2 \
+    -v $BASE/farm:/farm -v $BASE/.tsp:/root/.tsp -v $BASE/iceccrun:/var/run/icecc \
+    -v $TPDIR:/tp ${CONF_MOUNT[@]+"${CONF_MOUNT[@]}"} \
+    -e SR_USER="$SR_USER" -e SR_UID="$(id -u)" -w $WORK $IMG sleep infinity >/dev/null
+  echo "== 容器 $NAME 已启动（单容器，编所有版本；限额 ${CPUS}核/${MEM}）"
+  # 看门狗随容器死。容器重建后若已有农场，必须立刻把它拉回来——否则 3 小时无续约，
+  # 死人开关会把农场释放（踩过：一天里反复重建容器，农场被自己的保护机制清掉了）
+  [ -f "$BASE/farm/state.env" ] && docker exec $NAME sr-farm _wd >/dev/null 2>&1 && echo "   看门狗已重新拉起（农场续约恢复）"
+}
+
+# 把某个官方镜像的 thirdparty 拉到 $TPDIR/<digest>/，并记下它要哪个 gcc
+ensure_tp(){   # $1=官方镜像全名  $2=digest
+  local img=$1 dg=$2
+  local d=$TPDIR/$dg
+  if [ -f "$d/.ready" ]; then echo "$dg"; return 0; fi
+  echo "== 首次使用该镜像的依赖，拉取中（约 7 秒，6~8G）…" >&2
+  docker image inspect "$img" >/dev/null 2>&1 || { echo "   拉镜像 $img …" >&2; docker pull -q "$img" >/dev/null 2>&1; }
+  # 多用户可能同时拉同一 digest：flock 串行，先拷到 .tmp 再原子 mv，别人永远看不到半成品
+  # 锁文件要能被所有用户打开：A 建的 644 文件 B 打不开写就 flock 不了。建成 666，打不开写就以只读 fd 上锁
+  local lk="$TPDIR/.lock.$dg"; ( umask 000; : >>"$lk" ) 2>/dev/null; chmod 666 "$lk" 2>/dev/null
+  exec 7<>"$lk" 2>/dev/null || exec 7<"$lk"; flock 7
+  if [ -f "$d/.ready" ]; then echo "$dg"; return 0; fi   # 等锁期间别人拷完了
+  local t="$d.tmp.$$"; rm -rf "$t" "$d" 2>/dev/null; mkdir -p "$t/installed"
+  # 布局必须是 <dir>/installed/...：build.sh 检查 $STARROCKS_THIRDPARTY/installed/llvm/lib/libLLVMInstCombine.a，
+  # 找不到就会去跑 build-thirdparty.sh 现场编（踩过：平铺后 rc=127）
+  # 用 docker run 而不是 docker cp：实测 7s vs 18s，docker cp 要把 6.6G 序列化成 tar 流过 daemon
+  docker run --rm -v "$t/installed":/dst "$img" cp -a /var/local/thirdparty/installed/. /dst/ >/dev/null 2>&1 || {
+    echo "!! 依赖拉取失败" >&2; rm -rf "$t"; return 1; }
+  # 记下这个镜像用哪个 gcc 大版本，编译时据此选 /opt/gccNN
+  local gv
+  gv=$(docker run --rm "$img" bash -c 'G=$(ls -d /opt/gcc-toolset-*/bin/gcc 2>/dev/null|sort -V|tail -1); [ -n "$G" ]||G=$(command -v gcc); $G -dumpversion' 2>/dev/null)
+  docker run --rm -v "$t":/dst "$img" bash -c "echo ${gv:-14} > /dst/.gccmajor; echo $img > /dst/.image; chmod -R a+rX /dst; touch /dst/.ready" >/dev/null 2>&1
+  mv "$t" "$d" && echo "$dg"; }
+
+case "${1:-}" in
+image)
+  echo "== 构建单镜像 $IMG（base=${SR_BASE_IMAGE:-Dockerfile 默认}，装 gcc 11/12/13 + 各自的 icecc 工具链包）…"
+  BA=(--build-arg APT_MIRROR="${SR_APT_MIRROR:-}"); [ -n "${SR_BASE_IMAGE:-}" ] && BA+=(--build-arg BASE="$SR_BASE_IMAGE")
+  docker build -f "$HERE/Dockerfile" "${BA[@]}" -t $IMG "$HERE" ;;
+up)      ensure_container ;;
+down)    docker rm -f $NAME >/dev/null 2>&1; echo "容器已删除（挂载卷保留）" ;;
+shell)   ensure_container && docker exec -it $NAME bash -l ;;
+history|log)
+  F=$BASE/farm/builds.tsv
+  [ -f "$F" ] || { echo "还没有编译记录"; exit 0; }
+  printf "%-16s %-8s %-22s %-14s %-6s %-5s %-4s %-7s %-6s %s\n" 时间 用户 源码树@分支 版本 模式 边数 rc 用时 anon峰 命中/编译
+  tail -n "${2:-20}" "$F" | awk -F"\t" '{printf "%-16s %-8s %-22s %-14s %-6s %-5s %-4s %-7s %-6s %s\n",$1,$2,substr($3,1,22),$4,$5,$6,$7,$8,$9,$10}' ;;
+tp)
+  echo "依赖目录: $TPDIR $([ "$TPDIR" = "$SHARED_TP" ] && echo "（全机共享）" || echo "（个人）")"
+  printf "%-14s %-8s %-7s %s\n" DIGEST GCC 大小 状态
+  for d in $TPDIR/*/; do [ -d "$d" ] || continue
+    printf "%-14s %-8s %-7s %s\n" "$(basename $d)" "$(cat $d/.gccmajor 2>/dev/null || echo ?)" \
+      "$(du -sh $d 2>/dev/null|cut -f1)" "$([ -f $d/.ready ] && echo 就绪 || echo 不完整)"
+  done ;;
+versions)
+  for n in $(awk '!/^#/&&NF{print $1}' "$CONF"); do
+    echo "[$n] $(ns_url "$n")"
+    tags_of "$n" | grep -E '^(main|[0-9]+\.[0-9]+)' | sort -Vr | head -12 | paste -sd' ' - | fold -sw 110 | sed 's/^/  /'
+  done ;;
+""|-h|--help|help) cat <<U
+用法: sr [-v <版本>] <子命令>
+  首次: cp srdev.conf.example srdev.conf; cp registries.conf.example registries.conf; 填好后 sr image
+
+  image              建单镜像（一次性，装齐各版本 gcc）
+  up                 起容器（单个，编所有版本，永不因换版本而重建）
+  build [目录] [选项] 编译。首次需 -v 指定用哪个官方镜像的依赖
+  farm {init|status|resume|suspend|down}
+  tp                 列出已拉下来的各版本依赖（全机共享目录）
+  history [N]        最近 N 次编译概况（默认 20）
+  versions           列出 registry 里可用的版本
+  shell / down
+
+版本用 -v 显式指定，例：sr -v main build   sr -v 4.1 build   sr -v 3.5.20 build
+指定一次后这棵源码树的这个分支会记住；上游镜像更新不会自动跟进
+（你的代码可能还没 rebase，跟进会把编译搞坏），要跟进用 -v 重新指定。
+U
+;;
+*)
+  ensure_container || exit 1
+  sub=$1; shift
+  case "$sub" in
+    build)
+      # 版本记忆：按「源码树 + 分支」记，切分支要重新指定
+      root_of(){ local d=$PWD; while [ "$d" != / ]; do
+          [ -f "$d/build.sh" ] && [ -d "$d/be/src" ] && { echo "$d"; return 0; }; d=$(dirname "$d"); done; return 1; }
+      WROOT=$(root_of || true); PDIR=$BASE/farm/versions; KEY=""
+      if [ -n "$WROOT" ]; then
+        BR=$(git -C "$WROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo ?)
+        [ "$BR" = HEAD ] && BR=$(git -C "$WROOT" describe --tags --abbrev=0 2>/dev/null || echo HEAD)
+        KEY=$(printf %s "$WROOT@$BR" | md5sum | cut -c1-12)
+      fi
+      if [ -z "$SPEC" ] && [ -n "$KEY" ] && [ -f "$PDIR/$KEY" ]; then
+        SPEC=$(cut -d' ' -f1 "$PDIR/$KEY")
+        echo "(依赖=$SPEC · $(basename "${WROOT:-?}")@${BR:-?}，你之前指定过；换用 -v)" >&2
+      fi
+      [ -n "$SPEC" ] || { echo "!! 首次编译需指定用哪个官方镜像的依赖，例: sr -v main build"
+                          echo "   sr versions 看可选版本"; exit 1; }
+      resolve "$SPEC" || { echo "!! 找不到版本 $SPEC，sr versions 看可选项"; exit 1; }
+      DG=$(digest_of "$PBASE"); [ -n "$DG" ] || { echo "!! 拿不到 $PBASE 的 digest"; exit 1; }
+      echo "   依赖镜像 $PBASE  digest=$DG"
+      # 要拉依赖 = 这个 digest 第一次用 = 必然全量重编 = 必然要农场。农场若在睡，
+      # 现在就后台唤醒（29s），和拉依赖（7s）+ configure 并行，不用等到编译开始再叫醒它。
+      if [ ! -f "$TPDIR/$DG/.ready" ] && grep -q '^FARM_STATUS=suspended' "$BASE/farm/state.env" 2>/dev/null; then
+        echo "   农场休眠中且需拉依赖 → 后台先唤醒，与拉取并行"
+        docker exec -d $NAME sr-farm resume >/dev/null 2>&1
+      fi
+      # 自动跟随上游最新镜像（加依赖不会破坏老代码）；但 digest 变了要提醒——
+      # 如果是依赖升级而你的代码还没 rebase，编译可能会挂，这时该 rebase 而不是怪工具
+      if [ -n "$KEY" ] && [ -f "$PDIR/$KEY" ]; then
+        OLD_DG=$(cut -d' ' -f2 "$PDIR/$KEY" 2>/dev/null)
+        if [ -n "$OLD_DG" ] && [ "$OLD_DG" != "$DG" ]; then
+          echo "   注意：上游 $SPEC 的依赖镜像已更新（$OLD_DG -> $DG），本次用新的。"
+          echo "         若编译报依赖相关错误，先把代码 rebase 到最新再试。"
+        fi
+      fi
+      ensure_tp "$PBASE" "$DG" >/dev/null || exit 1
+      GMAJ=$(cat "$TPDIR/$DG/.gccmajor" 2>/dev/null | cut -d. -f1); GMAJ=${GMAJ:-14}
+      GHOME=/opt/gcc$GMAJ
+      [ "$GMAJ" = 14 ] && GHOME=$(docker exec $NAME bash -c 'ls -d /opt/gcc-toolset-14 2>/dev/null || echo /opt/gcc13')
+      [ -n "$KEY" ] && { mkdir -p "$PDIR" 2>/dev/null; echo "$SPEC $DG" > "$PDIR/$KEY"; }
+      # 每次编译进自己的私有 mount namespace，把该版本的依赖 bind 到规范路径 /var/local/thirdparty。
+      # 不能改路径挂成 /tp/<digest> 直接用：CMakeCache 会把首次 configure 找到的 FILEPATH 缓存成
+      # /var/local/thirdparty/...，之后不再重找（踩过：toolchains base 上 libcurl.a 找不到；dev-env base 上
+      # 则静默链到内置的 main 依赖）。规范路径 + 私有 ns：路径永不变、版本互不干扰、并发各用各的。
+      # 可选透传：CCACHE_REMOTE_STORAGE(ccache 远端存储 URL) / SR_CCACHE_DIR(换一个缓存目录做对照实验)
+      XENV=(); for v in CCACHE_REMOTE_STORAGE SR_CCACHE_DIR; do [ -n "${!v:-}" ] && XENV+=(-e "$v"); done
+      docker exec -w "$PWD" \
+        -e STARROCKS_THIRDPARTY=/var/local/thirdparty -e STARROCKS_GCC_HOME="$GHOME" -e SR_TPDIGEST="$DG" -e SR_VER="$SPEC" -e SR_BRANCH="${BR:-?}" \
+        "${XENV[@]}" "${TTY[@]}" $NAME unshare -m --propagation private sh -c \
+          'mount --bind "/tp/$0/installed" /var/local/thirdparty/installed && exec sr-build "$@"' "$DG" "$@" ;;
+    farm) docker exec "${TTY[@]}" $NAME sr-farm "$@" ;;
+    *) if docker exec $NAME sh -c "command -v \"\$1\"" _ "$sub" >/dev/null 2>&1; then
+         docker exec "${TTY[@]}" $NAME "$sub" "$@"
+       else echo "未知子命令: $sub"; exec "$0" --help; fi ;;
+  esac ;;
+esac

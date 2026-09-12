@@ -1,0 +1,5 @@
+# 站点配置：registry 地址、节点账号密码等，只在本机
+srdev.conf
+registries.conf
+*.log
+.DS_Store

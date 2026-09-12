@@ -1,0 +1,21 @@
+# srdev 站点配置。复制为 srdev.conf 按环境填写；srdev.conf 在 .gitignore 里，不要提交。
+# 宿主机的 sr 直接 source 它；容器内以 /etc/srdev.conf 只读挂入，sr-farm 读同一份。
+
+## 镜像来源
+SR_BASE_IMAGE=REGISTRY_HOST:5000/starrocks/toolchains-ubuntu:main-20260707   # sr image 的 base：官方 toolchains 镜像（不是 dev-env）
+SR_APT_MIRROR=                     # 建镜像/装节点时替换 archive.ubuntu.com 的源，如 mirrors.cloud.aliyuncs.com；留空不换
+#SR_REGISTRIES=/path/to/registries.conf   # 版本号解析表，默认与 sr 同目录的 registries.conf
+
+## 宿主机
+SR_TPDIR=/srv/srdev/thirdparty     # 各版本 thirdparty 的公共目录（按 digest 存、全机共享）；不可写时退回 ~/thirdparty
+#CPUS=16                           # 容器 CPU 限额
+#MEM=48g                           # 容器内存限额
+#IMG=sr-dev:single                 # 镜像名
+
+## 编译农场（sr farm init 申请的云上节点）
+SR_NODE_USER=sr                    # 节点上的 ssh 用户
+SR_NODE_PASSWORD=                  # 节点初始密码，仅首次铺 ssh 密钥用；之后全走专用密钥 ~/farm/ssh/id_farm
+WORKERS=5                          # worker 台数
+ITYPE=8c32g                        # 节点规格（平台侧的名字）
+#TSP_REGION=cn-zhangjiakou         # 平台申请参数
+#TSP_CSP=aliyun

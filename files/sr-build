@@ -1,0 +1,361 @@
+#!/bin/bash
+# sr-build —— StarRocks BE 加速编译驱动（容器内使用）
+#   本地 ninja + ccache 为默认；农场可用且重编规模够大时自动外发。
+#   所有默认值来自 2026-09 的实测，见 --why。
+set -uo pipefail
+
+# 源码树跟着当前目录走：从 $PWD 逐级上溯找 StarRocks 根（build.sh + env.sh + be/src）。
+# 这台机上有 20+ 个 worktree，写死一个路径等于每次都编错仓库。
+find_root(){ local d=$PWD
+  while [ "$d" != / ]; do
+    [ -f "$d/build.sh" ] && [ -f "$d/env.sh" ] && [ -d "$d/be/src" ] && { echo "$d"; return 0; }
+    d=$(dirname "$d")
+  done; return 1; }
+FARM_STATE=${FARM_STATE:-/farm/state.env}
+# 锁按源码树分，且放共享卷 /farm（不是容器内 /tmp，那样多 profile 容器互相看不见）。
+# 同一棵树必须串行：gensrc 产物是共享的，并发会互相覆盖。
+# 不同树可以并行：真正的并发闸门是全机单例 iceccd 的 -m 16，不管几个任务在跑，
+# 本机同时编译的 cc1plus 都不会超过 16 个，scheduler 会把其余的派到农场。
+LOCK=""   # 源码树定下来之后才能算，见下
+
+BT=Debug ; DIST=auto ; JAVAEXT=1 ; CLEAN=0 ; GEN=ninja ; JLOCAL=16 ; VERBOSE=0 ; CACHE=1
+TARGET=be   # be | fe | all
+usage(){ cat <<'U'
+用法: sr-build [源码目录] [选项] [-- 透传给 build.sh 的参数]
+  不给源码目录就从当前目录上溯找 StarRocks 根
+  --be | --fe | --all            编译目标（默认 be；fe 走原生 maven 逻辑）
+  --debug | --release | --asan   构建类型（默认 debug，仅对 be 生效）
+  --dist auto|on|off             是否用编译农场（默认 auto）
+  --no-java-ext                  跳过 java-extensions（默认构建，仅约 6 秒）
+  --clean                        清空该类型的构建树后重建
+  --make                         回退到 Unix Makefiles（默认 ninja）
+  --no-ccache                    绕过 ccache（仅用于做纯编译计时对比）
+  -j N                           本地并发（默认 16）
+  --why                          打印各默认值背后的实测依据
+U
+}
+why(){ cat <<'W'
+默认值的实测依据（StarRocks main@f2cedbb2c2f，16 核封顶开发机，机内对比）:
+  ninja 而非 make      : 全量 2768s -> 1933s (1.43x)，CPU 利用率 56% -> 84%
+  ccache sloppiness    : BE 开 WITH_PCH=ON，默认令 78.4% 的编译绕过缓存；
+                         解开后回退/切分支场景 1825s -> 392s (4.66x)
+  本地 -j16            : 共享机约束；峰值内存 28.3GB(Debug) / 32.7GB(ASAN)
+  分布式并发自适应     : worker数×8 + 本地16。写死 48 会在 worker 变化时吃亏
+                         纯本地 -j16 1308s -> 4 worker 778s(1.68x) -> 5 worker 678s(1.93x)
+  scheduler 放本容器   : 它只占 3.2MB/0.5%CPU（预处理源码和产物都是 client<->worker 直连，
+                         不过它），省下的那台机当 worker，32->40 核，快 14.8%
+  农场异步唤醒         : 不等那 29 秒，直接按满并发开工，后台边编边判断要不要唤醒；
+                         轮询累计 ccache miss，攒够 8 次才唤醒（全命中的编译不吵醒农场）
+  客户端 iceccd -m 16  : 预处理只占编译成本 8.8%，无需为它留核；
+                         压到 -m4 实测反而慢 44% (820s -> 1180s)
+  --dist auto 阈值     : 农场醒着 >50 条边；睡着 >150 条边(唤醒需 29 秒)
+                         实测改 1 个 TU 走农场亏 1.9%，改 377 个赚 45%
+  默认建 java-extensions: 热 .m2 下仅 5.8 秒，而跳过会导致
+                         output/be/lib/jni-packages 缺 jar，Hive/Iceberg 等连接器运行时失败
+W
+}
+PASS=(); SRARG=""
+while [ $# -gt 0 ]; do case "$1" in
+  --be) TARGET=be; shift;; --fe) TARGET=fe; shift;; --all) TARGET=all; shift;;
+  --debug) BT=Debug; shift;; --release) BT=Release; shift;; --asan) BT=ASAN; shift;;
+  --dist) DIST=$2; shift 2;; --no-java-ext) JAVAEXT=0; shift;;
+  --clean) CLEAN=1; shift;; --make) GEN=make; shift;; --no-ccache) CACHE=0; shift;;
+  -j) JLOCAL=$2; shift 2;; --why) why; exit 0;; -h|--help) usage; exit 0;;
+  -v) VERBOSE=1; shift;;
+  --) shift; PASS+=("$@"); break;;
+  # 目录型位置参数 = 指定源码树，放前放后都行
+  *) if [ -d "$1" ] && [ -z "$SRARG" ]; then SRARG=$(cd "$1" && pwd); shift
+     else echo "未知参数: $1"; usage; exit 1; fi;;
+esac; done
+
+# 指定了目录就用它，否则从 $PWD 上溯
+if [ -n "$SRARG" ]; then
+  SR=$SRARG
+  { [ -f "$SR/build.sh" ] && [ -d "$SR/be/src" ]; } || { echo "!! $SR 不像 StarRocks 源码树（缺 build.sh 或 be/src）"; exit 1; }
+else
+  SR=$(find_root) || { echo "!! 当前目录 $PWD 不在任何 StarRocks 源码树里。"
+                       echo "   进到某个 worktree 再跑，或者显式指定：sr build /path/to/starrocks [选项]"; exit 1; }
+fi
+
+LOCK=/farm/sr-build.$(printf %s "$SR" | md5sum | cut -c1-12).lock
+command -v flock >/dev/null && exec 9>$LOCK && flock -n 9 || {
+  echo "!! 这棵源码树已有构建在进行：$SR"
+  echo "   同一棵树的 gensrc 产物是共享的，并发会互相覆盖，故串行。"
+  echo "   等它结束，或换一棵 worktree（不同树可以并行）。"; exit 1; }
+chmod 666 $LOCK 2>/dev/null
+printf '%s\n' "$SR" > "$LOCK.tree" 2>/dev/null; chmod 666 "$LOCK.tree" 2>/dev/null
+
+export STARROCKS_HOME=$SR
+# 隔离构建树，避免和原生 be/build_* 打架。但老分支的 build.sh 不认这个变量——
+# 认不认要看它自己，猜错会导致头部显示的构建树是假的、edges() 数不到边、--clean 删错目录。
+if grep -q CMAKE_BUILD_PREFIX "$SR/build.sh" 2>/dev/null; then
+  export CMAKE_BUILD_PREFIX=$SR/be/nj
+  TREE_BASE=$SR/be/nj
+else
+  TREE_BASE=$SR/be                          # 老分支：只能用它原生的位置
+  TREE_NOTE="  (该分支 build.sh 不支持 CMAKE_BUILD_PREFIX，用原生位置)"
+fi
+# build.sh 把 $CCACHE 当 CMAKE_CXX_COMPILER_LAUNCHER。
+# 用 ccache 当 launcher、靠 CCACHE_PREFIX 转发给 icecc —— 这样缓存和分布式能同时生效。
+if [ $CACHE = 1 ]; then export CCACHE=ccache; else export CCACHE=/usr/local/bin/cxxlaunch; export CCACHE_DISABLE=1; fi
+export CCACHE_DIR=${SR_CCACHE_DIR:-/ccache}   # SR_CCACHE_DIR 仅供对照实验换目录
+export BUILD_TYPE=$BT
+[ "$GEN" = make ] && export PATH=/opt/noninja:$PATH
+
+# ---- 决定要不要用农场 ----
+USE_FARM=0; FARM_NOTE="本地"; ASYNC_WAKE=0
+MISS_MIN=${MISS_MIN:-8}      # 这段时间内 ccache miss 超过几次就算「真在编」
+TREE=$TREE_BASE/build_$BT
+# grep -c 计数为 0 时退出码是 1，写 `|| echo 99999` 会输出两行 "0\n99999"（踩过三次了）
+# 数边前先让 build.sh 把 gensrc + cmake configure 跑完（--configure-only）。否则数的是上一次的状态：
+# 依赖路径/编译器一变，gensrc 的 thrift 版本戳、CMakeCache 都会让全部边变脏，而 ninja -n 在那之前
+# 只看到 0 条——于是按本地 -j16 跑了一次 1761 条边的全量（踩过，22 分钟）。configure 有缓存，代价几十秒。
+edges(){ ( cd "$SR" && ./build.sh --be --configure-only >/dev/null 2>&1 ) || true
+         [ -f "$TREE/build.ninja" ] || { echo 99999; return; }
+         local n; n=$( cd "$TREE" && ninja -n 2>/dev/null | grep -c 'CXX object' ); echo "${n:-99999}"; }
+# 农场是硬前置。这是个分布式编译项目，没有农场就别开工——
+# 静默退化成本地编译只会让人以为"就这么慢"，而不知道少了 1.9 倍。
+if [ ! -f "$FARM_STATE" ]; then
+  echo "!! 还没有编译农场，本工具的所有编译都需要它。"
+  echo "   先执行: sr farm init"
+  echo "   （约 6~9 分钟建 5 台 worker；之后休眠/唤醒/续约/自愈全自动，不用再管）"
+  exit 1
+fi
+# 农场标记为 degraded（resume 修复后仍连不上）时也拒绝：这是分布式工具，不能静默退回本地
+if grep -q '^FARM_STATUS=degraded' "$FARM_STATE" 2>/dev/null; then
+  echo "!! 农场处于 degraded（worker 未连上，resume 修复失败）。先 sr farm status 排查，或 sr farm resume 重试。"
+  exit 1
+fi
+[ "$TARGET" = fe ] && DIST=off   # FE 是 maven/Java，农场和 ccache 都帮不上忙
+if [ "$DIST" != off ]; then
+  sr-farm _wd 2>/dev/null || true   # 容器重启后把看门狗拉回来
+  . "$FARM_STATE"                                    # 提供 SCHED / FARM_STATUS / WORKERS
+  N=$(edges)
+  # 构建树不存在（首次 / --clean）时必然是大规模真编译，不必等 miss 攒够再唤醒；
+  # 这样唤醒能和 cmake configure 那 30-60 秒重叠，而不是等到编译真开始才动。
+  FRESH=0; { [ ! -f "$TREE/build.ninja" ] || [ $CLEAN = 1 ]; } && FRESH=1
+  # 边数是在 build.sh 跑 cmake configure 之前数的。若编译器或 thirdparty 路径和 CMakeCache 里记的不同，
+  # configure 会把所有边标脏，实际是全量——此时按"0 条边"选本地 -j16 就亏大了（踩过：换 base 后全量本地 22 分钟）
+  if [ $FRESH = 0 ] && [ -f "$TREE/CMakeCache.txt" ]; then
+    CC_CACHED=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$TREE/CMakeCache.txt" | head -1)
+    TP_CACHED=$(grep -oE '/tp/[0-9a-f]{12}|/var/local/thirdparty' "$TREE/CMakeCache.txt" | head -1)
+    CC_NOW=${STARROCKS_GCC_HOME:-/opt/gcc-toolset-14}/bin/g++
+    TP_NOW=${STARROCKS_THIRDPARTY:-/var/local/thirdparty}
+    if { [ -n "$CC_CACHED" ] && [ "$(readlink -f "$CC_CACHED")" != "$(readlink -f "$CC_NOW")" ]; } \
+       || { [ -n "$TP_CACHED" ] && [ "$TP_CACHED" != "${TP_NOW%/installed}" ]; }; then
+      FRESH=1; echo "   (编译器或依赖路径与上次 configure 不同，视为全量重编)"
+    fi
+  fi
+  THRESH=50; [ "${FARM_STATUS:-}" = suspended ] && THRESH=150
+  if [ "$DIST" = on ] || [ "$N" -gt "$THRESH" ] || [ $FRESH = 1 ]; then
+    if [ "${FARM_STATUS:-}" = suspended ]; then
+      # 不同步等那 29 秒。直接按「农场已就位」的并发开工：本地 daemon 会把真正在跑的
+      # 编译卡在 -m 16，多出来的槽在 icecc 里排队；农场一醒，排队的立刻溢出到远端。
+      # （依据：scheduler 故障注入实测，scheduler 死时本地仍稳在 16 并发、不 OOM、能编完）
+      # 同时后台观察 15 秒——若 ccache 一路命中，说明这次根本不用编，就别吵醒农场。
+      USE_FARM=1; ASYNC_WAKE=1
+      if [ $FRESH = 1 ]; then
+        FARM_NOTE="分布式 (农场休眠中，已开工并立即后台唤醒)"
+      else
+        FARM_NOTE="分布式 (农场休眠中，已开工并后台评估是否唤醒)"
+      fi
+    elif timeout 4 bash -c "echo > /dev/tcp/${SCHED}/${SPORT:-8765}" 2>/dev/null; then
+      USE_FARM=1; FARM_NOTE="分布式 (scheduler ${SCHED}, ${WORKERS:-?} 台 worker)"
+    else
+      FARM_NOTE="本地（农场 ${SCHED} 连不上，已降级）"
+    fi
+  else
+    FARM_NOTE="本地（本次仅重编约 ${N} 个 TU，未达外发阈值 ${THRESH}）"
+  fi
+fi
+if [ $USE_FARM = 1 ]; then
+  # 并发 = 远端总核 + 本机 16。写死 48 会在 worker 数变化时吃亏（5 台时容量其实是 56）
+  export USE_ICECC=1; J=$(( ${WORKERS:-4} * 8 + JLOCAL ))
+  # icecc 拒绝符号链接，必须给真实文件；给错了会静默退回本地编译。
+  # 单容器带多套 gcc，工具链包必须和当前 STARROCKS_GCC_HOME 配对——
+  # 传错版本的包，worker 上就用错编译器编，产物 ABI 不一致且不报错。
+  GH=$(basename "${STARROCKS_GCC_HOME:-/opt/gcc-toolset-14}")
+  export ICECC_VERSION=$(ls -1 /opt/icecc/$GH/*.tar.gz 2>/dev/null | head -1)
+  [ -f "$ICECC_VERSION" ] || export ICECC_VERSION=$(ls -1 /opt/icecc/*/*.tar.gz /opt/icecc/*.tar.gz 2>/dev/null | head -1)
+  [ -f "$ICECC_VERSION" ] || { echo "!! 找不到 icecc 工具链包，降级为本地"; USE_FARM=0; export USE_ICECC=0; J=$JLOCAL; }
+  [ $CACHE = 1 ] && export CCACHE_PREFIX=icecc     # ccache 未命中时才外发，命中直接取 .o
+  # 必须排除僵尸：pgrep 会匹配到 <defunct> 的 iceccd，让人误以为 daemon 还活着。
+  # 后果很重：客户端连不上本地 daemon 时，icecc 会「无限制地」退回本地编译，
+  # -j56 就变成 56 个 cc1plus 并发，48G 容器必被 OOM 杀（踩过，cgroup oom 计数 34）。
+  iceccd_alive(){ local p st; for p in $(pgrep -x iceccd 2>/dev/null); do
+      st=$(awk '{print $3}' /proc/$p/stat 2>/dev/null); [ "$st" != Z ] && return 0; done; return 1; }
+  # 端口是全机唯一的：多 profile 容器各起一个 daemon，只有第一个能 bind 10245，
+  # 后面的静默失败，客户端连不上就无限制本地并发 → OOM（踩过）。
+  # 共享 /var/run/icecc 之后，所有容器的客户端都连同一个 daemon。
+  port_taken(){ ss -ltn 2>/dev/null | grep -q ":${DPORT:-10245} "; }
+  { iceccd_alive || port_taken; } || {
+    mkdir -p /var/run/icecc
+    # 9>&- 必须加：daemon 会继承持有构建锁的 fd 9，它常驻就把锁永久占住（踩过，
+    # 症状是编译结束后再也拿不到锁、报「已有构建在进行」而 ps 里根本没有 sr-build）
+    /usr/sbin/iceccd -d -s "$SCHED:${SPORT:-8765}" -n "${NETNAME:-srfarm}" -m $JLOCAL \
+      -p "${DPORT:-10245}" -N "$(hostname)-${SR_USER:-u}" -u nobody -l /tmp/iceccd.log </dev/null >/dev/null 2>&1 9>&-
+    sleep 3; }
+  # 兜底：daemon 没起来就绝不能用远端级别的并发，否则全落本地把容器撑爆
+  { iceccd_alive || port_taken; } || { echo "!! 本地 iceccd 起不来，降级为本地编译 -j$JLOCAL"; \
+                    USE_FARM=0; export USE_ICECC=0; J=$JLOCAL; unset CCACHE_PREFIX 2>/dev/null || true; }
+else
+  export USE_ICECC=0; J=$JLOCAL; unset CCACHE_PREFIX 2>/dev/null || true
+fi
+
+case $TARGET in
+  be)  ARGS=(--be -j "$J") ;;
+  fe)  ARGS=(--fe -j "$J") ;;
+  all) ARGS=(--be --fe -j "$J") ;;
+esac
+[ "$TARGET" != fe ] && [ $JAVAEXT = 0 ] && ARGS+=(--without-java-ext)
+[ $CLEAN = 1 ] && [ "$TARGET" != fe ] && rm -rf "$TREE"
+[ $CLEAN = 1 ] && ARGS+=(--clean)
+[ ${#PASS[@]} -gt 0 ] && ARGS+=("${PASS[@]}")
+
+echo "=========================================================="
+echo " 目标: $TARGET$([ "$TARGET" = fe ] && echo "   (maven，农场/ccache 不参与)")"
+[ "$TARGET" != fe ] && echo " 类型: $BT      生成器: $GEN      并发: -j$J"
+echo " 模式: $FARM_NOTE"
+echo " 版本: ${SR_VER:-未指定}   编译器: $(${STARROCKS_GCC_HOME:-/usr}/bin/gcc -dumpfullversion 2>/dev/null || echo ?)   依赖: ${STARROCKS_THIRDPARTY:-默认}"
+echo " 源码树: $SR"
+echo " 构建树: $TREE${TREE_NOTE:-}"
+if [ $CACHE = 1 ]; then
+  CS=$(ccache -s 2>/dev/null | sed -n 's/^Cache size (\{0,1\}[^)]*)\{0,1\}:[[:space:]]*//p' | head -1)
+  [ -n "$CS" ] || CS=$(ccache -s 2>/dev/null | awk -F': *' '/Cache size/{print $2; exit}')
+  echo " ccache: ${CS:-0} / 上限 $(ccache -k max_size 2>/dev/null || echo 75G)"
+else
+  echo " ccache: 已禁用 (--no-ccache)"
+fi
+echo " java-extensions: $([ $JAVAEXT = 1 ] && echo 构建 || echo 跳过'(产物将缺 jni-packages 等 jar)')"
+echo "=========================================================="
+# 心跳：容器是 root，宿主看门狗是普通用户，必须放宽权限双方才都能更新
+mkdir -p /farm 2>/dev/null; : > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null
+# ---- OOM 观测 ----
+# 三个互相独立的读数，不共用同一条链路（单一读数骗过自己太容易了）：
+#   1) cgroup oom_kill 计数器 —— 内核的权威记账
+#   2) 编译日志里 g++ 自报的 "Killed signal terminated program cc1plus"
+#   3) memory.peak 距 memory.max 的余量 —— 就算没被杀也能看出贴没贴顶
+CG=/sys/fs/cgroup
+oomcnt(){ awk '/^oom_kill /{print $2}' $CG/memory.events 2>/dev/null \
+          || cat $CG/memory/memory.failcnt 2>/dev/null || echo 0; }
+g(){ awk -v n="$1" 'BEGIN{printf "%.1f", n/1073741824}'; }
+OOM0=$(oomcnt)
+HIT0=$(ccache -s 2>/dev/null | awk -F'[ /]+' '/^ *Hits:/{print $3; exit}'); HIT0=${HIT0:-0}
+CALL0=$(ccache -s 2>/dev/null | awk -F'[ /]+' '/^Cacheable calls:/{print $3; exit}'); CALL0=${CALL0:-0}
+# 不能用 memory.peak 判断内存紧不紧：它把 page cache 算在内，而编译要写 20G 构建树，
+# 峰值必然贴满上限（实测 48.0/48.0G 但 oom_kill=0，全是可回收的 file cache）。
+# 真正会撑爆的是 anon，所以自己采样 anon 峰值。
+ANONF=/tmp/sr-build-anonpeak
+( echo 0 > $ANONF
+  while :; do
+    a=$(awk '/^anon /{print $2}' $CG/memory.stat 2>/dev/null); [ -n "$a" ] || break
+    m=$(cat $ANONF 2>/dev/null || echo 0); [ "$a" -gt "${m:-0}" ] && echo "$a" > $ANONF
+    # 顺带打心跳：看门狗跨容器看不到编译进程，只能靠这个文件的 mtime 判断忙闲
+    touch /farm/last-build 2>/dev/null
+    sleep 5
+  done ) >/dev/null 2>&1 9>&- &
+SAMPLER=$!
+
+# 后台评估是否值得唤醒农场。ccache 命中一次只要 4-5ms，真编一个 TU 要几秒到几分钟，
+# 两者差着三四个数量级，所以观察 15 秒的 miss 增量就足以分辨，不需要任何预测。
+RUNFLAG=/tmp/sr-build.running.$$
+misses(){ ccache -s 2>/dev/null | awk -F'[ /]+' '/^ *Misses:/{print $3; exit}'; }
+if [ "${ASYNC_WAKE:-0}" = 1 ]; then
+  : > $RUNFLAG
+  # 不能用「开工后固定等 N 秒」来判断：build.sh 前 30-60 秒在跑 cmake configure 和 gensrc，
+  # 一次编译都还没发生，miss 恒为 0，于是真编译也会被误判成全命中（踩过）。
+  # 改成轮询累计 miss：一旦攒够 MISS_MIN 次就唤醒，攒不够就说明真全命中，让农场继续睡。
+  ( if [ "${FRESH:-0}" = 1 ]; then
+      # 全新构建树：不必等 miss，立刻唤醒，让 29 秒藏进 configure 阶段
+      echo "   [农场] 全新构建树，必有大量真编译 -> 立即唤醒（与 configure 并行）"
+      sr-farm resume >/dev/null 2>&1
+      exit 0
+    fi
+    M0=$(misses); M0=${M0:-0}
+    while [ -f $RUNFLAG ]; do
+      sleep 5
+      [ -f $RUNFLAG ] || break                     # 编译已结束，白唤醒没意义
+      if [ $CACHE = 0 ]; then D=99999; else M1=$(misses); D=$(( ${M1:-0} - M0 )); fi
+      if [ "$D" -ge "$MISS_MIN" ]; then
+        echo "   [农场] 已累计 ${D} 次 ccache miss，确属真编译 -> 唤醒农场"
+        sr-farm resume >/dev/null 2>&1
+        exit 0
+      fi
+    done
+    echo "   [农场] 全程仅 ${D:-0} 次 ccache miss，基本全命中 -> 未唤醒，农场继续睡" ) 9>&- &
+fi
+
+S=$(date +%s)
+( cd "$SR" && ./build.sh "${ARGS[@]}" ) 2>&1 | tee /tmp/sr-build-last.out; RC=${PIPESTATUS[0]}
+rm -f $RUNFLAG
+E=$(date +%s)
+: > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null
+
+kill $SAMPLER 2>/dev/null
+OOM1=$(oomcnt); # grep -c 计数为 0 时退出码是 1，写 `|| echo 0` 会变成两行 "0\n0"，
+# 后面 [ "$KILLED" -gt 0 ] 就报 integer expression expected（踩过两次了）
+KILLED=$(grep -c "Killed signal terminated program" /tmp/sr-build-last.out 2>/dev/null); KILLED=${KILLED:-0}
+PEAK=$(cat $ANONF 2>/dev/null || echo 0); MAXM=$(cat $CG/memory.max 2>/dev/null || echo 0)
+
+# 失败 + 有 OOM 痕迹 = 明确诊断，并自动降并发重试一次（ninja 是增量的，重试只补没编完的）
+if [ $RC -ne 0 ] && { [ "${OOM1:-0}" -gt "${OOM0:-0}" ] || [ "${KILLED:-0}" -gt 0 ]; }; then
+  echo ""
+  echo "!! 编译失败是内存打爆导致的，不是代码问题："
+  echo "   cgroup oom_kill: $OOM0 -> $OOM1   g++ 自报被杀: $KILLED 次"
+  [ "${MAXM:-0}" != 0 ] && [ "$MAXM" != max ] && \
+    echo "   anon 峰值 $(g ${PEAK:-0})G / 上限 $(g $MAXM)G"
+  RETRY=$(( J / 2 )); [ $RETRY -lt 4 ] && RETRY=4
+  echo "   -> 自动降到 -j$RETRY 重试（ninja 增量，只补没编完的部分）"
+  ARGS=(--be -j "$RETRY"); [ $JAVAEXT = 0 ] && ARGS+=(--without-java-ext)   # 只有 BE 会 OOM
+  ( cd "$SR" && ./build.sh "${ARGS[@]}" ); RC=$?
+  E=$(date +%s)
+fi
+
+printf "\n== 结束 rc=%d 用时 %dm%02ds ==\n" $RC $(( (E-S)/60 )) $(( (E-S)%60 ))
+# 每次编译记一行概况到 /farm/builds.tsv（宿主机卷，sr history 看），完整输出另存一份
+HIT1=$(ccache -s 2>/dev/null | awk -F'[ /]+' '/^ *Hits:/{print $3; exit}'); HIT1=${HIT1:-0}
+CALL1=$(ccache -s 2>/dev/null | awk -F'[ /]+' '/^Cacheable calls:/{print $3; exit}'); CALL1=${CALL1:-0}
+MODE_SHORT=本地; case "$FARM_NOTE" in 分布式*) MODE_SHORT=分布式;; esac
+mkdir -p /farm/logs 2>/dev/null
+LOGF=/farm/logs/$(date +%Y%m%d-%H%M%S)-$(basename "$SR")-${BT}.log
+cp /tmp/sr-build-last.out "$LOGF" 2>/dev/null; chmod 666 "$LOGF" 2>/dev/null
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$(date '+%m-%d %H:%M:%S')" "${SR_USER:-?}" "$(basename "$SR")@${SR_BRANCH:-?}" "${SR_VER:-?}/${SR_TPDIGEST:-?}" \
+  "$MODE_SHORT" "${N:-?}" "$RC" "$(( (E-S)/60 ))m$(( (E-S)%60 ))s" "$(g ${PEAK:-0})G" \
+  "$(( HIT1 - ${HIT0:-0} ))/$(( CALL1 - ${CALL0:-0} ))" "$LOGF" >> /farm/builds.tsv 2>/dev/null; chmod 666 /farm/builds.tsv 2>/dev/null
+# 报 anon 余量（不含 page cache）。ASAN 每槽约 2.04G、Debug 约 1.77G，贴到 85% 再加并发就危险了
+if [ "${MAXM:-0}" != 0 ] && [ "$MAXM" != max ] && [ "${PEAK:-0}" != 0 ]; then
+  PCT=$(awk -v a=$PEAK -v b=$MAXM 'BEGIN{printf "%.0f", a*100/b}')
+  printf " anon 峰值 %sG / 上限 %sG (%s%%)   oom_kill %s->%s%s\n" \
+    "$(g $PEAK)" "$(g $MAXM)" "$PCT" "$OOM0" "$OOM1" \
+    "$([ "$PCT" -ge 85 ] && echo '  <- 余量偏紧，再加并发或换 ASAN 有 OOM 风险')"
+fi
+[ $CACHE = 1 ] && ccache -s 2>/dev/null | grep -E 'Cacheable calls|Hits:|Uncacheable' | head -3
+
+# 产物落点。build.sh 只会闷头打一句 OUTPUT DIR=，既不说二进制在哪也不说是不是这次新出的
+if [ $RC -eq 0 ]; then
+  echo ""
+  if [ "$TARGET" = fe ] || [ "$TARGET" = all ]; then
+    FOUT=$SR/output/fe
+    echo " FE 产物: $FOUT"
+    FJ=$(ls -1 "$FOUT/lib/"*.jar 2>/dev/null | wc -l)
+    [ -d "$FOUT/lib" ] && echo "   lib/  $FJ 个 jar   bin/ conf/ webroot/"
+  fi
+  [ "$TARGET" = fe ] && exit $RC
+  OUT=$SR/output/be
+  BIN=$OUT/lib/starrocks_be
+  echo " BE 产物: $OUT"
+  if [ -f "$BIN" ]; then
+    # 用 mtime 判断这次到底有没有重新产出，避免拿着上次的二进制以为是新的
+    AGE=$(( $(date +%s) - $(stat -c %Y "$BIN") ))
+    BINFRESH=$([ $AGE -le $((E-S+120)) ] && echo "本次生成" || echo "未更新，仍是 $((AGE/60)) 分钟前那份")
+    printf "   %-46s %s  (%s)\n" "lib/starrocks_be" "$(du -h "$BIN"|cut -f1)" "$BINFRESH"
+  else
+    echo "   !! 没找到 lib/starrocks_be"
+  fi
+  NJ=$(ls -1 "$OUT/lib/jni-packages/" 2>/dev/null | wc -l)
+  [ "$NJ" -gt 0 ] && echo "   lib/jni-packages/                              $NJ 个 jar"
+  [ "$NJ" = 0 ] && [ $JAVAEXT = 0 ] && echo "   lib/jni-packages/  (空 —— 用了 --no-java-ext，Hive/Iceberg 等连接器运行时会失败)"
+  echo "   bin/ conf/ www/"
+fi
+exit $RC

@@ -1,0 +1,7 @@
+#!/bin/bash
+# CMAKE_CXX_COMPILER_LAUNCHER。USE_ICECC=1 时把编译外发给 icecc 农场。
+if [ "${USE_ICECC:-0}" = "1" ]; then
+  exec icecc "$@"
+else
+  exec "$@"
+fi
