@@ -1,0 +1,36 @@
+#!/bin/bash
+# ccache-pch —— CMAKE_CXX_COMPILER_LAUNCHER。普通 TU 原样交给 ccache；编 PCH 时多做一件事：
+# 对预处理结果取 sha256 写成 <gch>.sum，配合 ccache.conf 的 pch_external_checksum=true。
+#
+# 为什么必须这样（2026-09-12 实测）：
+#   - GCC 的 .gch 字节不可复现：同容器连续编两次大小都不同。ccache 默认按 .gch 内容哈希，
+#     于是 PCH 一被重建（--clean / 换镜像 / 头文件 mtime 变），该目标下所有 TU 必 miss（0/1446）。
+#   - PCH 编译命令自带 -include cmake_pch.hxx，ccache 把旧的 cmake_pch.hxx.gch 当输入哈希，
+#     而输出正是它 —— 编完发现"输入被改了"就拒存（计数器里 548 次 Input file modified），
+#     所以 PCH 的编译结果从来没进过缓存，恢复不出同一份字节。
+#   .sum 只随头文件内容变，与 .gch 字节无关；共享缓存（另一台机器生成的 .gch）也因此能命中。
+case " $* " in *" -x c++-header "*) ;; *) exec ccache "$@" ;; esac
+
+out=""; hxx=""; pre=(); skip=0
+for a in "$@"; do
+  if [ $skip = 1 ]; then skip=0; continue; fi
+  case "$a" in
+    -o)       skip=1; out=""; continue ;;
+    -include) skip=1; continue ;;                    # 取不到值时下一轮拿；见下
+    -MF|-MT|-MQ) skip=1; continue ;;
+    -MD|-MMD|-c) continue ;;
+    *.cxx|*.cpp|*.cc) [ "${a#-}" = "$a" ] && continue ;;   # 空壳源文件 cmake_pch.hxx.cxx
+  esac
+  pre+=("$a")
+done
+# 上面的 skip 把 -o / -include 的值吞掉了，再单独扫一遍取值
+prev=""; for a in "$@"; do case "$prev" in -o) out=$a;; -include) hxx=$a;; esac; prev=$a; done
+
+ccache "$@"; rc=$?
+if [ $rc = 0 ] && [ -n "$out" ] && [ -n "$hxx" ]; then
+  # 直接把头文件当主输入预处理（不走 -include，否则 GCC 会去找旁边的 .gch 而不展开头文件）。
+  # -fdirectives-only 不展开宏，只做 include 拼接，快且确定；-P 去掉行号标记。
+  sum=$("${pre[@]}" -E -P -fdirectives-only "$hxx" 2>/dev/null | sha256sum | cut -d' ' -f1)
+  [ -n "$sum" ] && echo "$sum" > "$out.sum"
+fi
+exit $rc

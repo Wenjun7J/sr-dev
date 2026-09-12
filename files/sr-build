@@ -97,7 +97,8 @@ else
 fi
 # build.sh 把 $CCACHE 当 CMAKE_CXX_COMPILER_LAUNCHER。
 # 用 ccache 当 launcher、靠 CCACHE_PREFIX 转发给 icecc —— 这样缓存和分布式能同时生效。
-if [ $CACHE = 1 ]; then export CCACHE=ccache; else export CCACHE=/usr/local/bin/cxxlaunch; export CCACHE_DISABLE=1; fi
+# ccache-pch = ccache 的薄包装：编 PCH 时顺手写 .gch.sum，配合 pch_external_checksum，见该脚本头注
+if [ $CACHE = 1 ]; then export CCACHE=/usr/local/bin/ccache-pch; else export CCACHE=/usr/local/bin/cxxlaunch; export CCACHE_DISABLE=1; fi
 export CCACHE_DIR=${SR_CCACHE_DIR:-/ccache}   # SR_CCACHE_DIR 仅供对照实验换目录
 export BUILD_TYPE=$BT
 [ "$GEN" = make ] && export PATH=/opt/noninja:$PATH

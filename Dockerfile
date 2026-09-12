@@ -38,6 +38,7 @@ RUN for v in 11 12 13; do mkdir -p /opt/gcc$v/bin \
 
 COPY files/ccache.conf /etc/ccache.conf
 COPY files/cxxlaunch   /usr/local/bin/cxxlaunch
+COPY files/ccache-pch  /usr/local/bin/ccache-pch
 COPY files/sr-build    /usr/local/bin/sr-build
 COPY files/sr-farm     /usr/local/bin/sr-farm
 COPY files/tspapi.py   /usr/local/bin/tspapi.py
@@ -57,5 +58,5 @@ RUN mkdir -p /opt/icecc && cd /opt/icecc \
 RUN mkdir -p /var/local/thirdparty/installed
 RUN mkdir -p /opt/noninja && printf '#!/bin/sh\nexit 1\n' > /opt/noninja/ninja && chmod +x /opt/noninja/ninja
 RUN git config --global --add safe.directory '*'
-RUN chmod +x /usr/local/bin/cxxlaunch /usr/local/bin/sr-build /usr/local/bin/sr-farm \
+RUN chmod +x /usr/local/bin/cxxlaunch /usr/local/bin/ccache-pch /usr/local/bin/sr-build /usr/local/bin/sr-farm \
              /usr/local/bin/tspapi.py /usr/local/bin/node-setup.sh
