@@ -310,7 +310,10 @@ if [ "${ASYNC_WAKE:-0}" = 1 ]; then
 fi
 
 S=$(date +%s)
-( cd "$SR" && ./build.sh "${ARGS[@]}" ) 2>&1 | tee /tmp/sr-build-last.out; RC=${PIPESTATUS[0]}
+# 输出文件必须每次构建独立：不同源码树可以在同一容器里并发编，共用一个 /tmp 文件会把两份输出搅在一起，
+# 失败那次的报错被另一边的进度行冲掉（踩过：只剩 FAILED 一行，错误正文没了）
+OUTF=$(mktemp /tmp/sr-build.XXXXXX)
+( cd "$SR" && ./build.sh "${ARGS[@]}" ) 2>&1 | tee "$OUTF"; RC=${PIPESTATUS[0]}
 rm -f $RUNFLAG
 E=$(date +%s)
 : > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null
@@ -318,7 +321,7 @@ E=$(date +%s)
 kill $SAMPLER 2>/dev/null
 OOM1=$(oomcnt); # grep -c 计数为 0 时退出码是 1，写 `|| echo 0` 会变成两行 "0\n0"，
 # 后面 [ "$KILLED" -gt 0 ] 就报 integer expression expected（踩过两次了）
-KILLED=$(grep -c "Killed signal terminated program" /tmp/sr-build-last.out 2>/dev/null); KILLED=${KILLED:-0}
+KILLED=$(grep -c "Killed signal terminated program" "$OUTF" 2>/dev/null); KILLED=${KILLED:-0}
 PEAK=$(cat $ANONF 2>/dev/null || echo 0); MAXM=$(cat $CG/memory.max 2>/dev/null || echo 0)
 
 # 失败 + 有 OOM 痕迹 = 明确诊断，并自动降并发重试一次（ninja 是增量的，重试只补没编完的）
@@ -342,7 +345,7 @@ CALL1=$(ccache -s 2>/dev/null | awk -F'[ /]+' '/^Cacheable calls:/{print $3; exi
 MODE_SHORT=本地; case "$FARM_NOTE" in 分布式*) MODE_SHORT=分布式;; esac
 mkdir -p /farm/logs 2>/dev/null
 LOGF=/farm/logs/$(date +%Y%m%d-%H%M%S)-$(basename "$SR")-${BT}.log
-cp /tmp/sr-build-last.out "$LOGF" 2>/dev/null; chmod 666 "$LOGF" 2>/dev/null
+cp "$OUTF" "$LOGF" 2>/dev/null; chmod 666 "$LOGF" 2>/dev/null; ln -sfn "$LOGF" /tmp/sr-build-last.out; rm -f "$OUTF"
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
   "$(date '+%m-%d %H:%M:%S')" "${SR_USER:-?}" "$(basename "$SR")@${SR_BRANCH:-?}" "${SR_VER:-?}/${SR_TPDIGEST:-?}" \
   "$MODE_SHORT" "${N:-?}" "$RC" "$(( (E-S)/60 ))m$(( (E-S)%60 ))s" "$(g ${PEAK:-0})G" \
