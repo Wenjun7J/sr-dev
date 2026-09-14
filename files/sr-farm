@@ -44,7 +44,7 @@ DPORT=${DPORT:-$(( 19700 + UIDN % 500 ))}    # 本机 iceccd
 # 多 profile 容器共用一个农场：容器都是 --network host，8765 全机唯一。
 # 必须查端口而不是查进程——各容器 PID namespace 独立，pgrep 看不到别家的 scheduler，
 # 会重复去起然后 bind 失败。
-sched_ensure(){ ss -ltn 2>/dev/null | grep -q ":$SPORT " || \
+sched_ensure(){ [ -n "$(ss -ltnH "sport = :$SPORT" 2>/dev/null)" ] || \
   /usr/sbin/icecc-scheduler -n "$NETNAME" -p "$SPORT" -d -l /tmp/icecc-scheduler.log >/dev/null 2>&1 9>&-; }
 # --network host 让容器和宿主机共享 netns，本地就能数出连上来的 daemon
 # grep -c 计数为 0 时退出码是 1，用 || echo 0 会多打一行；必须吃掉退出码

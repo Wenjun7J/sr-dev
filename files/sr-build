@@ -100,6 +100,28 @@ fi
 # ccache-pch = ccache 的薄包装：编 PCH 时顺手写 .gch.sum，配合 pch_external_checksum，见该脚本头注
 if [ $CACHE = 1 ]; then export CCACHE=/usr/local/bin/ccache-pch; else export CCACHE=/usr/local/bin/cxxlaunch; export CCACHE_DISABLE=1; fi
 export CCACHE_DIR=${SR_CCACHE_DIR:-/ccache}   # SR_CCACHE_DIR 仅供对照实验换目录
+# ccache 远端（可选）：srdev.conf 配了 SR_CCACHE_REMOTE_BUCKET 就把本容器里的 OSS 代理当 http 后端。
+# 两级读穿：本地命中不走网，本地 miss 才查远端并回填本地。代理端口按 uid（多用户不撞），
+# 凭据用各人自己的 ~/.ossutilconfig（宿主机 sr 以 SR_OSSCFG 传路径）。实测 main 全量：
+# 空本地 + 已填充远端 1m51s（对照本地全命中 1m32s、真编 8~11 分钟）；一份 Debug 基线约 3.2 GB / 3244 个对象。
+[ -f /etc/srdev.conf ] && { set -a; . /etc/srdev.conf; set +a; }
+REMOTE_NOTE=""
+if [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] && [ -n "${SR_CCACHE_REMOTE_BUCKET:-}" ]; then
+  PPORT=$(( 20700 + ${SR_UID:-0} % 500 )); RPFX=${SR_CCACHE_REMOTE_PREFIX:-ccache/}
+  proxy_up(){ [ -n "$(ss -ltnH "sport = :$PPORT" 2>/dev/null)" ]; }   # 不能 `ss | grep -q`：pipefail 下 SIGPIPE 返回 141（踩过）
+  if ! proxy_up && [ -f "${SR_OSSCFG:-/nonexistent}" ]; then
+    setsid nohup python3 /usr/local/bin/oss-ccache-proxy.py --bucket "$SR_CCACHE_REMOTE_BUCKET" --prefix "$RPFX" \
+      --listen 127.0.0.1:$PPORT --config "$SR_OSSCFG" --log /farm/ccache-proxy.log </dev/null >>/farm/ccache-proxy.out 2>&1 9>&- &
+    for i in 1 2 3 4 5 6; do proxy_up && break; sleep 0.5; done
+  fi
+  if proxy_up; then
+    # connect-timeout 默认 100ms，-j56 并发下会误判；operation-timeout 要容得下 100MB 级的 PCH 结果
+    export CCACHE_REMOTE_STORAGE="http://127.0.0.1:$PPORT/|connect-timeout=3000|operation-timeout=60000"
+    REMOTE_NOTE="oss://$SR_CCACHE_REMOTE_BUCKET/$RPFX (经本容器 :$PPORT)"
+  else
+    REMOTE_NOTE="未启用：代理起不来（缺 ${SR_OSSCFG:-~/.ossutilconfig}？看 /farm/ccache-proxy.out）"
+  fi
+elif [ -n "${CCACHE_REMOTE_STORAGE:-}" ]; then REMOTE_NOTE="$CCACHE_REMOTE_STORAGE (环境指定)"; fi
 export BUILD_TYPE=$BT
 [ "$GEN" = make ] && export PATH=/opt/noninja:$PATH
 
@@ -188,7 +210,7 @@ if [ $USE_FARM = 1 ]; then
   # 端口是全机唯一的：多 profile 容器各起一个 daemon，只有第一个能 bind 10245，
   # 后面的静默失败，客户端连不上就无限制本地并发 → OOM（踩过）。
   # 共享 /var/run/icecc 之后，所有容器的客户端都连同一个 daemon。
-  port_taken(){ ss -ltn 2>/dev/null | grep -q ":${DPORT:-10245} "; }
+  port_taken(){ [ -n "$(ss -ltnH "sport = :${DPORT:-10245}" 2>/dev/null)" ]; }
   { iceccd_alive || port_taken; } || {
     mkdir -p /var/run/icecc
     # 9>&- 必须加：daemon 会继承持有构建锁的 fd 9，它常驻就把锁永久占住（踩过，
@@ -224,6 +246,7 @@ if [ $CACHE = 1 ]; then
   CS=$(ccache -s 2>/dev/null | sed -n 's/^Cache size (\{0,1\}[^)]*)\{0,1\}:[[:space:]]*//p' | head -1)
   [ -n "$CS" ] || CS=$(ccache -s 2>/dev/null | awk -F': *' '/Cache size/{print $2; exit}')
   echo " ccache: ${CS:-0} / 上限 $(ccache -k max_size 2>/dev/null || echo 75G)"
+  [ -n "$REMOTE_NOTE" ] && echo " ccache 远端: $REMOTE_NOTE"
 else
   echo " ccache: 已禁用 (--no-ccache)"
 fi

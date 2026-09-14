@@ -30,7 +30,7 @@ files/node-setup.sh     在 worker 节点上执行：清掉预装服务、装 ic
 files/tspapi.py         云平台（TSP）的极简客户端，标准库实现；换平台只需重写这一个文件
 files/cxxlaunch         CMAKE_CXX_COMPILER_LAUNCHER，绕过 ccache 做纯计时时用
 files/ccache.conf       PCH sloppiness、75G 上限、zstd 1 级
-files/oss-ccache-proxy.py  实验：把 ccache 的 http 远端映射到阿里云 OSS（ccache 无 S3/OSS 后端）
+files/oss-ccache-proxy.py  ccache 的 http 远端 → 阿里云 OSS 的签名代理（ccache 无 S3/OSS 后端）；conf 配桶名即启用
 docs/sr_flowchart.svg   一次 sr build 的完整流程
 ```
 
@@ -79,15 +79,25 @@ cd /path/to/starrocks && sr -v main build  # 首次必须 -v；之后这棵树�
 每个用户一个容器 `<user>_farm`、一个 cgroup slice、一套端口；ccache 在各自 `~/ccache`（同一目录内 Debug/Release/ASAN 互不干扰）；
 thirdparty 走公共目录全机共享；`~/farm/builds.tsv` 与 `~/farm/logs/` 记录每次编译。
 
-## 实验中：ccache 远端上 OSS
+## ccache 远端上 OSS
 
-ccache 4.x 的远端只有 http / redis / file。`files/oss-ccache-proxy.py` 在本机监听，把 ccache 的 GET/HEAD/PUT/DELETE 转成 OSS V1 签名请求，凭据只从 `~/.ossutilconfig` 读：
+ccache 4.x 的远端只有 http / redis / file。`files/oss-ccache-proxy.py` 在容器里监听，把 ccache 的 GET/HEAD/PUT/DELETE 转成 OSS V1 签名请求，
+凭据只从各人自己的 `~/.ossutilconfig` 读。`srdev.conf` 里配上桶名即启用，`sr build` 自动起代理、自动接上：
 
-```bash
-python3 files/oss-ccache-proxy.py --bucket <桶> --prefix ccache/ &
-CCACHE_REMOTE_STORAGE='http://127.0.0.1:8384/' sr build            # 读写
-CCACHE_REMOTE_STORAGE='http://127.0.0.1:8384/|read-only' sr build  # 只读
 ```
+SR_CCACHE_REMOTE_BUCKET=<桶名>
+SR_CCACHE_REMOTE_PREFIX=ccache/
+```
+
+两级读穿：本地命中不走网，本地 miss 才查远端并回填本地。实测 main Debug 全量（5 worker 农场）：
+
+| 场景 | 用时 | 命中 |
+|---|---|---|
+| 空本地 + 空远端（真编 + 上传 3.2 GB / 3244 对象） | 11m40s | 0 |
+| **空本地 + 已填充远端**（新人 / 新机器首次编） | **1m51s** | 远端 97% |
+| 本地全命中（对照） | 1m32s | 本地 99.9% |
+
+远端命中比本地只慢约 20 秒。能跨机共享的前提是 PCH 走 `.sum` 哈希（见 `files/ccache-pch`），否则用了 PCH 的 TU 一个也命中不了。
 
 ## 换掉云平台
 

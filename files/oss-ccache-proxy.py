@@ -171,6 +171,8 @@ def main():
     Handler.prefix = a.prefix
     Handler.logf = open(a.log, "a") if a.log else None
     host, port = a.listen.rsplit(":", 1)
+    # 默认 backlog 只有 5：-j56 的 ccache 同时连上来会丢 SYN，客户端 100ms connect-timeout 直接算 miss（实测 35/1640）
+    ThreadingHTTPServer.request_queue_size = 256
     srv = ThreadingHTTPServer((host, int(port)), Handler)
     srv.daemon_threads = True
     print(f"oss-ccache-proxy: {a.listen} -> oss://{a.bucket}/{a.prefix} via {ep}", flush=True)

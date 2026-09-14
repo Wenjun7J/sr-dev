@@ -19,3 +19,9 @@ WORKERS=5                          # worker 台数
 ITYPE=8c32g                        # 节点规格（平台侧的名字）
 #TSP_REGION=cn-zhangjiakou         # 平台申请参数
 #TSP_CSP=aliyun
+
+## ccache 远端（可选）：配了桶名即启用。本地 miss 才查远端、命中回填本地；所有人共享同一前缀。
+## 凭据用各人自己的 ~/.ossutilconfig（ossutil 的配置），代理随容器起，端口按 uid。
+## 能跨机共享的前提是 PCH 走 .sum 哈希（ccache.conf 已开 pch_external_checksum）。
+#SR_CCACHE_REMOTE_BUCKET=<桶名>       # 与 ossutil 配置同一 endpoint（建议内网端点）
+#SR_CCACHE_REMOTE_PREFIX=ccache/       # 桶内前缀
