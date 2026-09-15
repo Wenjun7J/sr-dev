@@ -157,7 +157,7 @@ versions)
   image              建单镜像（一次性，装齐各版本 gcc）
   up                 起容器（单个，编所有版本，永不因换版本而重建）
   build [目录] [选项] 编译。首次需 -v 指定用哪个官方镜像的依赖
-  farm {init|status|resume|suspend|down}
+  farm {init|status|usage [--watch [秒]]|resume|suspend|down}
   tp                 列出已拉下来的各版本依赖（全机共享目录）
   history [N]        最近 N 次编译概况（默认 20）
   versions           列出 registry 里可用的版本

@@ -50,7 +50,7 @@ sr image                                   # 一次性，~5 分钟
 cd /path/to/starrocks && sr -v main build  # 首次必须 -v；之后这棵树的这个分支会记住
 ```
 
-`sr help` 列出全部子命令；`sr build --help` / `sr build --why` 看编译选项与默认值依据。
+`sr farm usage`（可 `--watch 5`）看农场资源：scheduler 的各 worker 槽位与负载、每台机器的 loadavg/内存/编译进程、本容器 CPU/内存。`sr help` 列出全部子命令；`sr build --help` / `sr build --why` 看编译选项与默认值依据。
 
 ## 版本是怎么处理的
 

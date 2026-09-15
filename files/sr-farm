@@ -107,6 +107,38 @@ init)
   echo "== 看门狗每 ${RENEW_MIN} 分钟续约 ${RENEW_H} 小时；空闲 ${IDLE_MIN} 分钟自动休眠。"
   echo "   容器关闭 → 续约停止 → 农场 ${RENEW_H} 小时内自动释放。"
   ;;
+# 资源视图：scheduler 文本口（端口 = SPORT+1，icecream 自带）+ 各节点 ssh 一跳 + 本容器 cgroup。--watch [秒] 循环刷新
+usage)
+  [ -f "$STATE" ] || { echo "当前无农场"; exit 1; }
+  . "$STATE"
+  sched_q(){ exec 3<>/dev/tcp/127.0.0.1/$((SPORT+1)) 2>/dev/null || return 1; printf '%s\nquit\n' "$1" >&3; timeout 2 cat <&3; exec 3>&-; }
+  CG=/sys/fs/cgroup
+  once(){
+    local hdr cs jobs u0 u1 cores mem memmax
+    cs=$(sched_q listcs 2>/dev/null); hdr=$(printf '%s\n' "$cs" | sed -n 's/^200-ICECC \([^:]*\): \([0-9]*\)s uptime, \([0-9]*\) hosts, \([0-9]*\) jobs in queue (\([0-9]*\) total).*/scheduler \1 · 已运行 \2s · \3 台 daemon · 排队 \4 · 累计派发 \5/p')
+    echo "== 集群 $CLUSTER (id=$CID)  平台 $($API row "$CLUSTER" 2>/dev/null | cut -d'|' -f1)/本地 $FARM_STATUS  到期 $($API row "$CLUSTER" 2>/dev/null | cut -d'|' -f2)"
+    echo "   ${hdr:-scheduler 文本口 :$((SPORT+1)) 连不上}"
+    echo "== scheduler 视图（jobs=当前/上限，load 为 icecc 千分制）"
+    printf '   %-26s %-15s %-9s %-6s %s\n' 主机 IP jobs load speed
+    printf '%s\n' "$cs" | grep -E '^ [^ ]+ \(' | sed -E 's/^ ([^ ]+) \(([0-9.]+):[0-9]+\) \[[^]]*\] speed=([0-9.]+) jobs=([0-9]+\/[0-9]+) load=([0-9]+).*/\1 \2 \4 \5 \3/' \
+      | awk -v me="$HOSTIP" '{tag=($2==me)?"(本机)":""; printf "   %-26s %-15s %-9s %5.1f%% %s %s\n", substr($1,1,26), $2, $3, $4/10, $5, tag; split($3,a,"/"); if($2!=me){cur+=a[1]; cap+=a[2]}} END{printf "   远端合计 %d/%d 槽在用\n", cur, cap}'
+    jobs=$(sched_q listjobs 2>/dev/null | grep -vE '^200|^$'); [ -n "$jobs" ] && { echo "== 正在派发的任务（前 10）"; printf '%s\n' "$jobs" | head -10 | cut -c1-150 | sed 's/^/   /'; }
+    echo "== 节点实际负载（ssh 一跳：loadavg 1m/5m · 内存 · 编译进程数）"
+    for ip in $NODES; do
+      ( r=$(timeout 8 ssh -n -i $KEY $SSHO $NUSER@$ip 'printf "%s %s|%s|%s|%s\n" $(cut -d" " -f1,2 /proc/loadavg) "$(free -m | awk "/^Mem:/{print \$3\"/\"\$2\"M\"}")" "$(pgrep -c cc1plus)" "$(nproc)"' 2>/dev/null)
+        [ -n "$r" ] && printf '   %-15s load %-12s mem %-14s cc1plus %-3s /%s 核\n' "$ip" "$(echo "$r"|cut -d'|' -f1)" "$(echo "$r"|cut -d'|' -f2)" "$(echo "$r"|cut -d'|' -f3)" "$(echo "$r"|cut -d'|' -f4)" \
+                  || printf '   %-15s (ssh 不通)\n' "$ip" ) &
+    done; wait
+    echo "== 本容器"
+    u0=$(awk '/^usage_usec/{print $2}' $CG/cpu.stat 2>/dev/null); sleep 1; u1=$(awk '/^usage_usec/{print $2}' $CG/cpu.stat 2>/dev/null)
+    cores=$(awk -v a="${u0:-0}" -v b="${u1:-0}" 'BEGIN{printf "%.1f", (b-a)/1000000}')
+    # memory.current 含页缓存，空闲时也有十几 G，看 anon 才是编译真占的
+    mem=$(awk '/^anon /{print $2}' $CG/memory.stat 2>/dev/null || echo 0); memmax=$(cat $CG/memory.max 2>/dev/null || echo max)
+    printf '   CPU %s 核在用 / 配额 %s   内存(anon) %.1fG / %s   本地 cc1plus %s\n' "$cores" "$(awk '{printf "%d", $1/$2}' $CG/cpu.max 2>/dev/null || echo ?)" "$(echo "${mem:-0}" | awk '{print $1/1073741824}')" "$([ "$memmax" = max ] && echo 不限 || echo "$memmax" | awk '{printf "%.0fG", $1/1073741824}')" "$(pgrep -c cc1plus)"
+    local t; for f in /farm/sr-build.*.lock; do [ -e "$f" ] || continue; t=$(cat "$f.tree" 2>/dev/null); ( exec 8>"$f"; flock -n 8 ) 2>/dev/null || echo "   正在编译: ${t:-?}"; done
+    [ -f /farm/last-build ] && echo "   距上次编译 $(( ($(date +%s)-$(stat -c %Y /farm/last-build))/60 )) 分钟"
+  }
+  if [ "${2:-}" = --watch ]; then while true; do clear; date '+%F %T'; once; sleep "${3:-5}"; done; else once; fi ;;
 status)
   [ -f "$STATE" ] || { echo "当前无农场"; exit 1; }
   . "$STATE"; IFS='|' read -r S T N <<<"$($API row "$CLUSTER")"
