@@ -5,8 +5,8 @@
 set -uo pipefail
 # 站点配置由宿主机 sr 只读挂进来；set -a 让 tspapi.py / ssh 子进程也看得到
 [ -f /etc/srdev.conf ] && { set -a; . /etc/srdev.conf; set +a; }
-API=/usr/local/bin/tspapi.py
-FARM=/farm
+API=${SR_TSPAPI:-/usr/local/bin/tspapi.py}   # SR_TSPAPI/SR_FARM_DIR 供隔离测试替换平台客户端与状态目录
+FARM=${SR_FARM_DIR:-/farm}
 STATE=$FARM/state.env
 LOGF=$FARM/watchdog.log
 KEY=$FARM/ssh/id_farm
@@ -155,21 +155,28 @@ suspend)
 down|release)
   if [ -f "$STATE" ]; then . "$STATE"
     # 先看平台上还在不在（第二次 down 时集群可能已经没了，先发 release 会报错、本地记录永远清不掉）。
-    # exists 的退出码：0=存在 1=不存在 2=查询失败——查询失败绝不能当成"已消失"
+    # exists 的退出码：0=存在(打印状态) 1=不存在 2=查询失败——查询失败绝不能当成"已消失"
     $API exists "$CID" >/dev/null 2>&1; EX=$?
     case $EX in
       1) echo "平台上已无集群 $CID，清理本地记录" ;;
       2) echo "!! 查询平台失败，无法确认，保留状态（CID=$CID），稍后重试 sr farm down"; exit 1 ;;
       0) $API op "$CID" release >/dev/null || { echo "!! 释放请求失败，保留状态（CID=$CID），稍后重试 sr farm down"; exit 1; }
-         # 释放已发出：先标 releasing，看门狗/resume/sr-build 见到即停手；再确认平台侧真的消失
-         sed -i 's/^FARM_STATUS=.*/FARM_STATUS=releasing/' "$STATE"
-         for i in $(seq 1 12); do sleep 5; $API exists "$CID" >/dev/null 2>&1; EX=$?; [ $EX = 0 ] || break; done
+         # "请求返回了"不等于"平台接受了"。只认两种证据：集群消失，或状态变成释放类（Releas*/Delet*/Destroy*/Terminat*/Remov*）。
+         # 观察到之前不标 releasing、不停续约；60 秒后仍是 Running/Suspended 就当释放被拒，状态原样保留（review：业务拒绝不能当释放中）。
+         ST=""; EX=0
+         for i in $(seq 1 12); do sleep 5; ST=$($API exists "$CID" 2>/dev/null); EX=$?
+           [ $EX = 0 ] || break
+           case "$ST" in [Rr]eleas*|[Dd]elet*|[Dd]estroy*|[Tt]erminat*|[Rr]emov*) break;; esac
+         done
          case $EX in
-           0) pkill -f "[s]r-farm _watchdog" 2>/dev/null
-              echo "释放已发出，平台仍显示存在（释放中）。已停止续约；稍后再执行 sr farm down 确认并清理本地记录"; exit 0 ;;
-           2) pkill -f "[s]r-farm _watchdog" 2>/dev/null
-              echo "!! 释放已发出但查询失败，保留 releasing 状态，稍后重试 sr farm down"; exit 1 ;;
            1) echo "平台确认集群已消失" ;;
+           2) echo "!! 释放请求已发出但随后查询失败，无法确认，状态原样保留（CID=$CID），稍后重试 sr farm down"; exit 1 ;;
+           0) case "$ST" in
+                [Rr]eleas*|[Dd]elet*|[Dd]estroy*|[Tt]erminat*|[Rr]emov*)
+                  sed -i 's/^FARM_STATUS=.*/FARM_STATUS=releasing/' "$STATE"; pkill -f "[s]r-farm _watchdog" 2>/dev/null
+                  echo "平台状态 $ST：释放中。已标 releasing 并停止续约；稍后再执行 sr farm down 确认并清理本地记录"; exit 0 ;;
+                *) echo "!! 释放请求发出 60 秒后平台仍显示 ${ST:-?}，释放未被接受。状态原样保留、续约继续（CID=$CID），请到平台排查"; exit 1 ;;
+              esac ;;
          esac ;;
     esac
   fi

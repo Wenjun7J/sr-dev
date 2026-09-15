@@ -153,11 +153,13 @@ fi
 # 所有 codegen 的 .stamp 随之变脏，依赖 stamp 的全部 TU 跟着重编——此前每一次默认 sr build 都是全量 ninja 遍历，
 # 一直被 ccache 命中掩盖（SR_EXPLAIN=1 抓到的现行）。编译器/依赖路径变了导致 build.ninja 过期的情况由下面的 FRESH 检测覆盖；
 # build.ninja 本身过期（ninja -n 第一条是 Re-running CMake）时数不准，交给"开工并后台按 miss 评估"路径兜底。
+# 输出两个值 "边数 清单是否过期"，调用方 read < <(edges)。不能在函数里给全局变量赋值——$(edges) 是子 shell，
+# 赋值会丢（review 用注入 Re-running CMake 的 ninja 桩抓到 MANIFEST_DIRTY 恒为 0）
 MANIFEST_DIRTY=0
-edges(){ [ -f "$TREE/build.ninja" ] || { echo 99999; return; }
-         local out n; out=$( cd "$TREE" && ninja -n 2>/dev/null ); n=$(printf '%s\n' "$out" | grep -c 'CXX object')
-         printf '%s\n' "$out" | grep -q 'Re-running CMake' && MANIFEST_DIRTY=1
-         echo "${n:-99999}"; }
+edges(){ [ -f "$TREE/build.ninja" ] || { echo "99999 0"; return; }
+         local out n d=0; out=$( cd "$TREE" && ninja -n 2>/dev/null ); n=$(printf '%s\n' "$out" | grep -c 'CXX object')
+         printf '%s\n' "$out" | grep -q 'Re-running CMake' && d=1
+         echo "${n:-99999} $d"; }
 # 农场是硬前置。这是个分布式编译项目，没有农场就别开工——
 # 静默退化成本地编译只会让人以为"就这么慢"，而不知道少了 1.9 倍。
 if [ ! -f "$FARM_STATE" ]; then
@@ -185,7 +187,7 @@ fi
 if [ "$DIST" != off ]; then
   sr-farm _wd 2>/dev/null || true   # 容器重启后把看门狗拉回来
   . "$FARM_STATE"                                    # 提供 SCHED / FARM_STATUS / WORKERS
-  N=$(edges)
+  read -r N MANIFEST_DIRTY < <(edges); N=${N:-99999}; MANIFEST_DIRTY=${MANIFEST_DIRTY:-0}
   # 构建树不存在（首次 / --clean）时必然是大规模真编译，不必等 miss 攒够再唤醒；
   # 这样唤醒能和 cmake configure 那 30-60 秒重叠，而不是等到编译真开始才动。
   FRESH=0; { [ ! -f "$TREE/build.ninja" ] || [ $CLEAN = 1 ]; } && FRESH=1
@@ -349,9 +351,9 @@ OUTF=$(mktemp /tmp/sr-build.XXXXXX)
 E=$(date +%s)
 : > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null
 
-kill $SAMPLER 2>/dev/null
-OOM1=$(oomcnt); # grep -c 计数为 0 时退出码是 1，写 `|| echo 0` 会变成两行 "0\n0"，
-# 后面 [ "$KILLED" -gt 0 ] 就报 integer expression expected（踩过两次了）
+# 先读一遍 OOM 痕迹用于决定要不要重试；采样器不停——重试期间要继续采样（review #6），结束后再读最终值。
+# grep -c 计数为 0 时退出码是 1，写 `|| echo 0` 会变成两行 "0\n0"，后面 [ "$KILLED" -gt 0 ] 就报 integer expression expected（踩过两次了）
+OOM1=$(oomcnt)
 KILLED=$(grep -c "Killed signal terminated program" "$OUTF" 2>/dev/null); KILLED=${KILLED:-0}
 PEAK=$(cat $ANONF 2>/dev/null || echo 0); MAXM=$(cat $CG/memory.max 2>/dev/null || echo 0)
 
@@ -379,6 +381,10 @@ if [ $RC -ne 0 ] && { [ "${OOM1:-0}" -gt "${OOM0:-0}" ] || [ "${KILLED:-0}" -gt 
 fi
 rm -f $RUNFLAG      # 采样与异步唤醒循环到这里才退出：重试期间也要继续采样、继续心跳
 : > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null
+kill $SAMPLER 2>/dev/null
+# 最终值覆盖两次尝试：峰值取采样器全程最大，oom/Killed 计数含重试
+OOM1=$(oomcnt); KILLED=$(grep -c "Killed signal terminated program" "$OUTF" 2>/dev/null); KILLED=${KILLED:-0}
+PEAK=$(cat $ANONF 2>/dev/null || echo 0)
 
 printf "\n== 结束 rc=%d 用时 %dm%02ds ==\n" $RC $(( (E-S)/60 )) $(( (E-S)%60 ))
 # 每次编译记一行概况到 /farm/builds.tsv（宿主机卷，sr history 看），完整输出另存一份

@@ -17,7 +17,7 @@
 #   3) -E -fdirectives-only：保留全部 #define/#undef 文本，头文件不展开宏。必须如此——全展开的 -E 看不见"只改了宏定义"
 #      （宏没在 PCH 头里被使用），合成工程实测会造成错误命中。行号/文件切换标记保留（__INCLUDE_LEVEL__ 的结构、
 #      __FILE__ 的文件身份都在里面）；-fno-working-directory 去掉 "# 1 <cwd>//"（对应 comp_dir，真实编译里已被抹成 .）。
-#   4) 行号标记里的文件名施加与编译器相同的 -f{file,macro,debug}-prefix-map：cmake_pch.hxx 里 #include 的是绝对路径
+#   4) 行号标记里的文件名只施加 -ffile-prefix-map（或成对等价的 macro+debug 映射）：cmake_pch.hxx 里 #include 的是绝对路径
 #      （内容，ccache 改不到），但编译器产物（__FILE__、DW_AT_name）里它已经是映射后的相对路径——校验和看到的文件名
 #      = 产物里的文件名。工程没配 prefix-map 时保持绝对路径，跨目录不共享：正确的保守行为。
 #   5) 哈希输入 = "v3" + 改写后的参数（*-prefix-map 只留选项名，与 ccache 一致）+ 归一化后的 -E 输出。
@@ -47,20 +47,29 @@ for a in "$@"; do
   case "$r" in -ffile-prefix-map=*|-fdebug-prefix-map=*|-fmacro-prefix-map=*) hashed+=("${r%%=*}");; *) hashed+=("$r");; esac
 done
 
-# 行号标记归一化：按 prefix-map（长前缀优先）把 # N "OLD/..." 改成 # N "NEW/..."
-mapsed=""
-for a in "${args[@]}"; do case "$a" in -ffile-prefix-map=*=*|-fmacro-prefix-map=*=*|-fdebug-prefix-map=*=*) m=${a#*=}; printf '%s\n' "$m";; esac; done \
+# 行号标记归一化：只用 -ffile-prefix-map（它同时作用于 __FILE__ 与调试信息）。-fdebug-prefix-map 单独存在时不改 __FILE__，
+# -fmacro-prefix-map 单独存在时不改调试信息——任一种单独出现，两条路径的产物就真的不同，绝不能归一化（review：只配 debug 映射的
+# 工程实测会错误命中）。两者以完全相同的 OLD=NEW 成对出现时等价于 file-prefix-map，允许。长前缀优先。
+sedf="$out.sum.sed.$$"
+{ for a in "${args[@]}"; do case "$a" in -ffile-prefix-map=*=*) printf 'F\t%s\n' "${a#*=}";; -fmacro-prefix-map=*=*) printf 'M\t%s\n' "${a#*=}";; -fdebug-prefix-map=*=*) printf 'D\t%s\n' "${a#*=}";; esac; done \
+  | awk -F'\t' '$1=="F"{f[$2]=1} $1=="M"{m[$2]=1} $1=="D"{d[$2]=1} END{for(k in f) print k; for(k in m) if(!(k in f) && (k in d)) print k}' \
   | awk -F= '{print length($1)"\t"$0}' | sort -rn | cut -f2- | while IFS= read -r m; do
-      o=${m%%=*}; n=${m#*=}; o=${o//|/\\|}; n=${n//|/\\|}; printf 's|^\\(# [0-9]* "\\)%s|\\1%s|\n' "$o" "$n"; done > "$out.sum.sed.$$" 2>/dev/null
-tmp=$(mktemp "$out.sum.XXXXXX" 2>/dev/null) || { rm -f "$out.sum.sed.$$"; exit 0; }
-if "${args[@]}" -E -fdirectives-only -fno-working-directory > "$tmp.raw" 2>/dev/null && [ -s "$tmp.raw" ] \
-   && sed -f "$out.sum.sed.$$" "$tmp.raw" > "$tmp.i" && [ -s "$tmp.i" ] \
-   && sum=$({ printf 'v3\n'; printf '%s\n' "${hashed[@]}"; cat "$tmp.i"; } | sha256sum | cut -d' ' -f1) && [ -n "$sum" ]; then
-  printf 'v3 %s\n' "$sum" > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$out.sum"   # mktemp 是 0600，宿主机用户读不了
-else
-  rm -f "$out.sum" "$tmp"
-  echo "ccache-pch: 预处理失败，未写 $out.sum（该 PCH 的 TU 按 .gch 内容哈希：正确但不可跨机共享）" >&2
+      o=${m%%=*}; n=${m#*=}; o=${o//|/\\|}; n=${n//|/\\|}; printf 's|^\\(# [0-9]* "\\)%s|\\1%s|\n' "$o" "$n"; done > "$sedf"; } 2>/dev/null
+
+# 预处理、归一化、哈希、写入、发布是一个整体：任何一步失败都删掉旧 .sum（.gch 可能已更新，旧 .sum 描述的是旧内容）
+publish_sum(){
+  local tmp sum
+  tmp=$(mktemp "$out.sum.XXXXXX" 2>/dev/null) || return 1
+  { "${args[@]}" -E -fdirectives-only -fno-working-directory > "$tmp.raw" 2>/dev/null && [ -s "$tmp.raw" ] \
+    && [ -f "$sedf" ] && sed -f "$sedf" "$tmp.raw" > "$tmp.i" && [ -s "$tmp.i" ] \
+    && sum=$({ printf 'v3\n'; printf '%s\n' "${hashed[@]}"; cat "$tmp.i"; } | sha256sum | cut -d' ' -f1) && [ -n "$sum" ] \
+    && printf 'v3 %s\n' "$sum" > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$out.sum"; } || { rm -f "$tmp" "$tmp.raw" "$tmp.i"; return 1; }
+  [ -n "${SR_PCH_KEEP_I:-}" ] && mv -f "$tmp.i" "$out.i" 2>/dev/null || rm -f "$tmp.i"   # SR_PCH_KEEP_I=1 留下归一化后的 -E 输出供检查
+  rm -f "$tmp.raw"; return 0
+}
+if ! publish_sum; then
+  rm -f "$out.sum"
+  echo "ccache-pch: 生成/发布 $out.sum 失败，已删除旧 .sum（该 PCH 的 TU 按 .gch 内容哈希：正确但不可跨机共享）" >&2
 fi
-rm -f "$tmp.raw" "$out.sum.sed.$$"
-[ -n "${SR_PCH_KEEP_I:-}" ] && mv -f "$tmp.i" "$out.i" 2>/dev/null || rm -f "$tmp.i"   # SR_PCH_KEEP_I=1 留下归一化后的 -E 输出供检查
+rm -f "$sedf"
 exit 0

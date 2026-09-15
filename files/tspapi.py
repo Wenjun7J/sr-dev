@@ -8,8 +8,9 @@ CFG = os.path.expanduser(os.environ.get("TSP_CONFIG", "~/.tsp/config.json"))   #
 def _cfg():
     try:
         with open(CFG) as f: return json.load(f)
-    except Exception:
-        sys.exit("未找到 TSP 凭据 %s。请在宿主机跑一次 tsp login，或挂载该目录。" % CFG)
+    except Exception as e:
+        # 不能 sys.exit：exists 的调用方把退出码 1 当"集群不存在"，凭据问题必须是"查询失败"(2)
+        raise RuntimeError("未找到/读不了 TSP 凭据 %s（%s）。请在宿主机跑一次 tsp login，或挂载该目录。" % (CFG, e))
 
 def _req(path, data=None, raw=False):
     c = _cfg(); url = c["server_url"].rstrip("/") + path
@@ -32,16 +33,19 @@ def _die2(msg):
     print(msg, file=sys.stderr); sys.exit(2)
 
 def exists(cid):
-    """结构化判定：退出码 0=存在(打印状态) 1=不存在 2=查询失败。sr-farm down 用它区分"没了"和"查不到"。"""
+    """结构化判定：退出码 0=存在(打印状态) 1=不存在 2=查询失败。sr-farm down 用它区分"没了"和"查不到"。
+    凭据、网络、响应结构、元素解析——任何一种失败都是 2；只有成功查完一份有效列表且确认不含 CID，才返回 1。"""
     try:
         cs = clusters()
+        for c in cs:
+            if not isinstance(c, dict):
+                raise ValueError("列表元素不是对象: %r" % (c,))
+            if str(c.get("cluster_id")) == str(cid):
+                print(c.get("status") or c.get("cluster_status") or "exists"); sys.exit(0)
     except SystemExit:
         raise
     except Exception as e:
         _die2("TSP 查询失败: %s" % e)
-    for c in cs:
-        if str(c.get("cluster_id")) == str(cid):
-            print(c.get("status") or c.get("cluster_status") or "exists"); sys.exit(0)
     sys.exit(1)
 
 def cid(name):
@@ -90,7 +94,12 @@ def row(name):
 def op(cluster_id, type_, add_hours=None):
     d = {"cluster_id": cluster_id, "type": type_, "op_scope": "ALL"}
     if add_hours: d["add_hours"] = str(add_hours)
-    return _req("/cluster/update/", d)
+    r = _req("/cluster/update/", d)
+    # 业务失败尽力识别："收到了 JSON"不等于成功。字段名未完全掌握，只用常见的 success/code；
+    # 识别不了的情况由 sr-farm 通过后续 exists 观察真实状态兜底。
+    if not isinstance(r, dict) or r.get("success") is False or r.get("code") not in (None, 0, "0", 200, "200"):
+        sys.exit("TSP 操作 %s 未成功: %s" % (type_, str(r)[:200]))
+    return r
 
 def create(name, workers, duration=2, itype="8c32g", disk="20"):
     # disk 20 而不是 100：实测 worker 上 icecc 只占 4 KB——预处理源码进来、.o 出去，
@@ -114,7 +123,7 @@ def create(name, workers, duration=2, itype="8c32g", disk="20"):
          "replication_num": "3", "data_sets": ""}
     return _req("/cluster/quick/apply/", d)
 
-if __name__ == "__main__":
+def _main():
     a = sys.argv[1:]
     if not a: sys.exit("用法: tspapi.py {cid|exists|nodes|spec|row|op|create} ...")
     f = a[0]
@@ -131,3 +140,11 @@ if __name__ == "__main__":
                                     a[4] if len(a) > 4 else "8c32g",
                                     a[5] if len(a) > 5 else "20").get("msg",""))
     else: sys.exit("未知子命令 " + f)
+
+if __name__ == "__main__":
+    try:
+        _main()
+    except SystemExit:
+        raise
+    except Exception as e:          # 凭据/网络/解析错误：一句话 + 非零退出，不抛栈
+        sys.exit("TSP 请求失败: %s" % e)
