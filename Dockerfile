@@ -47,13 +47,16 @@ COPY files/node-setup.sh /usr/local/bin/node-setup.sh
 
 # 每个 gcc 版本各生成一份 icecc 工具链包：客户端把自己的编译器传给 worker，
 # 所以编 3.5 时传 gcc11 的包、编 main 时传 gcc14 的包，不能混
-RUN mkdir -p /opt/icecc && cd /opt/icecc \
- && for g in /opt/gcc11 /opt/gcc12 /opt/gcc13 $(ls -d /opt/gcc-toolset-* 2>/dev/null); do \
-      [ -x "$g/bin/gcc" ] || continue; \
-      n=$(basename $g); mkdir -p /opt/icecc/$n && cd /opt/icecc/$n \
+# 任何一份生成失败即镜像构建失败——运行时绝不拿别的 gcc 的包顶替（worker 用错编译器且不报错）
+RUN set -e; TS=$(ls -d /opt/gcc-toolset-* 2>/dev/null); [ -n "$TS" ] || { echo "base image has no /opt/gcc-toolset-*"; exit 1; }; \
+    mkdir -p /opt/icecc; \
+    for g in /opt/gcc11 /opt/gcc12 /opt/gcc13 $TS; do \
+      n=$(basename $g); [ -x "$g/bin/gcc" ] || { echo "toolchain $n: no gcc at $g/bin/gcc"; exit 1; }; \
+      mkdir -p /opt/icecc/$n && cd /opt/icecc/$n \
       && icecc-create-env --gcc "$g/bin/gcc" "$g/bin/g++" >/dev/null 2>&1 \
-      && echo "toolchain $n: $(ls *.tar.gz 2>/dev/null)"; \
-    done; true
+      && [ "$(ls *.tar.gz 2>/dev/null | wc -l)" = 1 ] || { echo "toolchain $n FAILED"; exit 1; }; \
+      echo "toolchain $n: $(ls *.tar.gz)"; \
+    done
 
 # 挂载点：每次编译在私有 mount ns 里把 /tp/<digest>/installed bind 到这里（thirdparty 的规范路径）
 RUN mkdir -p /var/local/thirdparty/installed

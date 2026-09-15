@@ -56,7 +56,7 @@ digest_of(){ local img=$1 h repo tag
   h=${img%%/*}; repo=$(echo "${img#*/}" | cut -d: -f1); tag=${img##*:}
   curl -sI --max-time 10 -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
     "http://$h/v2/$repo/manifests/$tag" 2>/dev/null \
-    | grep -i '^docker-content-digest:' | tr -d '\r' | awk '{print $2}' | cut -d: -f2 | cut -c1-12; }
+    | grep -i '^docker-content-digest:' | tr -d '\r' | awk '{print $2}'; }   # 返回完整 sha256:…，截短只在显示时做
 
 running(){ [ "$(docker inspect -f '{{.State.Running}}' $NAME 2>/dev/null)" = true ]; }
 TTY=(); [ -t 0 ] && [ -t 1 ] && TTY=(-it)
@@ -80,16 +80,21 @@ ensure_container(){
     -v $WORK:$WORK -v $BASE/ccache:/ccache -v $BASE/m2:/root/.m2 \
     -v $BASE/farm:/farm -v $BASE/.tsp:/root/.tsp -v $BASE/iceccrun:/var/run/icecc \
     -v $TPDIR:/tp ${CONF_MOUNT[@]+"${CONF_MOUNT[@]}"} \
-    -e SR_USER="$SR_USER" -e SR_UID="$(id -u)" -e SR_OSSCFG="$HOME/.ossutilconfig" -w $WORK $IMG sleep infinity >/dev/null
+    -e SR_USER="$SR_USER" -e SR_UID="$(id -u)" -e SR_OSSCFG="$HOME/.ossutilconfig" -w $WORK $IMG sleep infinity >/dev/null \
+    || { echo "!! 容器启动失败（docker run 返回非零）"; return 1; }
   echo "== 容器 $NAME 已启动（单容器，编所有版本；限额 ${CPUS}核/${MEM}）"
   # 看门狗随容器死。容器重建后若已有农场，必须立刻把它拉回来——否则 3 小时无续约，
   # 死人开关会把农场释放（踩过：一天里反复重建容器，农场被自己的保护机制清掉了）
   [ -f "$BASE/farm/state.env" ] && docker exec $NAME sr-farm _wd >/dev/null 2>&1 && echo "   看门狗已重新拉起（农场续约恢复）"
+  return 0   # 上一行是条件链，没有农场时会返回 1，曾让新用户第一次 sr build 在容器起好后被 || exit 1 打断
 }
 
 # 把某个官方镜像的 thirdparty 拉到 $TPDIR/<digest>/，并记下它要哪个 gcc
-ensure_tp(){   # $1=官方镜像全名  $2=digest
-  local img=$1 dg=$2
+# $1=镜像引用 repo@sha256:…（一切 docker 操作按 digest，tag 移动或本地残留同 tag 旧镜像都拿不到错内容）
+# $2=完整 digest（64 hex，直接做目录名：名字与内容由构造保证一致，永远不需要替换一个可能正被别人 bind 着编译的目录）
+# $3=解析出的 tag 形式，只用于记录
+ensure_tp(){
+  local img=$1 dg=$2 tagname=${3:-$1}
   local d=$TPDIR/$dg
   if [ -f "$d/.ready" ]; then echo "$dg"; return 0; fi
   echo "== 首次使用该镜像的依赖，拉取中（约 7 秒，6~8G）…" >&2
@@ -108,7 +113,7 @@ ensure_tp(){   # $1=官方镜像全名  $2=digest
   # 记下这个镜像用哪个 gcc 大版本，编译时据此选 /opt/gccNN
   local gv
   gv=$(docker run --rm "$img" bash -c 'G=$(ls -d /opt/gcc-toolset-*/bin/gcc 2>/dev/null|sort -V|tail -1); [ -n "$G" ]||G=$(command -v gcc); $G -dumpversion' 2>/dev/null)
-  docker run --rm -v "$t":/dst "$img" bash -c "echo ${gv:-14} > /dst/.gccmajor; echo $img > /dst/.image; chmod -R a+rX /dst; touch /dst/.ready" >/dev/null 2>&1
+  docker run --rm -v "$t":/dst "$img" bash -c "echo ${gv:-14} > /dst/.gccmajor; echo $tagname > /dst/.image; echo $img > /dst/.ref; echo sha256:$dg > /dst/.digest; chmod -R a+rX /dst; touch /dst/.ready" >/dev/null 2>&1
   mv "$t" "$d" && echo "$dg"; }
 
 case "${1:-}" in
@@ -127,9 +132,10 @@ history|log)
 tp)
   echo "依赖目录: $TPDIR $([ "$TPDIR" = "$SHARED_TP" ] && echo "（全机共享）" || echo "（个人）")"
   printf "%-14s %-8s %-7s %s\n" DIGEST GCC 大小 状态
-  for d in $TPDIR/*/; do [ -d "$d" ] || continue
-    printf "%-14s %-8s %-7s %s\n" "$(basename $d)" "$(cat $d/.gccmajor 2>/dev/null || echo ?)" \
-      "$(du -sh $d 2>/dev/null|cut -f1)" "$([ -f $d/.ready ] && echo 就绪 || echo 不完整)"
+  for d in $TPDIR/*/; do [ -d "$d" ] || continue; n=$(basename $d)
+    printf "%-14s %-8s %-7s %-6s %s\n" "${n:0:12}" "$(cat $d/.gccmajor 2>/dev/null || echo ?)" \
+      "$(du -sh $d 2>/dev/null|cut -f1)" "$([ -f $d/.ready ] && echo 就绪 || echo 不完整)" \
+      "$([ ${#n} -lt 64 ] && echo '(旧格式目录，确认无人使用后可删)' || cat $d/.image 2>/dev/null)"
   done ;;
 versions)
   for n in $(awk '!/^#/&&NF{print $1}' "$CONF"); do
@@ -175,8 +181,10 @@ U
       [ -n "$SPEC" ] || { echo "!! 首次编译需指定用哪个官方镜像的依赖，例: sr -v main build"
                           echo "   sr versions 看可选版本"; exit 1; }
       resolve "$SPEC" || { echo "!! 找不到版本 $SPEC，sr versions 看可选项"; exit 1; }
-      DG=$(digest_of "$PBASE"); [ -n "$DG" ] || { echo "!! 拿不到 $PBASE 的 digest"; exit 1; }
-      echo "   依赖镜像 $PBASE  digest=$DG"
+      DGFULL=$(digest_of "$PBASE"); [ -n "$DGFULL" ] || { echo "!! 拿不到 $PBASE 的 digest"; exit 1; }
+      DG=${DGFULL#sha256:}; DGS=${DG:0:12}       # 目录名用完整 digest，显示用 12 位
+      REF="${PBASE%:*}@$DGFULL"                 # 按 digest 引用镜像（%:* 去掉的是最后的 :tag，registry 的 :5000 不受影响）
+      echo "   依赖镜像 $PBASE  digest=$DGS"
       # 要拉依赖 = 这个 digest 第一次用 = 必然全量重编 = 必然要农场。农场若在睡，
       # 现在就后台唤醒（29s），和拉依赖（7s）+ configure 并行，不用等到编译开始再叫醒它。
       if [ ! -f "$TPDIR/$DG/.ready" ] && grep -q '^FARM_STATUS=suspended' "$BASE/farm/state.env" 2>/dev/null; then
@@ -187,12 +195,12 @@ U
       # 如果是依赖升级而你的代码还没 rebase，编译可能会挂，这时该 rebase 而不是怪工具
       if [ -n "$KEY" ] && [ -f "$PDIR/$KEY" ]; then
         OLD_DG=$(cut -d' ' -f2 "$PDIR/$KEY" 2>/dev/null)
-        if [ -n "$OLD_DG" ] && [ "$OLD_DG" != "$DG" ]; then
-          echo "   注意：上游 $SPEC 的依赖镜像已更新（$OLD_DG -> $DG），本次用新的。"
+        if [ -n "$OLD_DG" ] && [ "${OLD_DG:0:12}" != "${DG:0:12}" ]; then   # 旧记录可能是 12 位格式，按前缀比
+          echo "   注意：上游 $SPEC 的依赖镜像已更新（${OLD_DG:0:12} -> $DGS），本次用新的。"
           echo "         若编译报依赖相关错误，先把代码 rebase 到最新再试。"
         fi
       fi
-      ensure_tp "$PBASE" "$DG" >/dev/null || exit 1
+      ensure_tp "$REF" "$DG" "$PBASE" >/dev/null || exit 1
       GMAJ=$(cat "$TPDIR/$DG/.gccmajor" 2>/dev/null | cut -d. -f1); GMAJ=${GMAJ:-14}
       GHOME=/opt/gcc$GMAJ
       [ "$GMAJ" = 14 ] && GHOME=$(docker exec $NAME bash -c 'ls -d /opt/gcc-toolset-14 2>/dev/null || echo /opt/gcc13')
@@ -204,7 +212,7 @@ U
       # 可选透传：CCACHE_REMOTE_STORAGE(ccache 远端存储 URL) / SR_CCACHE_DIR(换一个缓存目录做对照实验)
       XENV=(); for v in CCACHE_REMOTE_STORAGE SR_CCACHE_DIR; do [ -n "${!v:-}" ] && XENV+=(-e "$v"); done
       docker exec -w "$PWD" \
-        -e STARROCKS_THIRDPARTY=/var/local/thirdparty -e STARROCKS_GCC_HOME="$GHOME" -e SR_TPDIGEST="$DG" -e SR_VER="$SPEC" -e SR_BRANCH="${BR:-?}" \
+        -e STARROCKS_THIRDPARTY=/var/local/thirdparty -e STARROCKS_GCC_HOME="$GHOME" -e SR_TPDIGEST="$DGS" -e SR_VER="$SPEC" -e SR_BRANCH="${BR:-?}" \
         "${XENV[@]}" "${TTY[@]}" $NAME unshare -m --propagation private sh -c \
           'mount --bind "/tp/$0/installed" /var/local/thirdparty/installed && exec sr-build "$@"' "$DG" "$@" ;;
     farm) docker exec "${TTY[@]}" $NAME sr-farm "$@" ;;
