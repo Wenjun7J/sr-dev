@@ -26,7 +26,7 @@ sr                      宿主机唯一入口：起容器、解析版本、拉�
 Dockerfile              单镜像：官方 toolchains 镜像 + gcc 11/12/13 + ninja/ccache/icecc + 每个 gcc 一份 icecc 工具链包
 files/sr-build          容器内编译驱动：ninja/ccache/icecc 编排、异步唤醒农场、OOM 识别与重试、编译记录
 files/sr-farm           农场生命周期：申请、下发 icecc、续约看门狗、闲置休眠、resume 校验/修复/降级
-files/mvn-keepcache     FE 用的 mvn 包装：`mvn clean` 前后存/放回各模块的 checkstyle 缓存（冷编译 checkstyle 105s → 0s）
+files/mvn-keepcache     FE 用的 mvn 包装：把各模块的 checkstyle 缓存同步到 ~/farm/checkstyle-cache，clean/手删后放回（冷编译 checkstyle 105s → 0s）
 files/node-setup.sh     在 worker 节点上执行：清掉预装服务、装 icecc、写配置并回读校验
 files/tspapi.py         云平台（TSP）的极简客户端，标准库实现；换平台只需重写这一个文件
 files/cxxlaunch         CMAKE_CXX_COMPILER_LAUNCHER，绕过 ccache 做纯计时时用
@@ -70,7 +70,8 @@ sr farm init                               # 可选：建农场。没有农场�
 
 `sr build --fe` 走 build.sh 的 maven 流程，农场与 ccache 不参与。实测 fe-core（含测试 5567 个 java 文件）冷编译 3m45s 里 checkstyle 占 105s，
 而 checkstyle 自带按 mtime 的缓存（`target/checkstyle-cachefile`），有它只要 0–1s——只是 `--clean` 会把它连 target/ 一起删掉。
-插件没有改缓存位置的 `-D` 开关，所以 `files/mvn-keepcache` 在 `mvn clean` 前后把它存走再放回：`sr build --fe --clean` 3m45s → 2m06s，检查结果不变。
+插件没有改缓存位置的 `-D` 开关（到 3.6.0 都没有），所以 `files/mvn-keepcache` 在每次 mvn 调用前后把它同步到 `~/farm/checkstyle-cache/`，
+`mvn clean`、`git clean`、手删 target 之后都能放回：`sr build --fe --clean` 3m45s → 2m06s，检查结果不变。不改 pom：临时改再还原会让被打断的构建留下脏 pom。
 剩下的大头是 maven-compiler-plugin 3.1 的整模块重编（改一行也编 4670 文件）与测试编译，`sr build --fe --help` 里的选项另说。
 
 ## 农场

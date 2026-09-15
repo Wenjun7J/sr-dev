@@ -141,7 +141,7 @@ TREE=$TREE_BASE/build_$BT
 # PCH 内容只含标准库头，自然重建几乎不会发生，跨机共享会一直断。此处已在源码树锁内、configure/数边之前；
 # 只碰 wrapper 管理的产物（*/CMakeFiles/*/cmake_pch.hxx.gch）。C 语言的 cmake_pch.h.gch 不管：build.sh 只给 C++ 配了
 # launcher，C 编译不经 ccache，永远不会有 .sum，纳入只会每次误删重建（踩过）。
-if [ -d "$TREE" ]; then
+if [ "$TARGET" != fe ] && [ -d "$TREE" ]; then   # --fe 不碰 BE 构建树（review）
   OLDPCH=0
   while IFS= read -r g; do
     if [ ! -f "$g.sum" ] || [ "$(head -c 3 "$g.sum" 2>/dev/null)" != "v5 " ]; then rm -f "$g" "$g.sum"; OLDPCH=$((OLDPCH+1)); fi
@@ -164,11 +164,13 @@ edges(){ [ -f "$TREE/build.ninja" ] || { echo "99999 0"; return; }
 # 静默退化成本地编译只会让人以为"就这么慢"，而不知道少了 1.9 倍。
 # 没有农场：不能分布式，但可以本机编。交互时问一句（y 继续 / 其它退出），非交互保持拒绝——脚本里静默退化成本地
 # 只会让人以为"就这么慢"，要放行请显式 SR_LOCAL_OK=1
+# FE 是 maven/Java，农场和 ccache 都帮不上：先定死本地，下面的农场检查只约束需要农场的构建（review：原来 --fe 也会被"无农场"拦住）
+[ "$TARGET" = fe ] && { DIST=off; FARM_NOTE="本地（FE 是 maven/Java，农场和 ccache 都帮不上）"; }
 NOFARM=""
 if [ ! -f "$FARM_STATE" ] && [ "$DIST" != off ]; then
   echo "!! 还没有编译农场：无法分布式编译（全量约慢 1.9 倍），只能本机 -j$JLOCAL。"
   echo "   建农场: sr farm init（约 6~9 分钟建 5 台 worker；之后休眠/唤醒/续约/自愈全自动，不用再管）"
-  if [ -t 0 ]; then
+  if [ -t 0 ] || [ -n "${SR_TTY:-}" ]; then   # SR_TTY 由宿主机 sr 按自己的 stdin 设置：docker exec -i 下容器内 -t 0 恒为假
     read -r -p "   现在先用本机编译吗？[y/N] " ans
     case "$ans" in y|Y|yes|YES) DIST=off; NOFARM=1; FARM_NOTE="本地（尚无农场，用户确认）";; *) echo "   已取消。"; exit 1;; esac
   elif [ -n "${SR_LOCAL_OK:-}" ]; then
@@ -177,18 +179,17 @@ if [ ! -f "$FARM_STATE" ] && [ "$DIST" != off ]; then
     echo "   非交互环境不自动退化；要本机编请设 SR_LOCAL_OK=1 或加 --dist off。"; exit 1
   fi
 fi
-# 农场标记为 degraded（resume 修复后仍连不上）时也拒绝：这是分布式工具，不能静默退回本地
-if grep -q '^FARM_STATUS=degraded' "$FARM_STATE" 2>/dev/null; then
+# 农场标记为 degraded（resume 修复后仍连不上）时也拒绝：这是分布式工具，不能静默退回本地。显式 --dist off 与 FE 不算静默，不拦（review）
+if [ "$DIST" != off ] && grep -q '^FARM_STATUS=degraded' "$FARM_STATE" 2>/dev/null; then
   echo "!! 农场处于 degraded（worker 未连上，resume 修复失败）。先 sr farm status 排查，或 sr farm resume 重试。"
   exit 1
 fi
 # 走本地的几种原因分别写清楚，别混成一句
-[ "$DIST" = off ] && [ -z "$NOFARM" ] && FARM_NOTE="本地（--dist off）"
+[ "$DIST" = off ] && [ -z "$NOFARM" ] && [ "$TARGET" != fe ] && FARM_NOTE="本地（--dist off）"
 if [ "$DIST" != off ] && grep -q '^FARM_STATUS=releasing' "$FARM_STATE" 2>/dev/null; then
   DIST=off; FARM_NOTE="本地（农场正在释放，sr farm down 尚未确认完成）"
   echo "!! 农场正在释放，本次按无农场处理（本地 -j$JLOCAL）"
 fi
-[ "$TARGET" = fe ] && { DIST=off; FARM_NOTE="本地（FE 是 maven/Java，农场和 ccache 都帮不上）"; }
 if [ "$DIST" != off ] && [ ! -f "$TOOLCHAIN" ]; then
   DIST=off; FARM_NOTE="本地（镜像里没有与 $GH 配对的 icecc 工具链包，不能外发）"
   echo "!! /opt/icecc/$GH/ 下没有工具链包，本次不用农场（重建镜像应修复；绝不拿别的 gcc 的包顶替）"
@@ -282,6 +283,7 @@ echo "=========================================================="
 echo " 目标: $TARGET$([ "$TARGET" = fe ] && echo "   (maven，农场/ccache 不参与)")"
 [ "$TARGET" != fe ] && echo " 类型: $BT      生成器: $GEN      并发: -j$J"
 echo " 模式: $FARM_NOTE"
+[ -n "${SR_DRYRUN:-}" ] && { echo " (SR_DRYRUN=1：决策已打印，到此为止不编译)"; exit 0; }   # 测试钩子：验证农场/交互决策
 echo " 版本: ${SR_VER:-未指定}   编译器: $(${STARROCKS_GCC_HOME:-/usr}/bin/gcc -dumpfullversion 2>/dev/null || echo ?)   依赖: ${STARROCKS_THIRDPARTY:-默认}"
 echo " 源码树: $SR"
 echo " 构建树: $TREE${TREE_NOTE:-}"
@@ -427,21 +429,23 @@ if [ $RC -eq 0 ]; then
     FJ=$(ls -1 "$FOUT/lib/"*.jar 2>/dev/null | wc -l)
     [ -d "$FOUT/lib" ] && echo "   lib/  $FJ 个 jar   bin/ conf/ webroot/"
     # FE 的真实开销在 maven reactor 摘要里。日志里可能有多段 reactor：--clean 会先单独跑一次 mvn clean（同样列出 fe-core，
-    # 全是 0.0x s），java-extensions 也有一段（属 BE）。只取最后一段含 fe-core 的；javac 模块数也只统计这一次 mvn 调用里的
-    # default-compile（testCompile 另算，不计）
+    # 全是 0.0x s），java-extensions 也有一段（属 BE）。只取最后一段含 fe-core 的
     if [ -f "$LOGF" ]; then
       # 去掉颜色码和可能的时间戳前缀（MAVEN_OPTS 开了 showDateTime 时每行前面有 HH:mm:ss）
-      FESUM=$(tr '\r' '\n' < "$LOGF" | sed -E 's/\x1b\[[0-9;]*m//g; s/^[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)? //' \
-        | awk '/Scanning for projects/{nc=0; nu=0; ph=""}
-               /^\[INFO\] --- /{ph=""} /--- maven-compiler-plugin:[^ ]+:compile \(default-compile\)/{ph="c"}
-               ph=="c" && /Compiling [0-9]+ source files/{nc++} ph=="c" && /Nothing to compile/{nu++}
-               /Reactor Summary/{f=1; buf=""} f{buf=buf $0 "\n"}
-               /BUILD (SUCCESS|FAILURE)/{if(f && buf ~ /fe-core/){last=buf; lnc=nc; lnu=nu} f=0}
-               END{printf "%s__COUNTS__ %d %d\n", last, lnc, lnu}')
-      printf '%s\n' "$FESUM" | grep -E ' (SUCCESS|FAILURE) ' | sed -E 's/^\[INFO\] //; s/ \.{2,} / /' \
+      FELOG=$(mktemp); tr '\r' '\n' < "$LOGF" | sed -E 's/\x1b\[[0-9;]*m//g; s/^[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)? //' > "$FELOG"
+      awk '/Reactor Summary/{f=1; buf=""} f{buf=buf $0 "\n"} /BUILD (SUCCESS|FAILURE)/{if(f && buf ~ /fe-core/) last=buf; f=0} END{printf "%s", last}' "$FELOG" \
+        | grep -E ' (SUCCESS|FAILURE) ' | sed -E 's/^\[INFO\] //; s/ \.{2,} / /' \
         | awk 'BEGIN{print " FE(maven) 各模块耗时:"} {t=$0; sub(/^.*\[ */,"",t); sub(/\]$/,"",t); printf "   %-22s %-8s %s\n", $1, $2, t}'
-      read -r _ NC NU < <(printf '%s\n' "$FESUM" | grep '^__COUNTS__')
-      echo "   javac 实际编译 ${NC:-0} 个模块，${NU:-0} 个模块已是最新（maven 的增量粒度是整模块：fe-core 有一个文件变就整模块重编）"
+      # javac 到底重编了哪些模块：看 "Compiling N source file(s) to <dir>/target/classes" 自带的输出目录归属，-T 并行下各模块日志
+      # 交错也不会错（review：全局阶段变量会被别的模块的 testCompile 覆盖而漏计，单数 "1 source file" 也没匹配）；只算 fe/ 下的
+      # 主源码，测试编译进 test-classes 不算。"Nothing to compile" 那行没有路径归属不了，不再报"N 个模块已是最新"
+      # 行形如 "[INFO] Compiling 4670 source files to /abs/fe/fe-core/target/classes"（compiler 3.13 会多一段 "with javac [...]"）
+      MODS=$(sed -nE "s#^(\[INFO\] )?Compiling ([0-9]+) source files?( with javac \[[^]]*\])? to $SR/fe/(.+)/target/classes\$#\\4 \\2#p" "$FELOG" | sort -u)
+      NM=$(printf '%s\n' "$MODS" | grep -c .)
+      if [ "$NM" -gt 0 ]; then
+        echo "   javac 重编 $NM 个模块：$(printf '%s\n' "$MODS" | awk '{printf "%s%s %s 文件", (NR>1?"，":""), $1, $2}')（maven 的增量粒度是整模块：fe-core 有一个文件变就整模块重编）"
+      else echo "   javac 没有重编任何模块（全部已是最新）"; fi
+      rm -f "$FELOG"
     fi
   fi
   [ "$TARGET" = fe ] && exit $RC

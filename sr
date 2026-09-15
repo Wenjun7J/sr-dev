@@ -45,11 +45,15 @@ tags_of(){ local ns=$1 u c; u=$(ns_url "$ns"); [ -n "$u" ] || return 1
     [ -s "$c.tmp" ] && mv "$c.tmp" "$c" || rm -f "$c.tmp"
   fi
   cat "$c" 2>/dev/null; }
-# main 的候选顺序：latest 优先（用户指定：main 分支对应 tag 以 latest 匹配优先），再 main / main-latest…，最后按日期 tag 取最新
-pick_tag(){ local ns=$1 v=$2 t c; t=$(tags_of "$ns") || return 1
+# 解析规则（按序）：main 先看 latest（用户指定：main 对应 tag 以 latest 匹配优先）；再 X.Y / X.Y-latest / X.Y-ee / X.Y-ee-latest；再最新的 X.Y-YYYYMMDD；
+# 最后兜底取该 minor 最高的补丁版 X.Y.Z（review：菜单从 3.5.20 抠出 3.5，镜像源没有 3.5-latest 时原来解析不了）。
+# 第三个参数可传已取到的 tag 列表，省一次请求
+pick_tag(){ local ns=$1 v=$2 t c ve; t=${3:-$(tags_of "$ns")} || return 1; ve=${v//./\\.}
   for c in $([ "$v" = main ] && echo latest) "$v" "$v-latest" "$v-ee" "$v-ee-latest"; do
     grep -qx -- "$c" <<<"$t" && { echo "$c"; return 0; }; done
-  c=$(printf '%s\n' "$t" | grep -E "^${v}-[0-9]{8}$" | sort -r | head -1)
+  c=$(printf '%s\n' "$t" | grep -E "^${ve}-[0-9]{8}$" | sort -r | head -1)
+  [ -n "$c" ] && { echo "$c"; return 0; }
+  c=$(printf '%s\n' "$t" | grep -E "^${ve}\.[0-9]+$" | sort -V | tail -1)
   [ -n "$c" ] && { echo "$c"; return 0; }; return 1; }
 resolve(){ local v=$1 n
   case "$v" in *:*) n=${v%%:*}; v=${v#*:}
@@ -57,12 +61,13 @@ resolve(){ local v=$1 n
   for n in $(ns_list); do
     TAG=$(pick_tag "$n" "$v" 2>/dev/null) && { NS=$n; PBASE="$(ns_url "$n"):$TAG"; return 0; }
   done; return 1; }
-# 可选版本：main（有任何 main* 或 latest tag）+ 各 minor（有 X.Y-latest 或 X.Y.Z tag），按版本号降序，跨命名空间去重
-candidate_versions(){ local n t
+# 可选版本：main + 各 minor，只列 pick_tag 真能解析的（review：原来从 X.Y.Z 抠出 X.Y 就列，解析规则却可能不认）；
+# main 置顶，其余按版本号降序取 8 个，跨命名空间去重
+candidate_versions(){ local n t c
   for n in $(ns_list); do t=$(tags_of "$n" 2>/dev/null) || continue
-    printf '%s\n' "$t" | grep -qE '^(main|latest)' && echo main
-    printf '%s\n' "$t" | grep -oE '^[0-9]+\.[0-9]+' | sort -Vr | uniq
-  done | awk '!seen[$0]++' | { read -r first; [ "$first" = main ] && echo main; { [ "$first" != main ] && echo "$first"; cat; } | grep -v '^main$' | sort -Vr | head -8; }; }
+    for c in main $(printf '%s\n' "$t" | grep -oE '^[0-9]+\.[0-9]+' | sort -Vr | uniq); do
+      pick_tag "$n" "$c" "$t" >/dev/null 2>&1 && echo "$c"; done
+  done | awk '!seen[$0]++' | sort -Vr | awk '/^main$/{m=1; next} {a[++k]=$0} END{if(m) print "main"; for(i=1; i<=k && i<=8; i++) print a[i]}'; }
 # 不 pull 就能拿到内容指纹（实测 ~50ms）。用 digest 当目录名：上游重推同名 tag 也认得出来。
 digest_of(){ local img=$1 h repo tag
   h=${img%%/*}; repo=$(echo "${img#*/}" | cut -d: -f1); tag=${img##*:}
@@ -72,7 +77,9 @@ digest_of(){ local img=$1 h repo tag
     | grep -i '^docker-content-digest:' | tr -d '\r' | awk '{print $2}'; }   # 返回完整 sha256:…，截短只在显示时做
 
 running(){ [ "$(docker inspect -f '{{.State.Running}}' $NAME 2>/dev/null)" = true ]; }
-TTY=(); [ -t 0 ] && [ -t 1 ] && TTY=(-it)
+# 交互性只看宿主机 stdin：是终端就把它接进容器（-i）并告知 SR_TTY=1，容器里的 Y/N 询问据此判断（-i 下容器内 -t 0 恒为假）。
+# -t 只在 stdout 也是终端时加：stdout 进了管道（sr build | tee log）还挂 -t，docker 会拒绝或把回车/转义码灌进日志（review）
+TTY=(); if [ -t 0 ]; then TTY=(-i -e SR_TTY=1); [ -t 1 ] && TTY=(-it -e SR_TTY=1); fi
 
 build_image(){
   echo "== 构建单镜像 $IMG（base=${SR_BASE_IMAGE:-Dockerfile 默认}，装 gcc 11/12/13 + 各自的 icecc 工具链包）…"
@@ -251,8 +258,9 @@ U
       # /var/local/thirdparty/...，之后不再重找（踩过：toolchains base 上 libcurl.a 找不到；dev-env base 上
       # 则静默链到内置的 main 依赖）。规范路径 + 私有 ns：路径永不变、版本互不干扰、并发各用各的。
       # 可选透传：CCACHE_REMOTE_STORAGE(ccache 远端存储 URL) / SR_CCACHE_DIR(换一个缓存目录做对照实验)
-      # MAVEN_OPTS: FE 的 maven JVM 参数/日志开关透传
-      XENV=(); for v in CCACHE_REMOTE_STORAGE SR_CCACHE_DIR SR_EXPLAIN MAVEN_OPTS; do [ -n "${!v:-}" ] && XENV+=(-e "$v"); done
+      # MAVEN_OPTS: FE 的 maven JVM 参数/日志开关透传；SR_LOCAL_OK: 非交互且无农场时放行本机编（review：容器里提示了它，这里却没转发）
+      # SR_DRYRUN / FARM_STATE：测试钩子，只走到决策打印就停 / 指向伪造的农场状态文件
+      XENV=(); for v in CCACHE_REMOTE_STORAGE SR_CCACHE_DIR SR_EXPLAIN MAVEN_OPTS SR_LOCAL_OK SR_DRYRUN FARM_STATE; do [ -n "${!v:-}" ] && XENV+=(-e "$v"); done
       docker exec -w "$PWD" \
         -e STARROCKS_THIRDPARTY=/var/local/thirdparty -e STARROCKS_GCC_HOME="$GHOME" -e SR_TPDIGEST="$DGS" -e SR_VER="$SPEC" -e SR_BRANCH="${BR:-?}" \
         "${XENV[@]}" "${TTY[@]}" $NAME unshare -m --propagation private sh -c \
