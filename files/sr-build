@@ -137,16 +137,16 @@ GH=$(basename "${STARROCKS_GCC_HOME:-/opt/gcc-toolset-14}")
 TOOLCHAIN=$(ls -1 /opt/icecc/$GH/*.tar.gz 2>/dev/null | head -1)
 MISS_MIN=${MISS_MIN:-8}      # 这段时间内 ccache miss 超过几次就算「真在编」
 TREE=$TREE_BASE/build_$BT
-# review #2：.sum 算法升级到 v4 后，旧 .sum（或有 .gch 无 .sum）的 PCH 强制重建，让新算法落地。只删 .sum 不行——
+# review #2：.sum 算法升级到 v5 后，旧 .sum（或有 .gch 无 .sum）的 PCH 强制重建，让新算法落地。只删 .sum 不行——
 # PCH 内容只含标准库头，自然重建几乎不会发生，跨机共享会一直断。此处已在源码树锁内、configure/数边之前；
 # 只碰 wrapper 管理的产物（*/CMakeFiles/*/cmake_pch.hxx.gch）。C 语言的 cmake_pch.h.gch 不管：build.sh 只给 C++ 配了
 # launcher，C 编译不经 ccache，永远不会有 .sum，纳入只会每次误删重建（踩过）。
 if [ -d "$TREE" ]; then
   OLDPCH=0
   while IFS= read -r g; do
-    if [ ! -f "$g.sum" ] || [ "$(head -c 3 "$g.sum" 2>/dev/null)" != "v4 " ]; then rm -f "$g" "$g.sum"; OLDPCH=$((OLDPCH+1)); fi
+    if [ ! -f "$g.sum" ] || [ "$(head -c 3 "$g.sum" 2>/dev/null)" != "v5 " ]; then rm -f "$g" "$g.sum"; OLDPCH=$((OLDPCH+1)); fi
   done < <(find "$TREE" -path '*/CMakeFiles/*/cmake_pch.hxx.gch' 2>/dev/null)
-  [ $OLDPCH -gt 0 ] && echo "   (发现 $OLDPCH 个旧格式 PCH，已删除以重建并生成 v4 .sum；该目标的 TU 本次会按新 key 查缓存)"
+  [ $OLDPCH -gt 0 ] && echo "   (发现 $OLDPCH 个旧格式 PCH，已删除以重建并生成 v5 .sum；该目标的 TU 本次会按新 key 查缓存)"
 fi
 # grep -c 计数为 0 时退出码是 1，写 `|| echo 99999` 会输出两行 "0\n99999"（踩过三次了）
 # 数边只看现有 build.ninja，绝不能先跑 build.sh --configure-only：它每次都重写 gensrc/codegen/*/*_manifest.cmake，

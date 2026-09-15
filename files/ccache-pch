@@ -1,6 +1,6 @@
 #!/bin/bash
 # ccache-pch —— CMAKE_CXX_COMPILER_LAUNCHER。普通 TU 原样交给 ccache；编 PCH（-x c++-header / -x c-header）时
-# 多做一件事：生成 <gch>.sum，配合 ccache.conf 的 pch_external_checksum=true 让 ccache 哈希 .sum 而不是 .gch 字节。
+# 多做两件事：PCH 本体直接用编译器生成（不经 ccache，见下），并生成 <gch>.sum 配合 pch_external_checksum=true 让 ccache 哈希 .sum 而不是 .gch 字节。
 #
 # 为什么必须这样（2026-09-12 实测）：
 #   - GCC 的 .gch 字节不可复现：同容器连续编两次大小都不同。ccache 默认按 .gch 内容哈希，
@@ -9,7 +9,7 @@
 #     编完发现"输入被改了"就拒存（548 次 Input file modified），PCH 结果从没进过缓存。
 #   - 跨机共享的前提：另一台机器生成的 .gch 字节必然不同，只有 .sum 能对得上。
 #
-# .sum 算法 v4（2026-09-15，按两轮 review 与合成工程实测修订；算法一变就升版本，旧 .sum 由 sr-build 迁移淘汰）：
+# .sum 算法 v5（2026-09-15，按四轮 review 与合成工程实测修订；算法一变就升版本，旧 .sum 由 sr-build 迁移淘汰）：
 #   1) 参数按 ccache base_dir 的规则改写：$CCACHE_BASEDIR 之下的绝对路径 -> realpath 相对 cwd。
 #      实测与 ccache 实际传给编译器的 argv 逐项一致（-I../../src、-include src/.../cmake_pch.hxx、源文件 ../../src/...）。
 #      不能只替换前缀（等价但不同的字串），也不能抹成 basename（同名不同目录 + __FILE__ 会碰撞）。
@@ -17,10 +17,10 @@
 #   3) -E -fdirectives-only：保留全部 #define/#undef 文本，头文件不展开宏。必须如此——全展开的 -E 看不见"只改了宏定义"
 #      （宏没在 PCH 头里被使用），合成工程实测会造成错误命中。行号/文件切换标记保留（__INCLUDE_LEVEL__ 的结构、
 #      __FILE__ 的文件身份都在里面）；-fno-working-directory 去掉 "# 1 <cwd>//"（对应 comp_dir，真实编译里已被抹成 .）。
-#   4) 行号标记里的文件名只施加 -ffile-prefix-map（或成对等价的 macro+debug 映射）：cmake_pch.hxx 里 #include 的是绝对路径
+#   4) 行号标记里的文件名按 GCC 的顺序语义施加 -ffile-prefix-map（最后指定者优先、首个匹配即停）；有 macro/debug 专用映射时不归一化：cmake_pch.hxx 里 #include 的是绝对路径
 #      （内容，ccache 改不到），但编译器产物（__FILE__、DW_AT_name）里它已经是映射后的相对路径——校验和看到的文件名
 #      = 产物里的文件名。工程没配 prefix-map 时保持绝对路径，跨目录不共享：正确的保守行为。
-#   5) 哈希输入 = "v4" + 改写后的参数 + 归一化后的 -E 输出。参数里只有被归一化覆盖的 prefix-map 退化为选项名，
+#   5) 哈希输入 = "v5" + 改写后的参数 + 归一化后的 -E 输出。参数里只有被归一化覆盖的 prefix-map 退化为选项名，
 #      其余（单独的 macro/debug 映射）连值一起进哈希——否则改映射目标产物变了 .sum 不变。
 #   6) 先写同目录临时文件，全部步骤成功后原子 mv；任一失败删掉旧 .sum（ccache 退化为按 .gch 内容哈希：正确但不可共享）。
 set -o pipefail
@@ -29,7 +29,10 @@ for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
 # 判定"这是在编 PCH"：-x c++-header / -x c-header，或输出是 *.gch（CMake 给 C 语言 PCH 的命令不带 -x，靠 .h 后缀让 GCC 自行判定）
 case " $* " in *" -x c++-header "*|*" -x c-header "*) ;; *) case "$out" in *.gch) ;; *) exec ccache "$@" ;; esac ;; esac
 
-ccache "$@"; rc=$?
+# PCH 本体的生成不走 ccache，直接调编译器：ccache 不哈希 -ffile-prefix-map 的值，会把另一组映射目标下生成的 .gch 当命中恢复
+# 回来（合成工程实测：__FILE__ 已烘进 .gch，TU 再新鲜编也是错的）；而 .gch 字节本就不可复现、缓存它只省 65×~1s，TU 的缓存
+# 靠 .sum 与 .gch 字节无关。不能外发（icecc 不支持远端生成 PCH），这里也不设 CCACHE_PREFIX。
+"$@"; rc=$?
 { [ $rc = 0 ] && [ -n "$out" ]; } || exit $rc
 
 base=${CCACHE_BASEDIR:-}
@@ -47,23 +50,29 @@ for a in "$@"; do
   args+=("$r")
 done
 
-# 哪些映射用于归一化行号标记：只有 -ffile-prefix-map（它同时作用于 __FILE__ 与调试信息），或以完全相同的 OLD=NEW 成对
-# 出现的 -fmacro-prefix-map + -fdebug-prefix-map（等价于 file 映射）。-fdebug-prefix-map 单独存在不改 __FILE__、
-# -fmacro-prefix-map 单独存在不改调试信息，两条路径的产物就真的不同，绝不能归一化（review：只配 debug 映射的工程实测错误命中）。
-sedf="$out.sum.sed.$$"
-{ for a in "${args[@]}"; do case "$a" in -ffile-prefix-map=*=*) printf 'F\t%s\n' "${a#*=}";; -fmacro-prefix-map=*=*) printf 'M\t%s\n' "${a#*=}";; -fdebug-prefix-map=*=*) printf 'D\t%s\n' "${a#*=}";; esac; done \
-  | awk -F'\t' '$1=="F"{f[$2]=1} $1=="M"{m[$2]=1} $1=="D"{d[$2]=1} END{for(k in f) print k; for(k in m) if(!(k in f) && (k in d)) print k}' \
-  | sort -u > "$sedf.maps"
-  awk -F= '{print length($1)"\t"$0}' "$sedf.maps" | sort -rn | cut -f2- | while IFS= read -r m; do
-      o=${m%%=*}; n=${m#*=}; o=${o//|/\\|}; n=${n//|/\\|}; printf 's|^\\(# [0-9]* "\\)%s|\\1%s|\n' "$o" "$n"; done > "$sedf"; } 2>/dev/null
+# 行号标记归一化 —— 只在"全部映射都是 -ffile-prefix-map"时做，并精确复现 GCC 的匹配语义：
+#   GCC 把每条 -f*-prefix-map 头插进链表，重映射时从最后指定的那条开始，第一个前缀匹配者生效（gcc/file-prefix-map.cc：
+#   add_prefix_map / remap_filename）。所以既不是"最长前缀优先"，也不能把映射放进集合排序——同样两条映射交换顺序，
+#   产物里的 __FILE__ 就不同（review 复现：ONE,TWO 与 TWO,ONE 曾得到同一个 .sum）。这里用 sed 的 t 跳转实现
+#   "首个匹配即停"，规则按 argv 逆序排列。
+#   出现任何 -fmacro-prefix-map / -fdebug-prefix-map（它们各自只作用于 __FILE__ 或调试信息，且各有独立链表）就放弃归一化，
+#   所有映射参数连值带顺序完整进哈希——保守但正确：这种工程跨目录不共享。
+FMAPS=(); MIXED=0
+for a in "${args[@]}"; do case "$a" in -ffile-prefix-map=*=*) FMAPS+=("${a#*=}");; -fmacro-prefix-map=*|-fdebug-prefix-map=*) MIXED=1;; esac; done
+sedf="$out.sum.sed.$$"; : > "$sedf" 2>/dev/null
+esc(){ printf '%s' "$1" | sed 's/[][\.*^$|]/\\&/g'; }   # 前缀里的 . 等按字面匹配（GCC 是纯字符串前缀比较）
+if [ $MIXED = 0 ] && [ ${#FMAPS[@]} -gt 0 ]; then
+  for (( k=${#FMAPS[@]}-1; k>=0; k-- )); do
+    m=${FMAPS[k]}; printf 's|^\\(# [0-9]* "\\)%s|\\1%s|; t\n' "$(esc "${m%%=*}")" "$(esc "${m#*=}")"
+  done > "$sedf" 2>/dev/null
+fi
 
-# 哈希参数：被归一化覆盖的映射只留选项名（其值已通过归一化后的 .i 间接体现，且换目录时 OLD 不同是期望的）；
-# 没被覆盖的映射（单独的 macro/debug）必须连值一起进哈希——否则改了映射目标、__FILE__/调试路径变了，.sum 却不变（review 复现过）
+# 哈希参数：被归一化覆盖（file-only 场景）的映射只留选项名——其值与顺序的效果已在归一化后的 .i 里体现，而换目录时 OLD 不同
+# 正是期望被抹掉的；混合场景全部映射连值带顺序进哈希（review：改映射目标产物变了 .sum 不能不变）
 hashed=()
 for r in "${args[@]}"; do
   case "$r" in
-    -ffile-prefix-map=*=*|-fmacro-prefix-map=*=*|-fdebug-prefix-map=*=*)
-      if grep -qxF -- "${r#*=}" "$sedf.maps" 2>/dev/null; then hashed+=("${r%%=*}"); else hashed+=("$r"); fi ;;
+    -ffile-prefix-map=*=*) if [ $MIXED = 0 ]; then hashed+=("${r%%=*}"); else hashed+=("$r"); fi ;;
     *) hashed+=("$r");;
   esac
 done
@@ -74,8 +83,8 @@ publish_sum(){
   tmp=$(mktemp "$out.sum.XXXXXX" 2>/dev/null) || return 1
   { "${args[@]}" -E -fdirectives-only -fno-working-directory > "$tmp.raw" 2>/dev/null && [ -s "$tmp.raw" ] \
     && [ -f "$sedf" ] && sed -f "$sedf" "$tmp.raw" > "$tmp.i" && [ -s "$tmp.i" ] \
-    && sum=$({ printf 'v4\n'; printf '%s\n' "${hashed[@]}"; cat "$tmp.i"; } | sha256sum | cut -d' ' -f1) && [ -n "$sum" ] \
-    && printf 'v4 %s\n' "$sum" > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$out.sum"; } || { rm -f "$tmp" "$tmp.raw" "$tmp.i"; return 1; }
+    && sum=$({ printf 'v5\n'; printf '%s\n' "${hashed[@]}"; cat "$tmp.i"; } | sha256sum | cut -d' ' -f1) && [ -n "$sum" ] \
+    && printf 'v5 %s\n' "$sum" > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$out.sum"; } || { rm -f "$tmp" "$tmp.raw" "$tmp.i"; return 1; }
   [ -n "${SR_PCH_KEEP_I:-}" ] && mv -f "$tmp.i" "$out.i" 2>/dev/null || rm -f "$tmp.i"   # SR_PCH_KEEP_I=1 留下归一化后的 -E 输出供检查
   rm -f "$tmp.raw"; return 0
 }
@@ -83,5 +92,5 @@ if ! publish_sum; then
   rm -f "$out.sum"
   echo "ccache-pch: 生成/发布 $out.sum 失败，已删除旧 .sum（该 PCH 的 TU 按 .gch 内容哈希：正确但不可跨机共享）" >&2
 fi
-rm -f "$sedf" "$sedf.maps"
+rm -f "$sedf"
 exit 0
