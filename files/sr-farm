@@ -44,8 +44,9 @@ DPORT=${DPORT:-$(( 19700 + UIDN % 500 ))}    # 本机 iceccd
 # 多 profile 容器共用一个农场：容器都是 --network host，8765 全机唯一。
 # 必须查端口而不是查进程——各容器 PID namespace 独立，pgrep 看不到别家的 scheduler，
 # 会重复去起然后 bind 失败。
+# SR_SCHED_VERBOSE=1（srdev.conf）时 scheduler 以 -vvv 跑，日志里能看到每个任务派给谁/为什么不派——排查"某台 worker 零任务"用
 sched_ensure(){ [ -n "$(ss -ltnH "sport = :$SPORT" 2>/dev/null)" ] || \
-  /usr/sbin/icecc-scheduler -n "$NETNAME" -p "$SPORT" -d -l /tmp/icecc-scheduler.log >/dev/null 2>&1 9>&-; }
+  /usr/sbin/icecc-scheduler -n "$NETNAME" -p "$SPORT" -d -l /tmp/icecc-scheduler.log $([ -n "${SR_SCHED_VERBOSE:-}" ] && echo "-v -v -v") >/dev/null 2>&1 9>&-; }
 # --network host 让容器和宿主机共享 netns，本地就能数出连上来的 daemon
 # grep -c 计数为 0 时退出码是 1，用 || echo 0 会多打一行；必须吃掉退出码
 # 按 NODES 里的远端 IP 逐个判"有没有到 scheduler 端口的已建立连接"。不能数所有含端口的连接：

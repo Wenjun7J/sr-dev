@@ -57,6 +57,12 @@ resolve(){ local v=$1 n
   for n in $(ns_list); do
     TAG=$(pick_tag "$n" "$v" 2>/dev/null) && { NS=$n; PBASE="$(ns_url "$n"):$TAG"; return 0; }
   done; return 1; }
+# 可选版本：main（有任何 main* 或 latest tag）+ 各 minor（有 X.Y-latest 或 X.Y.Z tag），按版本号降序，跨命名空间去重
+candidate_versions(){ local n t
+  for n in $(ns_list); do t=$(tags_of "$n" 2>/dev/null) || continue
+    printf '%s\n' "$t" | grep -qE '^(main|latest)' && echo main
+    printf '%s\n' "$t" | grep -oE '^[0-9]+\.[0-9]+' | sort -Vr | uniq
+  done | awk '!seen[$0]++' | { read -r first; [ "$first" = main ] && echo main; { [ "$first" != main ] && echo "$first"; cat; } | grep -v '^main$' | sort -Vr | head -8; }; }
 # 不 pull 就能拿到内容指纹（实测 ~50ms）。用 digest 当目录名：上游重推同名 tag 也认得出来。
 digest_of(){ local img=$1 h repo tag
   h=${img%%/*}; repo=$(echo "${img#*/}" | cut -d: -f1); tag=${img##*:}
@@ -68,9 +74,15 @@ digest_of(){ local img=$1 h repo tag
 running(){ [ "$(docker inspect -f '{{.State.Running}}' $NAME 2>/dev/null)" = true ]; }
 TTY=(); [ -t 0 ] && [ -t 1 ] && TTY=(-it)
 
+build_image(){
+  echo "== 构建单镜像 $IMG（base=${SR_BASE_IMAGE:-Dockerfile 默认}，装 gcc 11/12/13 + 各自的 icecc 工具链包）…"
+  BA=(--build-arg APT_MIRROR="${SR_APT_MIRROR:-}"); [ -n "${SR_BASE_IMAGE:-}" ] && BA+=(--build-arg BASE="$SR_BASE_IMAGE")
+  docker build -f "$HERE/Dockerfile" "${BA[@]}" -t $IMG "$HERE"; }
+# 没镜像就地构建（首次约 5 分钟）：sr up / sr build 都不该因为"还没跑 sr image"停下来；sr image 保留为显式重建
+ensure_image(){ docker image inspect $IMG >/dev/null 2>&1 && return 0; echo "== 镜像 $IMG 不存在，先构建（一次性）"; build_image; }
 ensure_container(){
   running && return 0
-  docker image inspect $IMG >/dev/null 2>&1 || { echo "!! 镜像 $IMG 还没建，先跑: sr image"; return 1; }
+  ensure_image || { echo "!! 镜像构建失败"; return 1; }
   mkdir -p $BASE/ccache $BASE/m2 $BASE/farm $BASE/.tsp $BASE/iceccrun $TPDIR
   chmod 777 $BASE/farm 2>/dev/null; chmod 777 $BASE/iceccrun 2>/dev/null || true
   local CGP=() CONF_MOUNT=()
@@ -124,10 +136,7 @@ ensure_tp(){
   mv "$t" "$d" && echo "$dg"; }
 
 case "${1:-}" in
-image)
-  echo "== 构建单镜像 $IMG（base=${SR_BASE_IMAGE:-Dockerfile 默认}，装 gcc 11/12/13 + 各自的 icecc 工具链包）…"
-  BA=(--build-arg APT_MIRROR="${SR_APT_MIRROR:-}"); [ -n "${SR_BASE_IMAGE:-}" ] && BA+=(--build-arg BASE="$SR_BASE_IMAGE")
-  docker build -f "$HERE/Dockerfile" "${BA[@]}" -t $IMG "$HERE" ;;
+image)   build_image ;;   # 显式重建（改了 Dockerfile 之后）；平时 sr up / sr build 发现没镜像会自动构建
 up)      ensure_container ;;
 down)    docker rm -f $NAME >/dev/null 2>&1; echo "容器已删除（挂载卷保留）" ;;
 shell)   ensure_container && docker exec -it $NAME bash -l ;;
@@ -152,11 +161,11 @@ versions)
   done ;;
 ""|-h|--help|help) cat <<U
 用法: sr [-v <版本>] <子命令>
-  首次: cp srdev.conf.example srdev.conf; cp registries.conf.example registries.conf; 填好后 sr image
+  首次: cp srdev.conf.example srdev.conf; cp registries.conf.example registries.conf; 然后直接 sr -v main build
 
-  image              建单镜像（一次性，装齐各版本 gcc）
-  up                 起容器（单个，编所有版本，永不因换版本而重建）
-  build [目录] [选项] 编译。首次需 -v 指定用哪个官方镜像的依赖
+  up                 起容器（没镜像会先自动构建，约 5 分钟；单个容器编所有版本）
+  image              强制重建镜像（改了 Dockerfile 之后用）
+  build [目录] [选项] 编译。首次会弹出版本选择（或用 -v 指定），之后记住；换版本再 -v
   farm {init|status|usage [--watch [秒]]|resume|suspend|down}
   tp                 列出已拉下来的各版本依赖（全机共享目录）
   history [N]        最近 N 次编译概况（默认 20）
@@ -196,8 +205,22 @@ U
         SPEC=$(cut -d' ' -f1 "$PDIR/$KEY")
         echo "(依赖=$SPEC · $(basename "${WROOT:-?}")@${BR:-?}，你之前指定过；换用 -v)" >&2
       fi
-      [ -n "$SPEC" ] || { echo "!! 首次编译需指定用哪个官方镜像的依赖，例: sr -v main build"
-                          echo "   sr versions 看可选版本"; exit 1; }
+      # 首次编译且没给 -v：交互时列出可选版本让用户挑（main 与各 minor），选定后记住；之后换版本才需要 -v。
+      # 不自动推断（分支名和依赖版本未必对应，猜错代价是一次失败的全量）。非交互环境仍要求 -v。
+      if [ -z "$SPEC" ]; then
+        if [ -t 0 ]; then   # 只看 stdin：sr build | tee log 这种 stdout 接管道的用法也该能弹出选择；菜单走 stderr
+          echo "首次编译 $(basename "${WROOT:-?}")@${BR:-?}：请选择依赖版本（对应官方 dev-env 镜像；之后会记住，换版本用 sr -v <版本> build）" >&2
+          mapfile -t CANDS < <(candidate_versions)
+          [ ${#CANDS[@]} -gt 0 ] || { echo "!! 取不到 registry 的版本列表，请用 sr -v <版本> build 指定" >&2; exit 1; }
+          i=1; for c in "${CANDS[@]}"; do printf '  %2d) %s\n' $i "$c" >&2; i=$((i+1)); done
+          read -r -p "输入编号，或直接输入版本号（如 3.5.20）: " ans
+          if [[ "$ans" =~ ^[0-9]+$ ]] && [ "$ans" -ge 1 ] && [ "$ans" -le ${#CANDS[@]} ]; then SPEC=${CANDS[ans-1]}; else SPEC=$ans; fi
+          [ -n "$SPEC" ] || { echo "!! 未选择版本，已取消"; exit 1; }
+          echo "   已选 $SPEC（记住到这棵树的这个分支；换版本: sr -v <版本> build）"
+        else
+          echo "!! 首次编译需指定依赖版本，例: sr -v main build（sr versions 看可选项；交互终端下会弹出选择）"; exit 1
+        fi
+      fi
       resolve "$SPEC" || { echo "!! 找不到版本 $SPEC，sr versions 看可选项"; exit 1; }
       DGFULL=$(digest_of "$PBASE"); [ -n "$DGFULL" ] || { echo "!! 拿不到 $PBASE 的 digest"; exit 1; }
       DG=${DGFULL#sha256:}; DGS=${DG:0:12}       # 目录名用完整 digest，显示用 12 位

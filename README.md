@@ -46,8 +46,8 @@ git clone <this repo> ~/srdev && cd ~/srdev
 cp srdev.conf.example srdev.conf          # 填 registry、base 镜像、apt 源、公共依赖目录、节点账号
 cp registries.conf.example registries.conf # 填版本号 -> dev-env 镜像的映射
 ln -s ~/srdev/sr ~/bin/sr
-sr image                                   # 一次性，~5 分钟
-cd /path/to/starrocks && sr -v main build  # 首次必须 -v；之后这棵树的这个分支会记住
+cd /path/to/starrocks && sr build          # 首次会列出可选版本让你选（或 -v 直接指定）；没镜像会先自动构建（~5 分钟）；之后这棵树的这个分支会记住
+sr farm init                               # 可选：建农场。没有农场时 sr build 会询问是否先本机编
 ```
 
 `sr farm usage`（可 `--watch 5`）看农场资源：scheduler 的各 worker 槽位与负载、每台机器的 loadavg/内存/编译进程、本容器 CPU/内存。`sr help` 列出全部子命令；`sr build --help` / `sr build --why` 看编译选项与默认值依据。
@@ -63,7 +63,7 @@ cd /path/to/starrocks && sr -v main build  # 首次必须 -v；之后这棵树�
 - **编译器**：拉依赖时记下该镜像的 gcc 大版本（`.gccmajor`），编译时用 `STARROCKS_GCC_HOME=/opt/gccNN` 指过去；icecc 工具链包也按 gcc 分别打好。
   gcc 是决定性变量：gcc14 编不过 3.3 的 rapidjson，gcc11 可以。
 
-版本按「源码树 + 分支」记住，切分支要重新 `-v`。之后**自动跟随**该版本 tag 的最新依赖镜像（加依赖不会破坏老代码）；digest 变了会提示——若编译报依赖相关错误，说明依赖升级而你的代码还没跟上，先 rebase。
+版本按「源码树 + 分支」记住（首次交互选择或 `-v` 指定），切分支要重新选/指定。之后**自动跟随**该版本 tag 的最新依赖镜像（加依赖不会破坏老代码）；digest 变了会提示——若编译报依赖相关错误，说明依赖升级而你的代码还没跟上，先 rebase。
 
 ## 农场
 

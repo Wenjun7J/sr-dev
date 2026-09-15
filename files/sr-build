@@ -162,11 +162,20 @@ edges(){ [ -f "$TREE/build.ninja" ] || { echo "99999 0"; return; }
          echo "${n:-99999} $d"; }
 # 农场是硬前置。这是个分布式编译项目，没有农场就别开工——
 # 静默退化成本地编译只会让人以为"就这么慢"，而不知道少了 1.9 倍。
-if [ ! -f "$FARM_STATE" ]; then
-  echo "!! 还没有编译农场，本工具的所有编译都需要它。"
-  echo "   先执行: sr farm init"
-  echo "   （约 6~9 分钟建 5 台 worker；之后休眠/唤醒/续约/自愈全自动，不用再管）"
-  exit 1
+# 没有农场：不能分布式，但可以本机编。交互时问一句（y 继续 / 其它退出），非交互保持拒绝——脚本里静默退化成本地
+# 只会让人以为"就这么慢"，要放行请显式 SR_LOCAL_OK=1
+NOFARM=""
+if [ ! -f "$FARM_STATE" ] && [ "$DIST" != off ]; then
+  echo "!! 还没有编译农场：无法分布式编译（全量约慢 1.9 倍），只能本机 -j$JLOCAL。"
+  echo "   建农场: sr farm init（约 6~9 分钟建 5 台 worker；之后休眠/唤醒/续约/自愈全自动，不用再管）"
+  if [ -t 0 ]; then
+    read -r -p "   现在先用本机编译吗？[y/N] " ans
+    case "$ans" in y|Y|yes|YES) DIST=off; NOFARM=1; FARM_NOTE="本地（尚无农场，用户确认）";; *) echo "   已取消。"; exit 1;; esac
+  elif [ -n "${SR_LOCAL_OK:-}" ]; then
+    DIST=off; NOFARM=1; FARM_NOTE="本地（尚无农场，SR_LOCAL_OK=1）"
+  else
+    echo "   非交互环境不自动退化；要本机编请设 SR_LOCAL_OK=1 或加 --dist off。"; exit 1
+  fi
 fi
 # 农场标记为 degraded（resume 修复后仍连不上）时也拒绝：这是分布式工具，不能静默退回本地
 if grep -q '^FARM_STATUS=degraded' "$FARM_STATE" 2>/dev/null; then
@@ -174,7 +183,7 @@ if grep -q '^FARM_STATUS=degraded' "$FARM_STATE" 2>/dev/null; then
   exit 1
 fi
 # 走本地的几种原因分别写清楚，别混成一句
-[ "$DIST" = off ] && FARM_NOTE="本地（--dist off）"
+[ "$DIST" = off ] && [ -z "$NOFARM" ] && FARM_NOTE="本地（--dist off）"
 if [ "$DIST" != off ] && grep -q '^FARM_STATUS=releasing' "$FARM_STATE" 2>/dev/null; then
   DIST=off; FARM_NOTE="本地（农场正在释放，sr farm down 尚未确认完成）"
   echo "!! 农场正在释放，本次按无农场处理（本地 -j$JLOCAL）"
