@@ -149,12 +149,15 @@ if [ -d "$TREE" ]; then
   [ $OLDPCH -gt 0 ] && echo "   (发现 $OLDPCH 个旧格式 PCH，已删除以重建并生成 v3 .sum；该目标的 TU 本次会按新 key 查缓存)"
 fi
 # grep -c 计数为 0 时退出码是 1，写 `|| echo 99999` 会输出两行 "0\n99999"（踩过三次了）
-# 数边前先让 build.sh 把 gensrc + cmake configure 跑完（--configure-only）。否则数的是上一次的状态：
-# 依赖路径/编译器一变，gensrc 的 thrift 版本戳、CMakeCache 都会让全部边变脏，而 ninja -n 在那之前
-# 只看到 0 条——于是按本地 -j16 跑了一次 1761 条边的全量（踩过，22 分钟）。configure 有缓存，代价几十秒。
-edges(){ ( cd "$SR" && ./build.sh --be --configure-only >/dev/null 2>&1 ) || true
-         [ -f "$TREE/build.ninja" ] || { echo 99999; return; }
-         local n; n=$( cd "$TREE" && ninja -n 2>/dev/null | grep -c 'CXX object' ); echo "${n:-99999}"; }
+# 数边只看现有 build.ninja，绝不能先跑 build.sh --configure-only：它每次都重写 gensrc/codegen/*/*_manifest.cmake，
+# 所有 codegen 的 .stamp 随之变脏，依赖 stamp 的全部 TU 跟着重编——此前每一次默认 sr build 都是全量 ninja 遍历，
+# 一直被 ccache 命中掩盖（SR_EXPLAIN=1 抓到的现行）。编译器/依赖路径变了导致 build.ninja 过期的情况由下面的 FRESH 检测覆盖；
+# build.ninja 本身过期（ninja -n 第一条是 Re-running CMake）时数不准，交给"开工并后台按 miss 评估"路径兜底。
+MANIFEST_DIRTY=0
+edges(){ [ -f "$TREE/build.ninja" ] || { echo 99999; return; }
+         local out n; out=$( cd "$TREE" && ninja -n 2>/dev/null ); n=$(printf '%s\n' "$out" | grep -c 'CXX object')
+         printf '%s\n' "$out" | grep -q 'Re-running CMake' && MANIFEST_DIRTY=1
+         echo "${n:-99999}"; }
 # 农场是硬前置。这是个分布式编译项目，没有农场就别开工——
 # 静默退化成本地编译只会让人以为"就这么慢"，而不知道少了 1.9 倍。
 if [ ! -f "$FARM_STATE" ]; then
@@ -199,7 +202,8 @@ if [ "$DIST" != off ]; then
     fi
   fi
   THRESH=50; [ "${FARM_STATUS:-}" = suspended ] && THRESH=150
-  if [ "$DIST" = on ] || [ "$N" -gt "$THRESH" ] || [ $FRESH = 1 ]; then
+  [ $MANIFEST_DIRTY = 1 ] && echo "   (build.ninja 已过期，边数 ${N} 只是下限；按需要农场处理，睡着则边编边评估是否唤醒)"
+  if [ "$DIST" = on ] || [ "$N" -gt "$THRESH" ] || [ $FRESH = 1 ] || [ $MANIFEST_DIRTY = 1 ]; then
     if [ "${FARM_STATUS:-}" = suspended ]; then
       # 不同步等那 29 秒。直接按「农场已就位」的并发开工：本地 daemon 会把真正在跑的
       # 编译卡在 -m 16，多出来的槽在 icecc 里排队；农场一醒，排队的立刻溢出到远端。
@@ -339,6 +343,8 @@ S=$(date +%s)
 # 输出文件必须每次构建独立：不同源码树可以在同一容器里并发编，共用一个 /tmp 文件会把两份输出搅在一起，
 # 失败那次的报错被另一边的进度行冲掉（踩过：只剩 FAILED 一行，错误正文没了）
 OUTF=$(mktemp /tmp/sr-build.XXXXXX)
+# 调试钩子：SR_EXPLAIN=1 时在开工前让 ninja 解释哪些边为什么脏（排查"明明没改代码却全量"用）
+[ -n "${SR_EXPLAIN:-}" ] && [ -f "$TREE/build.ninja" ] && { echo "== ninja explain（开工前，前 15 条）:"; ninja -C "$TREE" -n -d explain 2>&1 | grep "^ninja explain" | head -15 | cut -c1-220; }
 ( cd "$SR" && ./build.sh "${ARGS[@]}" ) 2>&1 | tee "$OUTF"; RC=${PIPESTATUS[0]}
 E=$(date +%s)
 : > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null

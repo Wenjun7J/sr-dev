@@ -220,7 +220,7 @@ U
       # /var/local/thirdparty/...，之后不再重找（踩过：toolchains base 上 libcurl.a 找不到；dev-env base 上
       # 则静默链到内置的 main 依赖）。规范路径 + 私有 ns：路径永不变、版本互不干扰、并发各用各的。
       # 可选透传：CCACHE_REMOTE_STORAGE(ccache 远端存储 URL) / SR_CCACHE_DIR(换一个缓存目录做对照实验)
-      XENV=(); for v in CCACHE_REMOTE_STORAGE SR_CCACHE_DIR; do [ -n "${!v:-}" ] && XENV+=(-e "$v"); done
+      XENV=(); for v in CCACHE_REMOTE_STORAGE SR_CCACHE_DIR SR_EXPLAIN; do [ -n "${!v:-}" ] && XENV+=(-e "$v"); done
       docker exec -w "$PWD" \
         -e STARROCKS_THIRDPARTY=/var/local/thirdparty -e STARROCKS_GCC_HOME="$GHOME" -e SR_TPDIGEST="$DGS" -e SR_VER="$SPEC" -e SR_BRANCH="${BR:-?}" \
         "${XENV[@]}" "${TTY[@]}" $NAME unshare -m --propagation private sh -c \

@@ -104,8 +104,8 @@
 
   <!-- 9 数边数 -->
   <rect x="250" y="938" width="300" height="56" rx="4" fill="#fff" stroke="#64748b" stroke-width="1.4"/>
-  <text x="266" y="962" class="t">build.sh --configure-only 后 ninja -n</text>
-  <text x="266" y="982" class="s">先 configure 再数边，否则依赖路径一变全脏却数到 0</text>
+  <text x="266" y="962" class="t">对现有 build.ninja 做 ninja -n 数边</text>
+  <text x="266" y="982" class="s">不先 configure：它会重写 codegen manifest 让全部边变脏</text>
   <line x1="400" y1="994" x2="400" y2="1024" stroke="#334155" stroke-width="1.6" marker-end="url(#a)"/>
 
   <!-- 10 菱形 农场状态 -->
