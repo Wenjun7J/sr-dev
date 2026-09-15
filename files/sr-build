@@ -424,13 +424,21 @@ if [ $RC -eq 0 ]; then
     echo " FE 产物: $FOUT"
     FJ=$(ls -1 "$FOUT/lib/"*.jar 2>/dev/null | wc -l)
     [ -d "$FOUT/lib" ] && echo "   lib/  $FJ 个 jar   bin/ conf/ webroot/"
-    # FE 的真实开销在 maven reactor 摘要里：只取含 fe-core 的那段（java-extensions 也有一段 reactor，属 BE）
+    # FE 的真实开销在 maven reactor 摘要里。日志里可能有多段 reactor：--clean 会先单独跑一次 mvn clean（同样列出 fe-core，
+    # 全是 0.0x s），java-extensions 也有一段（属 BE）。只取最后一段含 fe-core 的；javac 模块数也只统计这一次 mvn 调用里的
+    # default-compile（testCompile 另算，不计）
     if [ -f "$LOGF" ]; then
-      tr '\r' '\n' < "$LOGF" | sed -E 's/\x1b\[[0-9;]*m//g' \
-        | awk '/Reactor Summary/{f=1; buf=""} f{buf=buf $0 "\n"} /BUILD (SUCCESS|FAILURE)/{if(f && buf ~ /fe-core/) print buf; f=0}' \
-        | grep -E ' (SUCCESS|FAILURE) ' | sed -E 's/^\[INFO\] //; s/ \.{2,} / /' \
+      # 去掉颜色码和可能的时间戳前缀（MAVEN_OPTS 开了 showDateTime 时每行前面有 HH:mm:ss）
+      FESUM=$(tr '\r' '\n' < "$LOGF" | sed -E 's/\x1b\[[0-9;]*m//g; s/^[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)? //' \
+        | awk '/Scanning for projects/{nc=0; nu=0; ph=""}
+               /^\[INFO\] --- /{ph=""} /--- maven-compiler-plugin:[^ ]+:compile \(default-compile\)/{ph="c"}
+               ph=="c" && /Compiling [0-9]+ source files/{nc++} ph=="c" && /Nothing to compile/{nu++}
+               /Reactor Summary/{f=1; buf=""} f{buf=buf $0 "\n"}
+               /BUILD (SUCCESS|FAILURE)/{if(f && buf ~ /fe-core/){last=buf; lnc=nc; lnu=nu} f=0}
+               END{printf "%s__COUNTS__ %d %d\n", last, lnc, lnu}')
+      printf '%s\n' "$FESUM" | grep -E ' (SUCCESS|FAILURE) ' | sed -E 's/^\[INFO\] //; s/ \.{2,} / /' \
         | awk 'BEGIN{print " FE(maven) 各模块耗时:"} {t=$0; sub(/^.*\[ */,"",t); sub(/\]$/,"",t); printf "   %-22s %-8s %s\n", $1, $2, t}'
-      NC=$(tr '\r' '\n' < "$LOGF" | grep -cE 'Compiling [0-9]+ source files'); NU=$(tr '\r' '\n' < "$LOGF" | grep -cE 'Nothing to compile')
+      read -r _ NC NU < <(printf '%s\n' "$FESUM" | grep '^__COUNTS__')
       echo "   javac 实际编译 ${NC:-0} 个模块，${NU:-0} 个模块已是最新（maven 的增量粒度是整模块：fe-core 有一个文件变就整模块重编）"
     fi
   fi
