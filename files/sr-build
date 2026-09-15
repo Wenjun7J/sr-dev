@@ -275,8 +275,6 @@ esac
 [ "$TARGET" != fe ] && [ $JAVAEXT = 0 ] && ARGS+=(--without-java-ext)
 [ $CLEAN = 1 ] && [ "$TARGET" != fe ] && rm -rf "$TREE"
 [ $CLEAN = 1 ] && ARGS+=(--clean)
-# FE：让 build.sh 用包装过的 mvn，--clean 时保住各模块的 checkstyle 缓存（详见 mvn-keepcache 头部；冷编译省 ~105s）
-[ "$TARGET" != be ] && export CUSTOM_MVN=/usr/local/bin/mvn-keepcache
 [ ${#PASS[@]} -gt 0 ] && ARGS+=("${PASS[@]}")
 
 echo "=========================================================="
