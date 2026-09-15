@@ -9,7 +9,7 @@
 #     编完发现"输入被改了"就拒存（548 次 Input file modified），PCH 结果从没进过缓存。
 #   - 跨机共享的前提：另一台机器生成的 .gch 字节必然不同，只有 .sum 能对得上。
 #
-# .sum 算法 v3（2026-09-15，按 review 与合成工程实测修订）：
+# .sum 算法 v4（2026-09-15，按两轮 review 与合成工程实测修订；算法一变就升版本，旧 .sum 由 sr-build 迁移淘汰）：
 #   1) 参数按 ccache base_dir 的规则改写：$CCACHE_BASEDIR 之下的绝对路径 -> realpath 相对 cwd。
 #      实测与 ccache 实际传给编译器的 argv 逐项一致（-I../../src、-include src/.../cmake_pch.hxx、源文件 ../../src/...）。
 #      不能只替换前缀（等价但不同的字串），也不能抹成 basename（同名不同目录 + __FILE__ 会碰撞）。
@@ -20,7 +20,8 @@
 #   4) 行号标记里的文件名只施加 -ffile-prefix-map（或成对等价的 macro+debug 映射）：cmake_pch.hxx 里 #include 的是绝对路径
 #      （内容，ccache 改不到），但编译器产物（__FILE__、DW_AT_name）里它已经是映射后的相对路径——校验和看到的文件名
 #      = 产物里的文件名。工程没配 prefix-map 时保持绝对路径，跨目录不共享：正确的保守行为。
-#   5) 哈希输入 = "v3" + 改写后的参数（*-prefix-map 只留选项名，与 ccache 一致）+ 归一化后的 -E 输出。
+#   5) 哈希输入 = "v4" + 改写后的参数 + 归一化后的 -E 输出。参数里只有被归一化覆盖的 prefix-map 退化为选项名，
+#      其余（单独的 macro/debug 映射）连值一起进哈希——否则改映射目标产物变了 .sum 不变。
 #   6) 先写同目录临时文件，全部步骤成功后原子 mv；任一失败删掉旧 .sum（ccache 退化为按 .gch 内容哈希：正确但不可共享）。
 set -o pipefail
 out=""; prev=""
@@ -34,7 +35,7 @@ ccache "$@"; rc=$?
 base=${CCACHE_BASEDIR:-}
 # base 目录本身也要改写（-I$base 这种），否则两条路径的哈希参数不同（合成工程实测踩过）
 rel(){ if [ -n "$base" ] && { [ "$1" = "$base" ] || [[ "$1" == "$base"/* ]]; }; then realpath -m --relative-to="$PWD" -- "$1"; else printf '%s' "$1"; fi; }
-args=(); hashed=(); skip=0
+args=(); skip=0
 for a in "$@"; do
   [ $skip = 1 ] && { skip=0; continue; }
   case "$a" in
@@ -44,17 +45,28 @@ for a in "$@"; do
     *) r=$(rel "$a");;
   esac
   args+=("$r")
-  case "$r" in -ffile-prefix-map=*|-fdebug-prefix-map=*|-fmacro-prefix-map=*) hashed+=("${r%%=*}");; *) hashed+=("$r");; esac
 done
 
-# 行号标记归一化：只用 -ffile-prefix-map（它同时作用于 __FILE__ 与调试信息）。-fdebug-prefix-map 单独存在时不改 __FILE__，
-# -fmacro-prefix-map 单独存在时不改调试信息——任一种单独出现，两条路径的产物就真的不同，绝不能归一化（review：只配 debug 映射的
-# 工程实测会错误命中）。两者以完全相同的 OLD=NEW 成对出现时等价于 file-prefix-map，允许。长前缀优先。
+# 哪些映射用于归一化行号标记：只有 -ffile-prefix-map（它同时作用于 __FILE__ 与调试信息），或以完全相同的 OLD=NEW 成对
+# 出现的 -fmacro-prefix-map + -fdebug-prefix-map（等价于 file 映射）。-fdebug-prefix-map 单独存在不改 __FILE__、
+# -fmacro-prefix-map 单独存在不改调试信息，两条路径的产物就真的不同，绝不能归一化（review：只配 debug 映射的工程实测错误命中）。
 sedf="$out.sum.sed.$$"
 { for a in "${args[@]}"; do case "$a" in -ffile-prefix-map=*=*) printf 'F\t%s\n' "${a#*=}";; -fmacro-prefix-map=*=*) printf 'M\t%s\n' "${a#*=}";; -fdebug-prefix-map=*=*) printf 'D\t%s\n' "${a#*=}";; esac; done \
   | awk -F'\t' '$1=="F"{f[$2]=1} $1=="M"{m[$2]=1} $1=="D"{d[$2]=1} END{for(k in f) print k; for(k in m) if(!(k in f) && (k in d)) print k}' \
-  | awk -F= '{print length($1)"\t"$0}' | sort -rn | cut -f2- | while IFS= read -r m; do
+  | sort -u > "$sedf.maps"
+  awk -F= '{print length($1)"\t"$0}' "$sedf.maps" | sort -rn | cut -f2- | while IFS= read -r m; do
       o=${m%%=*}; n=${m#*=}; o=${o//|/\\|}; n=${n//|/\\|}; printf 's|^\\(# [0-9]* "\\)%s|\\1%s|\n' "$o" "$n"; done > "$sedf"; } 2>/dev/null
+
+# 哈希参数：被归一化覆盖的映射只留选项名（其值已通过归一化后的 .i 间接体现，且换目录时 OLD 不同是期望的）；
+# 没被覆盖的映射（单独的 macro/debug）必须连值一起进哈希——否则改了映射目标、__FILE__/调试路径变了，.sum 却不变（review 复现过）
+hashed=()
+for r in "${args[@]}"; do
+  case "$r" in
+    -ffile-prefix-map=*=*|-fmacro-prefix-map=*=*|-fdebug-prefix-map=*=*)
+      if grep -qxF -- "${r#*=}" "$sedf.maps" 2>/dev/null; then hashed+=("${r%%=*}"); else hashed+=("$r"); fi ;;
+    *) hashed+=("$r");;
+  esac
+done
 
 # 预处理、归一化、哈希、写入、发布是一个整体：任何一步失败都删掉旧 .sum（.gch 可能已更新，旧 .sum 描述的是旧内容）
 publish_sum(){
@@ -62,8 +74,8 @@ publish_sum(){
   tmp=$(mktemp "$out.sum.XXXXXX" 2>/dev/null) || return 1
   { "${args[@]}" -E -fdirectives-only -fno-working-directory > "$tmp.raw" 2>/dev/null && [ -s "$tmp.raw" ] \
     && [ -f "$sedf" ] && sed -f "$sedf" "$tmp.raw" > "$tmp.i" && [ -s "$tmp.i" ] \
-    && sum=$({ printf 'v3\n'; printf '%s\n' "${hashed[@]}"; cat "$tmp.i"; } | sha256sum | cut -d' ' -f1) && [ -n "$sum" ] \
-    && printf 'v3 %s\n' "$sum" > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$out.sum"; } || { rm -f "$tmp" "$tmp.raw" "$tmp.i"; return 1; }
+    && sum=$({ printf 'v4\n'; printf '%s\n' "${hashed[@]}"; cat "$tmp.i"; } | sha256sum | cut -d' ' -f1) && [ -n "$sum" ] \
+    && printf 'v4 %s\n' "$sum" > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$out.sum"; } || { rm -f "$tmp" "$tmp.raw" "$tmp.i"; return 1; }
   [ -n "${SR_PCH_KEEP_I:-}" ] && mv -f "$tmp.i" "$out.i" 2>/dev/null || rm -f "$tmp.i"   # SR_PCH_KEEP_I=1 留下归一化后的 -E 输出供检查
   rm -f "$tmp.raw"; return 0
 }
@@ -71,5 +83,5 @@ if ! publish_sum; then
   rm -f "$out.sum"
   echo "ccache-pch: 生成/发布 $out.sum 失败，已删除旧 .sum（该 PCH 的 TU 按 .gch 内容哈希：正确但不可跨机共享）" >&2
 fi
-rm -f "$sedf"
+rm -f "$sedf" "$sedf.maps"
 exit 0

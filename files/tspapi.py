@@ -38,8 +38,8 @@ def exists(cid):
     try:
         cs = clusters()
         for c in cs:
-            if not isinstance(c, dict):
-                raise ValueError("列表元素不是对象: %r" % (c,))
+            if not isinstance(c, dict) or c.get("cluster_id") in (None, ""):
+                raise ValueError("列表元素缺少 cluster_id，响应结构不符: %r" % (str(c)[:120],))
             if str(c.get("cluster_id")) == str(cid):
                 print(c.get("status") or c.get("cluster_status") or "exists"); sys.exit(0)
     except SystemExit:
