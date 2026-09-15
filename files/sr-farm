@@ -48,7 +48,12 @@ sched_ensure(){ [ -n "$(ss -ltnH "sport = :$SPORT" 2>/dev/null)" ] || \
   /usr/sbin/icecc-scheduler -n "$NETNAME" -p "$SPORT" -d -l /tmp/icecc-scheduler.log >/dev/null 2>&1 9>&-; }
 # --network host 让容器和宿主机共享 netns，本地就能数出连上来的 daemon
 # grep -c 计数为 0 时退出码是 1，用 || echo 0 会多打一行；必须吃掉退出码
-dcount(){ ss -tn state established 2>/dev/null | grep -c ":$SPORT" 2>/dev/null; true; }
+# 按 NODES 里的远端 IP 逐个判"有没有到 scheduler 端口的已建立连接"。不能数所有含端口的连接：
+# 本地 iceccd 那条回环连接两端各算一次，5 台显示 7；反过来少连 2 台也能凑够数，degraded 检测就形同虚设（review #4）
+dcount(){ local n=0 ip
+  for ip in ${NODES:-}; do
+    [ -n "$(ss -tnH state established "( sport = :$SPORT and dst = $ip )" 2>/dev/null)" ] && n=$((n+1))
+  done; echo $n; }
 # 下发节点配置（幂等）。$1=1 表示首次要先铺密钥。node-setup.sh 内部回读文件比对，报"写入OK/不符"
 provision_nodes(){ local first=${1:-0} ip
   for ip in $NODES; do
@@ -113,12 +118,14 @@ status)
   fi
   LB=$(stat -c %Y $FARM/last-build 2>/dev/null || echo 0)
   sched_ensure; D=$(dcount)
-  printf "集群 %s (id=%s)\n平台状态 %s / 本地记录 %s\n到期 %s   22点清扫 %s\nscheduler %s:%s(本容器)   worker %s   daemon已连 %s\n距上次编译 %d 分钟\n看门狗 %s\n" \
-    "$CLUSTER" "$CID" "$S" "$FARM_STATUS" "$T" "$N" "$SCHED" "$SPORT" "$WORKERS" "$D" $(( ($(date +%s)-LB)/60 )) \
+  printf "集群 %s (id=%s)\n平台状态 %s / 本地记录 %s\n到期 %s   22点清扫 %s\nscheduler %s:%s(本容器)   worker 已连 %s/%s\n距上次编译 %d 分钟\n看门狗 %s\n" \
+    "$CLUSTER" "$CID" "$S" "$FARM_STATUS" "$T" "$N" "$SCHED" "$SPORT" "$D" "$WORKERS" $(( ($(date +%s)-LB)/60 )) \
     "$(pgrep -f '[s]r-farm _watchdog' >/dev/null && echo 运行中 || echo 已停)"
   ;;
 resume|up)
-  . "$STATE"; sched_ensure
+  . "$STATE"
+  [ "${FARM_STATUS:-}" = releasing ] && { echo "!! 农场正在释放（上次 sr farm down 未确认完成），先 sr farm down 清理后再 init"; exit 1; }
+  sched_ensure
   pstate(){ $API row "$CLUSTER" 2>/dev/null | cut -d'|' -f1; }
   # 平台还在 Updating（上一次 suspend 没落定）时发 start 会被静默丢掉（踩过：4 分钟后仍 Suspended）。
   # 先等它落定，再 start，再轮询到 Running——每一步都实测，不猜。
@@ -146,7 +153,26 @@ suspend)
   . "$STATE"; $API op "$CID" stop >/dev/null
   sed -i 's/^FARM_STATUS=.*/FARM_STATUS=suspended/' "$STATE"; echo "已休眠（仍继续续约，否则睡着也会到期）" ;;
 down|release)
-  [ -f "$STATE" ] && { . "$STATE"; $API op "$CID" release >/dev/null 2>&1 || true; }
+  if [ -f "$STATE" ]; then . "$STATE"
+    # 先看平台上还在不在（第二次 down 时集群可能已经没了，先发 release 会报错、本地记录永远清不掉）。
+    # exists 的退出码：0=存在 1=不存在 2=查询失败——查询失败绝不能当成"已消失"
+    $API exists "$CID" >/dev/null 2>&1; EX=$?
+    case $EX in
+      1) echo "平台上已无集群 $CID，清理本地记录" ;;
+      2) echo "!! 查询平台失败，无法确认，保留状态（CID=$CID），稍后重试 sr farm down"; exit 1 ;;
+      0) $API op "$CID" release >/dev/null || { echo "!! 释放请求失败，保留状态（CID=$CID），稍后重试 sr farm down"; exit 1; }
+         # 释放已发出：先标 releasing，看门狗/resume/sr-build 见到即停手；再确认平台侧真的消失
+         sed -i 's/^FARM_STATUS=.*/FARM_STATUS=releasing/' "$STATE"
+         for i in $(seq 1 12); do sleep 5; $API exists "$CID" >/dev/null 2>&1; EX=$?; [ $EX = 0 ] || break; done
+         case $EX in
+           0) pkill -f "[s]r-farm _watchdog" 2>/dev/null
+              echo "释放已发出，平台仍显示存在（释放中）。已停止续约；稍后再执行 sr farm down 确认并清理本地记录"; exit 0 ;;
+           2) pkill -f "[s]r-farm _watchdog" 2>/dev/null
+              echo "!! 释放已发出但查询失败，保留 releasing 状态，稍后重试 sr farm down"; exit 1 ;;
+           1) echo "平台确认集群已消失" ;;
+         esac ;;
+    esac
+  fi
   pkill -f "[s]r-farm _watchdog" 2>/dev/null
   rm -f "$STATE"; echo "已释放并停止看门狗" ;;
 _wd) wd_ensure; exit 0 ;;
@@ -154,6 +180,8 @@ _watchdog)
   while true; do
     [ -f "$STATE" ] || exit 0
     . "$STATE"
+    # 正在释放的集群不能再续约/唤醒：看门狗自己识别状态退出，不依赖 down 那一次 pkill
+    [ "${FARM_STATUS:-}" = releasing ] && { echo "$(date '+%F %T') 农场正在释放，看门狗停止续约并退出" >>"$LOGF"; exit 0; }
     [ "${FARM_STATUS:-}" = running ] && sched_ensure
     $API op "$CID" renew $RENEW_H >/dev/null 2>&1   # 重置为 now+RENEW_H 小时
     # 平台每天 0 点把 auto-release 重置为 true，不重发的话农场会在某天 22 点被清掉。

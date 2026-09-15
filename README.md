@@ -63,7 +63,7 @@ cd /path/to/starrocks && sr -v main build  # 首次必须 -v；之后这棵树�
 - **编译器**：拉依赖时记下该镜像的 gcc 大版本（`.gccmajor`），编译时用 `STARROCKS_GCC_HOME=/opt/gccNN` 指过去；icecc 工具链包也按 gcc 分别打好。
   gcc 是决定性变量：gcc14 编不过 3.3 的 rapidjson，gcc11 可以。
 
-版本按「源码树 + 分支」记住，切分支要重新 `-v`。上游依赖镜像往前走时**不会**自动跟进（你的代码可能还没 rebase）；`sr -v main build` 重新指定即可跟进，依赖升级会提示 rebase。
+版本按「源码树 + 分支」记住，切分支要重新 `-v`。之后**自动跟随**该版本 tag 的最新依赖镜像（加依赖不会破坏老代码）；digest 变了会提示——若编译报依赖相关错误，说明依赖升级而你的代码还没跟上，先 rebase。
 
 ## 农场
 

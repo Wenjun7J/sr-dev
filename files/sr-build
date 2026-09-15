@@ -159,6 +159,10 @@ if grep -q '^FARM_STATUS=degraded' "$FARM_STATE" 2>/dev/null; then
 fi
 # 走本地的几种原因分别写清楚，别混成一句
 [ "$DIST" = off ] && FARM_NOTE="本地（--dist off）"
+if [ "$DIST" != off ] && grep -q '^FARM_STATUS=releasing' "$FARM_STATE" 2>/dev/null; then
+  DIST=off; FARM_NOTE="本地（农场正在释放，sr farm down 尚未确认完成）"
+  echo "!! 农场正在释放，本次按无农场处理（本地 -j$JLOCAL）"
+fi
 [ "$TARGET" = fe ] && { DIST=off; FARM_NOTE="本地（FE 是 maven/Java，农场和 ccache 都帮不上）"; }
 if [ "$DIST" != off ] && [ ! -f "$TOOLCHAIN" ]; then
   DIST=off; FARM_NOTE="本地（镜像里没有与 $GH 配对的 icecc 工具链包，不能外发）"
@@ -325,7 +329,6 @@ S=$(date +%s)
 # 失败那次的报错被另一边的进度行冲掉（踩过：只剩 FAILED 一行，错误正文没了）
 OUTF=$(mktemp /tmp/sr-build.XXXXXX)
 ( cd "$SR" && ./build.sh "${ARGS[@]}" ) 2>&1 | tee "$OUTF"; RC=${PIPESTATUS[0]}
-rm -f $RUNFLAG
 E=$(date +%s)
 : > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null
 
@@ -344,10 +347,21 @@ if [ $RC -ne 0 ] && { [ "${OOM1:-0}" -gt "${OOM0:-0}" ] || [ "${KILLED:-0}" -gt 
     echo "   anon 峰值 $(g ${PEAK:-0})G / 上限 $(g $MAXM)G"
   RETRY=$(( J / 2 )); [ $RETRY -lt 4 ] && RETRY=4
   echo "   -> 自动降到 -j$RETRY 重试（ninja 增量，只补没编完的部分）"
-  ARGS=(--be -j "$RETRY"); [ $JAVAEXT = 0 ] && ARGS+=(--without-java-ext)   # 只有 BE 会 OOM
-  ( cd "$SR" && ./build.sh "${ARGS[@]}" ); RC=$?
+  # 从原参数派生：只换并发、去掉 --clean（重试是增量）。目标（--fe/--all）和 -- 透传全部保留（review #5：
+  # 原来重建成 --be 会把 FE 和透传丢掉，BE 重试成功还会把整体报成成功）。build.sh 只认 "-j N"，-jN 顺手也处理
+  RARGS=(); skip=0
+  for a in "${ARGS[@]}"; do
+    [ $skip = 1 ] && { skip=0; continue; }
+    case "$a" in -j) skip=1; continue;; -j[0-9]*) continue;; --clean) continue;; esac
+    RARGS+=("$a")
+  done
+  RARGS+=(-j "$RETRY")
+  echo "   重试: ./build.sh ${RARGS[*]}" | tee -a "$OUTF"
+  ( cd "$SR" && ./build.sh "${RARGS[@]}" ) 2>&1 | tee -a "$OUTF"; RC=${PIPESTATUS[0]}   # 输出追加进同一份日志
   E=$(date +%s)
 fi
+rm -f $RUNFLAG      # 采样与异步唤醒循环到这里才退出：重试期间也要继续采样、继续心跳
+: > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null
 
 printf "\n== 结束 rc=%d 用时 %dm%02ds ==\n" $RC $(( (E-S)/60 )) $(( (E-S)%60 ))
 # 每次编译记一行概况到 /farm/builds.tsv（宿主机卷，sr history 看），完整输出另存一份

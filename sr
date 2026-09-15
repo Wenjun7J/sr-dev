@@ -3,8 +3,8 @@
 #   版本差异全靠"指路"，容器永不重建（重建会杀掉 scheduler，农场就断了）：
 #     thirdparty  公共目录 $SR_TPDIR/<digest>/ 整体挂成 /tp，编译时 bind 到规范路径，用哪个由 STARROCKS_THIRDPARTY 指
 #     编译器      镜像里备齐 gcc 11/12/13/14，用哪个由 STARROCKS_GCC_HOME 指
-#   镜像由用户显式指定（-v），不自动推断也不自动更新——上游镜像往前走时，
-#   你的代码可能还停在老 commit，跟进会把编译搞坏。
+#   依赖镜像的版本由用户显式指定（-v），不自动推断；指定后自动跟随该版本 tag 的最新 digest，
+#   digest 变了会提示"若报依赖错误先 rebase"（加依赖不破坏老代码；依赖升级时你的代码可能还没跟上）。
 set -uo pipefail
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 # 站点相关的东西（registry、base 镜像、apt 源、公共依赖目录、节点账号）全在 srdev.conf 里，
@@ -156,8 +156,8 @@ versions)
   shell / down
 
 版本用 -v 显式指定，例：sr -v main build   sr -v 4.1 build   sr -v 3.5.20 build
-指定一次后这棵源码树的这个分支会记住；上游镜像更新不会自动跟进
-（你的代码可能还没 rebase，跟进会把编译搞坏），要跟进用 -v 重新指定。
+指定一次后这棵源码树的这个分支会记住，并自动跟随该版本的最新依赖镜像；
+digest 变了会提示（若报依赖相关错误，先 rebase 代码）。换版本用 -v 重新指定。
 U
 ;;
 *)
@@ -166,7 +166,17 @@ U
   case "$sub" in
     build)
       # 版本记忆：按「源码树 + 分支」记，切分支要重新指定
-      root_of(){ local d=$PWD; while [ "$d" != / ]; do
+      # 与容器内 sr-build 同一规则找源码目录（review #7）：遇 -- 停；-j/--dist 跳过其值；其余 -* 跳过；
+      # 第一个存在的目录型位置参数就是源码根（必须是根本身，不上溯）；没给时才从 $PWD 上溯。
+      # 不能"扫所有参数里的现存目录"：-- 后面透传给 build.sh 的目录会被误认。
+      TSTART=""; skipv=0
+      for a in "$@"; do
+        [ $skipv = 1 ] && { skipv=0; continue; }
+        case "$a" in --) break;; -j|--dist) skipv=1;; -*) ;; *) [ -d "$a" ] && { TSTART=$(cd "$a" && pwd); break; };; esac
+      done
+      root_of(){ local d
+          if [ -n "$TSTART" ]; then [ -f "$TSTART/build.sh" ] && [ -d "$TSTART/be/src" ] && { echo "$TSTART"; return 0; }; return 1; fi
+          d=$PWD; while [ "$d" != / ]; do
           [ -f "$d/build.sh" ] && [ -d "$d/be/src" ] && { echo "$d"; return 0; }; d=$(dirname "$d"); done; return 1; }
       WROOT=$(root_of || true); PDIR=$BASE/farm/versions; KEY=""
       if [ -n "$WROOT" ]; then

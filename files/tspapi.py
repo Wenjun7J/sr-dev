@@ -3,7 +3,7 @@
    端点与 tsp-cli 保持一致；token 复用 ~/.tsp/config.json（由宿主机卷挂入）。"""
 import json, os, re, sys, urllib.parse, urllib.request
 
-CFG = os.path.expanduser("~/.tsp/config.json")
+CFG = os.path.expanduser(os.environ.get("TSP_CONFIG", "~/.tsp/config.json"))   # TSP_CONFIG 供测试指向独立凭据
 
 def _cfg():
     try:
@@ -22,7 +22,27 @@ def _req(path, data=None, raw=False):
     return t if raw else json.loads(t)
 
 def clusters():
-    return _req("/cluster/api/cluster/list/").get("detail", [])
+    """集群列表。响应结构不符时直接以 2 退出——不能把它当成空列表（review #9）"""
+    r = _req("/cluster/api/cluster/list/")
+    if not isinstance(r, dict) or not isinstance(r.get("detail"), list):
+        _die2("TSP 响应结构不符: %s" % str(r)[:200])
+    return r["detail"]
+
+def _die2(msg):
+    print(msg, file=sys.stderr); sys.exit(2)
+
+def exists(cid):
+    """结构化判定：退出码 0=存在(打印状态) 1=不存在 2=查询失败。sr-farm down 用它区分"没了"和"查不到"。"""
+    try:
+        cs = clusters()
+    except SystemExit:
+        raise
+    except Exception as e:
+        _die2("TSP 查询失败: %s" % e)
+    for c in cs:
+        if str(c.get("cluster_id")) == str(cid):
+            print(c.get("status") or c.get("cluster_status") or "exists"); sys.exit(0)
+    sys.exit(1)
 
 def cid(name):
     for c in clusters():
@@ -96,9 +116,10 @@ def create(name, workers, duration=2, itype="8c32g", disk="20"):
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    if not a: sys.exit("用法: tspapi.py {cid|nodes|spec|row|op|create} ...")
+    if not a: sys.exit("用法: tspapi.py {cid|exists|nodes|spec|row|op|create} ...")
     f = a[0]
     if   f == "cid":    print(cid(a[1]) or "")
+    elif f == "exists": exists(a[1])
     elif f == "nodes":  print(" ".join(nodes(a[1])))
     elif f == "spec":
         d = spec(a[1])
