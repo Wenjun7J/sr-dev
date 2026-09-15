@@ -41,6 +41,7 @@ COPY files/cxxlaunch   /usr/local/bin/cxxlaunch
 COPY files/ccache-pch  /usr/local/bin/ccache-pch
 COPY files/oss-ccache-proxy.py /usr/local/bin/oss-ccache-proxy.py
 COPY files/sr-build    /usr/local/bin/sr-build
+COPY files/mvn-keepcache /usr/local/bin/mvn-keepcache
 COPY files/sr-farm     /usr/local/bin/sr-farm
 COPY files/tspapi.py   /usr/local/bin/tspapi.py
 COPY files/node-setup.sh /usr/local/bin/node-setup.sh
