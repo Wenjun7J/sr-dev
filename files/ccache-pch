@@ -1,36 +1,66 @@
 #!/bin/bash
-# ccache-pch —— CMAKE_CXX_COMPILER_LAUNCHER。普通 TU 原样交给 ccache；编 PCH 时多做一件事：
-# 对预处理结果取 sha256 写成 <gch>.sum，配合 ccache.conf 的 pch_external_checksum=true。
+# ccache-pch —— CMAKE_CXX_COMPILER_LAUNCHER。普通 TU 原样交给 ccache；编 PCH（-x c++-header / -x c-header）时
+# 多做一件事：生成 <gch>.sum，配合 ccache.conf 的 pch_external_checksum=true 让 ccache 哈希 .sum 而不是 .gch 字节。
 #
 # 为什么必须这样（2026-09-12 实测）：
 #   - GCC 的 .gch 字节不可复现：同容器连续编两次大小都不同。ccache 默认按 .gch 内容哈希，
-#     于是 PCH 一被重建（--clean / 换镜像 / 头文件 mtime 变），该目标下所有 TU 必 miss（0/1446）。
-#   - PCH 编译命令自带 -include cmake_pch.hxx，ccache 把旧的 cmake_pch.hxx.gch 当输入哈希，
-#     而输出正是它 —— 编完发现"输入被改了"就拒存（计数器里 548 次 Input file modified），
-#     所以 PCH 的编译结果从来没进过缓存，恢复不出同一份字节。
-#   .sum 只随头文件内容变，与 .gch 字节无关；共享缓存（另一台机器生成的 .gch）也因此能命中。
-case " $* " in *" -x c++-header "*) ;; *) exec ccache "$@" ;; esac
-
-out=""; hxx=""; pre=(); skip=0
-for a in "$@"; do
-  if [ $skip = 1 ]; then skip=0; continue; fi
-  case "$a" in
-    -o)       skip=1; out=""; continue ;;
-    -include) skip=1; continue ;;                    # 取不到值时下一轮拿；见下
-    -MF|-MT|-MQ) skip=1; continue ;;
-    -MD|-MMD|-c) continue ;;
-    *.cxx|*.cpp|*.cc) [ "${a#-}" = "$a" ] && continue ;;   # 空壳源文件 cmake_pch.hxx.cxx
-  esac
-  pre+=("$a")
-done
-# 上面的 skip 把 -o / -include 的值吞掉了，再单独扫一遍取值
-prev=""; for a in "$@"; do case "$prev" in -o) out=$a;; -include) hxx=$a;; esac; prev=$a; done
+#     于是 PCH 一被重建（--clean / 换镜像），该目标下所有 TU 必 miss（0/1446）。
+#   - PCH 编译命令自带 -include cmake_pch.hxx，ccache 把旧的 .gch 当输入哈希，而输出正是它，
+#     编完发现"输入被改了"就拒存（548 次 Input file modified），PCH 结果从没进过缓存。
+#   - 跨机共享的前提：另一台机器生成的 .gch 字节必然不同，只有 .sum 能对得上。
+#
+# .sum 算法 v3（2026-09-15，按 review 与合成工程实测修订）：
+#   1) 参数按 ccache base_dir 的规则改写：$CCACHE_BASEDIR 之下的绝对路径 -> realpath 相对 cwd。
+#      实测与 ccache 实际传给编译器的 argv 逐项一致（-I../../src、-include src/.../cmake_pch.hxx、源文件 ../../src/...）。
+#      不能只替换前缀（等价但不同的字串），也不能抹成 basename（同名不同目录 + __FILE__ 会碰撞）。
+#   2) 主输入保持 cmake_pch.hxx.cxx + -include hxx，与真实 PCH 编译同一预处理上下文。-E 下 GCC 不加载 .gch（实测）。
+#   3) -E -fdirectives-only：保留全部 #define/#undef 文本，头文件不展开宏。必须如此——全展开的 -E 看不见"只改了宏定义"
+#      （宏没在 PCH 头里被使用），合成工程实测会造成错误命中。行号/文件切换标记保留（__INCLUDE_LEVEL__ 的结构、
+#      __FILE__ 的文件身份都在里面）；-fno-working-directory 去掉 "# 1 <cwd>//"（对应 comp_dir，真实编译里已被抹成 .）。
+#   4) 行号标记里的文件名施加与编译器相同的 -f{file,macro,debug}-prefix-map：cmake_pch.hxx 里 #include 的是绝对路径
+#      （内容，ccache 改不到），但编译器产物（__FILE__、DW_AT_name）里它已经是映射后的相对路径——校验和看到的文件名
+#      = 产物里的文件名。工程没配 prefix-map 时保持绝对路径，跨目录不共享：正确的保守行为。
+#   5) 哈希输入 = "v3" + 改写后的参数（*-prefix-map 只留选项名，与 ccache 一致）+ 归一化后的 -E 输出。
+#   6) 先写同目录临时文件，全部步骤成功后原子 mv；任一失败删掉旧 .sum（ccache 退化为按 .gch 内容哈希：正确但不可共享）。
+set -o pipefail
+out=""; prev=""
+for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
+# 判定"这是在编 PCH"：-x c++-header / -x c-header，或输出是 *.gch（CMake 给 C 语言 PCH 的命令不带 -x，靠 .h 后缀让 GCC 自行判定）
+case " $* " in *" -x c++-header "*|*" -x c-header "*) ;; *) case "$out" in *.gch) ;; *) exec ccache "$@" ;; esac ;; esac
 
 ccache "$@"; rc=$?
-if [ $rc = 0 ] && [ -n "$out" ] && [ -n "$hxx" ]; then
-  # 直接把头文件当主输入预处理（不走 -include，否则 GCC 会去找旁边的 .gch 而不展开头文件）。
-  # -fdirectives-only 不展开宏，只做 include 拼接，快且确定；-P 去掉行号标记。
-  sum=$("${pre[@]}" -E -P -fdirectives-only "$hxx" 2>/dev/null | sha256sum | cut -d' ' -f1)
-  [ -n "$sum" ] && echo "$sum" > "$out.sum"
+{ [ $rc = 0 ] && [ -n "$out" ]; } || exit $rc
+
+base=${CCACHE_BASEDIR:-}
+# base 目录本身也要改写（-I$base 这种），否则两条路径的哈希参数不同（合成工程实测踩过）
+rel(){ if [ -n "$base" ] && { [ "$1" = "$base" ] || [[ "$1" == "$base"/* ]]; }; then realpath -m --relative-to="$PWD" -- "$1"; else printf '%s' "$1"; fi; }
+args=(); hashed=(); skip=0
+for a in "$@"; do
+  [ $skip = 1 ] && { skip=0; continue; }
+  case "$a" in
+    -o|-MF|-MT|-MQ) skip=1; continue;;
+    -MD|-MMD|-c) continue;;
+    -I*) r="-I$(rel "${a#-I}")";;
+    *) r=$(rel "$a");;
+  esac
+  args+=("$r")
+  case "$r" in -ffile-prefix-map=*|-fdebug-prefix-map=*|-fmacro-prefix-map=*) hashed+=("${r%%=*}");; *) hashed+=("$r");; esac
+done
+
+# 行号标记归一化：按 prefix-map（长前缀优先）把 # N "OLD/..." 改成 # N "NEW/..."
+mapsed=""
+for a in "${args[@]}"; do case "$a" in -ffile-prefix-map=*=*|-fmacro-prefix-map=*=*|-fdebug-prefix-map=*=*) m=${a#*=}; printf '%s\n' "$m";; esac; done \
+  | awk -F= '{print length($1)"\t"$0}' | sort -rn | cut -f2- | while IFS= read -r m; do
+      o=${m%%=*}; n=${m#*=}; o=${o//|/\\|}; n=${n//|/\\|}; printf 's|^\\(# [0-9]* "\\)%s|\\1%s|\n' "$o" "$n"; done > "$out.sum.sed.$$" 2>/dev/null
+tmp=$(mktemp "$out.sum.XXXXXX" 2>/dev/null) || { rm -f "$out.sum.sed.$$"; exit 0; }
+if "${args[@]}" -E -fdirectives-only -fno-working-directory > "$tmp.raw" 2>/dev/null && [ -s "$tmp.raw" ] \
+   && sed -f "$out.sum.sed.$$" "$tmp.raw" > "$tmp.i" && [ -s "$tmp.i" ] \
+   && sum=$({ printf 'v3\n'; printf '%s\n' "${hashed[@]}"; cat "$tmp.i"; } | sha256sum | cut -d' ' -f1) && [ -n "$sum" ]; then
+  printf 'v3 %s\n' "$sum" > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$out.sum"   # mktemp 是 0600，宿主机用户读不了
+else
+  rm -f "$out.sum" "$tmp"
+  echo "ccache-pch: 预处理失败，未写 $out.sum（该 PCH 的 TU 按 .gch 内容哈希：正确但不可跨机共享）" >&2
 fi
-exit $rc
+rm -f "$tmp.raw" "$out.sum.sed.$$"
+[ -n "${SR_PCH_KEEP_I:-}" ] && mv -f "$tmp.i" "$out.i" 2>/dev/null || rm -f "$tmp.i"   # SR_PCH_KEEP_I=1 留下归一化后的 -E 输出供检查
+exit 0
