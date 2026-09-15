@@ -89,7 +89,8 @@ SR_CCACHE_REMOTE_BUCKET=<桶名>
 SR_CCACHE_REMOTE_PREFIX=ccache/
 ```
 
-两级读穿：本地命中不走网，本地 miss 才查远端并回填本地。实测 main Debug 全量（5 worker 农场）：
+两级读穿：本地命中不走网，本地 miss 才查远端并回填本地。缓存 key 与目录无关（以源码树根为 `CCACHE_BASEDIR`、`hash_dir=false`），
+同一份代码放在谁的哪个目录都命中同一批对象。实测 main Debug 全量（5 worker 农场）：
 
 | 场景 | 用时 | 命中 |
 |---|---|---|

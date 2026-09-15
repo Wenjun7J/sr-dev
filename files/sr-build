@@ -100,6 +100,10 @@ fi
 # ccache-pch = ccache 的薄包装：编 PCH 时顺手写 .gch.sum，配合 pch_external_checksum，见该脚本头注
 if [ $CACHE = 1 ]; then export CCACHE=/usr/local/bin/ccache-pch; else export CCACHE=/usr/local/bin/cxxlaunch; export CCACHE_DISABLE=1; fi
 export CCACHE_DIR=${SR_CCACHE_DIR:-/ccache}   # SR_CCACHE_DIR 仅供对照实验换目录
+# 缓存 key 跟着项目走、与目录无关：以源码树根为 base_dir，树内的绝对路径（-I、源文件、PCH）改写成相对路径再哈希，
+# ccache 也把相对路径传给编译器。于是同一份代码放哪个目录、哪个人编，key 都相同，本地 miss 才去远端拿。
+# 实测：同一 commit 另一路径、空本地缓存，1639/1640 从远端命中、1m28s。thirdparty/gcc 在树外，保持绝对路径，对所有人一致。
+export CCACHE_BASEDIR=$SR
 # ccache 远端（可选）：srdev.conf 配了 SR_CCACHE_REMOTE_BUCKET 就把本容器里的 OSS 代理当 http 后端。
 # 两级读穿：本地命中不走网，本地 miss 才查远端并回填本地。代理端口按 uid（多用户不撞），
 # 凭据用各人自己的 ~/.ossutilconfig（宿主机 sr 以 SR_OSSCFG 传路径）。实测 main 全量：
