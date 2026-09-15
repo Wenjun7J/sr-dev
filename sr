@@ -165,7 +165,7 @@ versions)
 
   up                 起容器（没镜像会先自动构建，约 5 分钟；单个容器编所有版本）
   image              强制重建镜像（改了 Dockerfile 之后用）
-  build [目录] [选项] 编译。首次会弹出版本选择（或用 -v 指定），之后记住；换版本再 -v
+  build [目录] [选项] 编译（默认 BE+FE；--be / --fe 单选）。首次会弹出版本选择（或用 -v 指定），之后记住；换版本再 -v
   farm {init|status|usage [--watch [秒]]|rebalance|resume|suspend|down}
   tp                 列出已拉下来的各版本依赖（全机共享目录）
   history [N]        最近 N 次编译概况（默认 20）
@@ -251,7 +251,8 @@ U
       # /var/local/thirdparty/...，之后不再重找（踩过：toolchains base 上 libcurl.a 找不到；dev-env base 上
       # 则静默链到内置的 main 依赖）。规范路径 + 私有 ns：路径永不变、版本互不干扰、并发各用各的。
       # 可选透传：CCACHE_REMOTE_STORAGE(ccache 远端存储 URL) / SR_CCACHE_DIR(换一个缓存目录做对照实验)
-      XENV=(); for v in CCACHE_REMOTE_STORAGE SR_CCACHE_DIR SR_EXPLAIN; do [ -n "${!v:-}" ] && XENV+=(-e "$v"); done
+      # MAVEN_OPTS: FE 的 maven JVM 参数/日志开关透传
+      XENV=(); for v in CCACHE_REMOTE_STORAGE SR_CCACHE_DIR SR_EXPLAIN MAVEN_OPTS; do [ -n "${!v:-}" ] && XENV+=(-e "$v"); done
       docker exec -w "$PWD" \
         -e STARROCKS_THIRDPARTY=/var/local/thirdparty -e STARROCKS_GCC_HOME="$GHOME" -e SR_TPDIGEST="$DGS" -e SR_VER="$SPEC" -e SR_BRANCH="${BR:-?}" \
         "${XENV[@]}" "${TTY[@]}" $NAME unshare -m --propagation private sh -c \

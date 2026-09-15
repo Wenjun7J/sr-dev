@@ -19,11 +19,11 @@ FARM_STATE=${FARM_STATE:-/farm/state.env}
 LOCK=""   # 源码树定下来之后才能算，见下
 
 BT=Debug ; DIST=auto ; JAVAEXT=1 ; CLEAN=0 ; GEN=ninja ; JLOCAL=16 ; VERBOSE=0 ; CACHE=1
-TARGET=be   # be | fe | all
+TARGET=all  # be | fe | all（默认 all：BE+FE；只编一个用 --be / --fe）
 usage(){ cat <<'U'
 用法: sr-build [源码目录] [选项] [-- 透传给 build.sh 的参数]
   不给源码目录就从当前目录上溯找 StarRocks 根
-  --be | --fe | --all            编译目标（默认 be；fe 走原生 maven 逻辑）
+  --be | --fe | --all            编译目标（默认 all=BE+FE；FE 走原生 maven，不经农场/ccache）
   --debug | --release | --asan   构建类型（默认 debug，仅对 be 生效）
   --dist auto|on|off             是否用编译农场（默认 auto）
   --no-java-ext                  跳过 java-extensions（默认构建，仅约 6 秒）
@@ -414,7 +414,7 @@ if [ "${MAXM:-0}" != 0 ] && [ "$MAXM" != max ] && [ "${PEAK:-0}" != 0 ]; then
     "$(g $PEAK)" "$(g $MAXM)" "$PCT" "$OOM0" "$OOM1" \
     "$([ "$PCT" -ge 85 ] && echo '  <- 余量偏紧，再加并发或换 ASAN 有 OOM 风险')"
 fi
-[ $CACHE = 1 ] && ccache -s 2>/dev/null | grep -E 'Cacheable calls|Hits:|Uncacheable' | head -3
+[ $CACHE = 1 ] && [ "$TARGET" != fe ] && ccache -s 2>/dev/null | grep -E 'Cacheable calls|Hits:|Uncacheable' | head -3   # 全局累计值，FE 不走 ccache 就不打
 
 # 产物落点。build.sh 只会闷头打一句 OUTPUT DIR=，既不说二进制在哪也不说是不是这次新出的
 if [ $RC -eq 0 ]; then
@@ -424,6 +424,15 @@ if [ $RC -eq 0 ]; then
     echo " FE 产物: $FOUT"
     FJ=$(ls -1 "$FOUT/lib/"*.jar 2>/dev/null | wc -l)
     [ -d "$FOUT/lib" ] && echo "   lib/  $FJ 个 jar   bin/ conf/ webroot/"
+    # FE 的真实开销在 maven reactor 摘要里：只取含 fe-core 的那段（java-extensions 也有一段 reactor，属 BE）
+    if [ -f "$LOGF" ]; then
+      tr '\r' '\n' < "$LOGF" | sed -E 's/\x1b\[[0-9;]*m//g' \
+        | awk '/Reactor Summary/{f=1; buf=""} f{buf=buf $0 "\n"} /BUILD (SUCCESS|FAILURE)/{if(f && buf ~ /fe-core/) print buf; f=0}' \
+        | grep -E ' (SUCCESS|FAILURE) ' | sed -E 's/^\[INFO\] //; s/ \.{2,} / /' \
+        | awk 'BEGIN{print " FE(maven) 各模块耗时:"} {t=$0; sub(/^.*\[ */,"",t); sub(/\]$/,"",t); printf "   %-22s %-8s %s\n", $1, $2, t}'
+      NC=$(tr '\r' '\n' < "$LOGF" | grep -cE 'Compiling [0-9]+ source files'); NU=$(tr '\r' '\n' < "$LOGF" | grep -cE 'Nothing to compile')
+      echo "   javac 实际编译 ${NC:-0} 个模块，${NU:-0} 个模块已是最新（maven 的增量粒度是整模块：fe-core 有一个文件变就整模块重编）"
+    fi
   fi
   [ "$TARGET" = fe ] && exit $RC
   OUT=$SR/output/be
