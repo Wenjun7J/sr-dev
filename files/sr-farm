@@ -122,7 +122,7 @@ usage)
     echo "== scheduler 视图（jobs=当前/上限，load 为 icecc 千分制）"
     printf '   %-26s %-15s %-9s %-6s %s\n' 主机 IP jobs load speed
     printf '%s\n' "$cs" | grep -E '^ [^ ]+ \(' | sed -E 's/^ ([^ ]+) \(([0-9.]+):[0-9]+\) \[[^]]*\] speed=([0-9.]+) jobs=([0-9]+\/[0-9]+) load=([0-9]+).*/\1 \2 \4 \5 \3/' \
-      | awk -v me="$HOSTIP" '{tag=($2==me)?"(本机)":""; printf "   %-26s %-15s %-9s %5.1f%% %s %s\n", substr($1,1,26), $2, $3, $4/10, $5, tag; split($3,a,"/"); if($2!=me){cur+=a[1]; cap+=a[2]}} END{printf "   远端合计 %d/%d 槽在用\n", cur, cap}'
+      | awk -v me="$HOSTIP" '{tag=($2==me)?"(本机)":""; if($2!=me && $5+0==0) tag="<- 从未接到任务(speed=0)"; printf "   %-26s %-15s %-9s %5.1f%% %s %s\n", substr($1,1,26), $2, $3, $4/10, $5, tag; split($3,a,"/"); if($2!=me){cur+=a[1]; cap+=a[2]}; if($2!=me && $5+0==0) idle++} END{printf "   远端合计 %d/%d 槽在用\n", cur, cap; if(idle>0) printf "   !! %d 台 worker speed=0：scheduler 一直没派任务给它（多半是它的 env 缓存空、而 scheduler 已有其它主机的统计就不再试新主机）。\n      修复：sr farm rebalance（重启 scheduler，统计清零后会随机分派、顺带给它装 env；进行中的任务会短暂回退本地）\n", idle}'
     jobs=$(sched_q listjobs 2>/dev/null | grep -vE '^200|^$'); [ -n "$jobs" ] && { echo "== 正在派发的任务（前 10）"; printf '%s\n' "$jobs" | head -10 | cut -c1-150 | sed 's/^/   /'; }
     echo "== 节点实际负载（ssh 一跳：loadavg 1m/5m · 内存 · 编译进程数）"
     for ip in $NODES; do
@@ -215,6 +215,12 @@ down|release)
   fi
   pkill -f "[s]r-farm _watchdog" 2>/dev/null
   rm -f "$STATE"; echo "已释放并停止看门狗" ;;
+# 重启 scheduler：icecc 有了各主机的统计后不再"试"没统计的新主机（比如 env 缓存被清过的 worker），它会一直零任务。
+# 重启后统计清零，前几轮随机分派，顺带把 env 装到所有主机。进行中的编译会短暂回退本地（软降级），几秒后恢复。
+rebalance)
+  [ -f "$STATE" ] || { echo "当前无农场"; exit 1; }; . "$STATE"
+  pkill -x icecc-scheduler 2>/dev/null; sleep 1; sched_ensure
+  echo "scheduler 已重启（:$SPORT）。worker 在 1~3 分钟内重连，之后 sr farm usage 里各台 speed 应都 > 0" ;;
 _wd) wd_ensure; exit 0 ;;
 _watchdog)
   while true; do

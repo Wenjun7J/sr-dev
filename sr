@@ -166,7 +166,7 @@ versions)
   up                 起容器（没镜像会先自动构建，约 5 分钟；单个容器编所有版本）
   image              强制重建镜像（改了 Dockerfile 之后用）
   build [目录] [选项] 编译。首次会弹出版本选择（或用 -v 指定），之后记住；换版本再 -v
-  farm {init|status|usage [--watch [秒]]|resume|suspend|down}
+  farm {init|status|usage [--watch [秒]]|rebalance|resume|suspend|down}
   tp                 列出已拉下来的各版本依赖（全机共享目录）
   history [N]        最近 N 次编译概况（默认 20）
   versions           列出 registry 里可用的版本

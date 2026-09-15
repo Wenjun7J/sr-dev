@@ -73,6 +73,7 @@ sr farm init                               # 可选：建农场。没有农场�
 - 编译不等唤醒：按满并发直接开工，后台轮询累计 ccache miss，攒够 8 次才叫醒农场（全命中的编译不吵醒它）。
 - `resume` 后实测 worker 连接数，不够就重新下发配置，仍不够标 `degraded`，`sr build` 拒绝开工而不是静默全落本地把容器 OOM 掉。
 - 远端任何故障都是软降级（icecc 回退本地）；真正致命的是本机 iceccd 静默失效，因此 `sr-build` 开工前会读 `/proc/<pid>/stat` 排除僵尸。
+- `sr farm usage` 里某台 worker `speed=0` 且从不接任务：icecc scheduler 有了其它主机的统计后不再尝试没统计的主机（env 缓存空的节点会一直饿着）。`sr farm rebalance` 重启 scheduler 让统计清零即可，实测修好过一台 5 天零任务的 worker。
 
 ## 多用户
 
