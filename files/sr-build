@@ -282,11 +282,14 @@ ensure_local_daemon(){ local sopt=() p cl
   if { iceccd_alive || port_taken; }; then
     # daemon 已在：核对它启动时的 -n/-s 是否就是本次期望的配置。不一致只警告不重启——别的构建可能正在用它（重启由 sr down/up 完成）
     for p in $(pgrep -x iceccd 2>/dev/null); do
-      cl=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)
-      case "$cl" in *" -n $NETNAME "*" -s $SCHED:$SPORT "*|*" -s $SCHED:$SPORT "*" -n $NETNAME "*) ;;
-        *iceccd*) echo "!! 常驻 iceccd 的配置与本次期望不同（期望 -n $NETNAME -s $SCHED:$SPORT）：$(echo "$cl" | grep -oE -- '-n [^ ]+|-s [^ ]+' | tr '\n' ' ')"
-                  echo "   它可能是在别的农场配置下启动的；农场构建会连不上 scheduler。空闲时 sr down && sr up 重建容器即可刷新。"; break;;
-      esac
+      cl="$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null) "
+      [[ "$cl" == *iceccd* ]] || continue
+      # 顺序无关的两段匹配（bash 实测：拼接两段引号的 case 双备选模式对完全相同的命令行也判不匹配，会每次误报）
+      if ! [[ "$cl" == *" -n $NETNAME "* && "$cl" == *" -s $SCHED:$SPORT "* ]]; then
+        echo "!! 常驻 iceccd 的配置与本次期望不同（期望 -n $NETNAME -s $SCHED:$SPORT）：$(echo "$cl" | grep -oE -- '-n [^ ]+|-s [^ ]+' | tr '\n' ' ')"
+        echo "   它可能是在别的农场配置下启动的；农场构建会连不上 scheduler。空闲时 sr down && sr up 重建容器即可刷新。"
+      fi
+      break
     done
     return 0
   fi
