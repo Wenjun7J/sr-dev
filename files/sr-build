@@ -118,14 +118,24 @@ REMOTE_NOTE=""
 if [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] && [ -n "${SR_CCACHE_REMOTE_BUCKET:-}" ]; then
   PPORT=$(( 20700 + ${SR_UID:-0} % 500 )); RPFX=${SR_CCACHE_REMOTE_PREFIX:-ccache/}
   proxy_up(){ [ -n "$(ss -ltnH "sport = :$PPORT" 2>/dev/null)" ]; }   # 不能 `ss | grep -q`：pipefail 下 SIGPIPE 返回 141（踩过）
-  if ! proxy_up && [ -f "${SR_OSSCFG:-/nonexistent}" ]; then
-    setsid nohup python3 /usr/local/bin/oss-ccache-proxy.py --bucket "$SR_CCACHE_REMOTE_BUCKET" --prefix "$RPFX" \
-      --listen 127.0.0.1:$PPORT --config "$SR_OSSCFG" --log /farm/ccache-proxy.log </dev/null >>/farm/ccache-proxy.out 2>&1 9>&- &
+  # review r7#4(P1)：容器 --network host，127.0.0.1 挡不住本机其他用户；代理无鉴权时任何人都能用所有者凭据 PUT 污染 / DELETE 共享缓存。
+  # 每用户随机令牌存 /farm/ccache-token（0600，目录已是 0700），ccache 用 http 后端自带的 bearer-token 属性携带，代理对所有方法校验。
+  TOKF=/farm/ccache-token
+  [ -s "$TOKF" ] || { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$TOKF" && chmod 600 "$TOKF"; }
+  TOK=$(cat "$TOKF" 2>/dev/null)
+  # 旧版（无鉴权）代理还在跑时，不带令牌 GET /_stats 会得 200 → 杀掉重起，否则鉴权形同虚设（kill 只影响本用户端口的代理）
+  if proxy_up && command -v curl >/dev/null 2>&1 \
+     && [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PPORT/_stats" 2>/dev/null)" = 200 ]; then
+    echo "   (发现无鉴权的旧版 ccache 代理，重启以启用令牌校验)"; pkill -f "oss-ccache-proxy.py .*--listen 127.0.0.1:$PPORT " 2>/dev/null; sleep 0.5
+  fi
+  if ! proxy_up && [ -f "${SR_OSSCFG:-/nonexistent}" ] && [ -n "$TOK" ]; then
+    setsid nohup python3 /usr/local/bin/oss-ccache-proxy.py --bucket "$SR_CCACHE_REMOTE_BUCKET" --prefix "$RPFX" --token-file "$TOKF" \
+      --listen 127.0.0.1:$PPORT --config "$SR_OSSCFG" --log /farm/ccache-proxy.log </dev/null >>/farm/ccache-proxy.out 2>&1 8>&- 9>&- &
     for i in 1 2 3 4 5 6; do proxy_up && break; sleep 0.5; done
   fi
-  if proxy_up; then
+  if proxy_up && [ -n "$TOK" ]; then
     # connect-timeout 默认 100ms，-j56 并发下会误判；operation-timeout 要容得下 100MB 级的 PCH 结果
-    export CCACHE_REMOTE_STORAGE="http://127.0.0.1:$PPORT/|connect-timeout=3000|operation-timeout=60000"
+    export CCACHE_REMOTE_STORAGE="http://127.0.0.1:$PPORT/|bearer-token=$TOK|connect-timeout=3000|operation-timeout=60000"
     REMOTE_NOTE="oss://$SR_CCACHE_REMOTE_BUCKET/$RPFX (经本容器 :$PPORT)"
   else
     REMOTE_NOTE="未启用：代理起不来（缺 ${SR_OSSCFG:-~/.ossutilconfig}？看 /farm/ccache-proxy.out）"
@@ -142,6 +152,9 @@ GH=$(basename "${STARROCKS_GCC_HOME:-/opt/gcc-toolset-14}")
 TOOLCHAIN=$(ls -1 /opt/icecc/$GH/*.tar.gz 2>/dev/null | head -1)
 MISS_MIN=${MISS_MIN:-8}      # 这段时间内 ccache miss 超过几次就算「真在编」
 TREE=$TREE_BASE/build_$BT
+# review r7#1（codex 第三轮）：透传 --with-gcov 时 build.sh 用 build_${BT}_gcov。探针/依赖戳/pending 必须对准真实目录，
+# 否则 gcov 构建成功会把普通树的戳改成新 digest、删掉 pending，普通 Debug 随后在新依赖下不再强制清理、残留旧对象。
+case " ${PASS[*]:-} " in *" --with-gcov "*) TREE=${TREE}_gcov;; esac
 # 老分支无法按生成器隔离目录：已有 CMakeCache 记的是另一种生成器时，CMake 会拒绝配置，提前识别并要求 --clean（review extra#5）
 if [ "$TARGET" != fe ] && [ "$TREE_BASE" = "$SR/be" ] && [ -f "$TREE/CMakeCache.txt" ] && [ $CLEAN = 0 ]; then
   PREVGEN=$(sed -n 's/^CMAKE_GENERATOR:[A-Z]*=//p' "$TREE/CMakeCache.txt" | head -1)
@@ -212,17 +225,56 @@ fi
 # 此时再按农场容量设 -j 会把几十个编译全压到本机、丢掉 iceccd 的本机上限 → 强制本地并发。
 case " ${PASS[*]:-} " in *" --output-compile-time "*)
   [ "$DIST" != off ] && echo " (检测到 --output-compile-time：计时 launcher 不经农场/ccache，强制本地 -j$JLOCAL)"; DIST=off;; esac
-# review#2(P1)：容器内 thirdparty 路径恒为 /var/local/thirdparty，提取又用 cp -a 保留时间戳；ninja 只看 mtime，
-# 切回旧 digest、或新依赖文件时间早于现有 .o 时会误判"无需重编"、残留旧产物（ccache 救不了：命令根本没跑）。
-# 按 digest 给 BE 构建树打戳：戳变了就强制 --clean（交给 build.sh 删真实目录，不自己 rm 猜的路径）。
-if [ "$TARGET" != fe ] && [ -n "${SR_TPDIGEST:-}" ] && [ -f "$TREE/.sr_tpdigest" ] \
-   && [ "$(cat "$TREE/.sr_tpdigest" 2>/dev/null)" != "$SR_TPDIGEST" ] && [ $CLEAN = 0 ]; then
-  echo "   依赖 digest 变了（$(cat "$TREE/.sr_tpdigest") -> $SR_TPDIGEST）→ 强制 --clean 全量，防时间戳误判残留旧产物"
-  CLEAN=1
+# review#2(P1)+r7#1 定案：容器内 thirdparty 路径恒为 /var/local/thirdparty，提取又 cp -a 保留时间戳；ninja 只看 mtime，
+# 切回旧 digest 或新依赖文件更旧时会误判"无需重编"、残留旧产物（ccache 救不了：命令根本没跑）。按 digest 给 BE 构建树打戳：
+#   有戳且 ≠ 当前 → 强制 --clean（交给 build.sh 删真实目录，不自己 rm 猜的路径）；
+#   无戳但有树：目录外的 pending 记录存在 = 上次切依赖的 clean 构建被中断、树内容不可信 → 强制 --clean；
+#              没有 pending = 早于此功能的历史树 → 采纳当前 digest 为基线（明确接受来源未知的风险，打印警告）。
+# 戳写入规则在构建结束处（RC=0，或“探针被清掉且构建文件重新存在”证明真的清理并重配置过）。
+if [ "$TARGET" != fe ] && [ -n "${SR_TPDIGEST:-}" ]; then
+  STAMP=$TREE/.sr_tpdigest; PENDING=$TREE_BASE/.sr_pending_$(basename "$TREE")
+  if [ -f "$STAMP" ]; then
+    if [ "$(cat "$STAMP" 2>/dev/null)" != "$SR_TPDIGEST" ] && [ $CLEAN = 0 ]; then
+      echo "   依赖 digest 变了（$(cat "$STAMP") -> $SR_TPDIGEST）→ 强制 --clean 全量，防时间戳误判残留旧产物"; CLEAN=1
+    fi
+  elif [ -f "$TREE/build.ninja" ] || [ -f "$TREE/Makefile" ]; then
+    if [ -f "$PENDING" ]; then
+      echo "   上次切依赖（→ $(cat "$PENDING" 2>/dev/null)）的 clean 构建被中断，树内容不可信 → 强制 --clean"; CLEAN=1
+    else
+      echo "   警告：该构建树没有依赖戳（早于此功能），本次采纳 $SR_TPDIGEST 为基线；若怀疑其来源请 sr build --clean"
+    fi
+  fi
 fi
+# review r7#3(P1)：state.env 只按白名单键解析、不再 source（曾可被替换后当 root 执行）；解析失败按无农场本地编译
+load_farm_state(){ local k v; [ -f "$FARM_STATE" ] || return 1
+  while IFS='=' read -r k v || [ -n "$k" ]; do v=${v%\"}; v=${v#\"}
+    case "$k" in
+      CLUSTER|NETNAME) [[ "$v" =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || return 1;;
+      CID|WORKERS|NCPU|SPORT|DPORT) [[ "$v" =~ ^[0-9]{1,10}$ ]] || return 1;;
+      SCHED) [[ "$v" =~ ^[0-9.]{7,15}$ ]] || return 1;;
+      NODES) [[ "$v" =~ ^[0-9.\ ]*$ ]] || return 1;;
+      FARM_STATUS) case "$v" in initializing|running|degraded|suspended|releasing) ;; *) return 1;; esac;;
+      ''|'#'*) continue;;
+      *) return 1;;
+    esac; printf -v "$k" '%s' "$v"; done < "$FARM_STATE"; }
+if [ "$DIST" != off ] && [ -f "$FARM_STATE" ] && ! load_farm_state; then
+  echo "!! $FARM_STATE 格式不符（可能损坏或被篡改），本次不用农场，本地 -j$JLOCAL"; DIST=off; FARM_NOTE="本地（state.env 解析失败）"
+fi
+# review r7#6：本地 iceccd 两种模式共用（原来只在农场分支里起，本地模式直连编译器、无跨树并发闸门）。起不来返回 1。
+# 必须排除僵尸：pgrep 会匹配 <defunct> 的 iceccd；端口全机唯一，多 profile 容器只有第一个能 bind，其余共用同一 daemon。
+iceccd_alive(){ local p st; for p in $(pgrep -x iceccd 2>/dev/null); do st=$(awk '{print $3}' /proc/$p/stat 2>/dev/null); [ "$st" != Z ] && return 0; done; return 1; }
+port_taken(){ [ -n "$(ss -ltnH "sport = :${DPORT:-10245}" 2>/dev/null)" ]; }
+ensure_local_daemon(){ local sopt=()
+  { iceccd_alive || port_taken; } && return 0
+  [ -n "${SCHED:-}" ] && sopt=(-s "$SCHED:${SPORT:-8765}")   # 没农场时不给 -s，daemon 独立跑只做本机限流
+  mkdir -p /var/run/icecc
+  # 8>&- 9>&-：daemon 常驻，不得继承农场锁/构建锁的 fd（踩过：锁被永久占住，编完再也拿不到锁）
+  /usr/sbin/iceccd -d ${sopt[@]+"${sopt[@]}"} -n "${NETNAME:-srfarm}" -m $LOCALCAP -p "${DPORT:-10245}" \
+    -N "$(hostname)-${SR_USER:-u}" -u nobody -l /tmp/iceccd.log </dev/null >/dev/null 2>&1 8>&- 9>&-
+  sleep 3; { iceccd_alive || port_taken; }; }
 if [ "$DIST" != off ]; then
   sr-farm _wd 2>/dev/null || true   # 容器重启后把看门狗拉回来
-  . "$FARM_STATE"                                    # 提供 SCHED / FARM_STATUS / WORKERS
+  # state.env 已在上面按白名单键解析进变量（SCHED / FARM_STATUS / WORKERS / NCPU…），不再 source（review r7#3）
   read -r N MANIFEST_DIRTY < <(edges); N=${N:-99999}; MANIFEST_DIRTY=${MANIFEST_DIRTY:-0}
   # 构建树不存在（首次 / --clean）时必然是大规模真编译，不必等 miss 攒够再唤醒；
   # 这样唤醒能和 cmake configure 那 30-60 秒重叠，而不是等到编译真开始才动。
@@ -267,7 +319,8 @@ if [ $USE_FARM = 1 ]; then
   # 总并发 = 每台 worker 的槽数(NCPU，init 时按节点核数或 SR_NODE_JOBS 写进 state.env) × 台数 + 本地。
   # 老的 state.env 没有 NCPU 时退回 8（旧农场都是 8 核，行为不变）。
   # 显式 -j N 是本次总并发上限（review extra2#1：原来 -j 只加在远端容量上，用户为省内存写 -j4 却仍 -j44 且本机可跑 16 个）
-  export USE_ICECC=1; if [ "$JSET" = 1 ]; then J=$JLOCAL; else J=$(( ${WORKERS:-4} * ${NCPU:-8} + JLOCAL )); fi
+  export USE_ICECC=1; unset ICECC 2>/dev/null || true   # 显式清掉 ICECC=no：环境若继承了它，icecc 会禁掉外发（codex 第三轮）
+  if [ "$JSET" = 1 ]; then J=$JLOCAL; else J=$(( ${WORKERS:-4} * ${NCPU:-8} + JLOCAL )); fi
   # icecc 拒绝符号链接，必须给真实文件；给错了会静默退回本地编译。
   # 单容器带多套 gcc，工具链包必须和当前 STARROCKS_GCC_HOME 配对——
   # 传错版本的包，worker 上就用错编译器编，产物 ABI 不一致且不报错。
@@ -293,7 +346,16 @@ if [ $USE_FARM = 1 ]; then
   { iceccd_alive || port_taken; } || { echo "!! 本地 iceccd 起不来，降级为本地编译 -j$JLOCAL"; \
                     USE_FARM=0; export USE_ICECC=0; J=$JLOCAL; ASYNC_WAKE=0; FARM_NOTE="本地（本地 iceccd 起不来，已降级）"; unset CCACHE_PREFIX ICECC_VERSION 2>/dev/null || true; }
 else
-  export USE_ICECC=0; J=$JLOCAL; unset CCACHE_PREFIX 2>/dev/null || true
+  J=$JLOCAL
+  # review r7#6：本地模式也经本机 iceccd。ICECC=no 让 icecc 客户端只在本机编、但仍占 daemon 的槽位（上游明确区分该路径与无 daemon 回退），
+  # 于是 -m $LOCALCAP 成为跨源码树共享的本机并发闸门（原来直连编译器，两棵树各 -j16 会叠成 32 个 cc1plus），且绝不外发、不唤醒农场。
+  if [ "$TARGET" != fe ] && ensure_local_daemon; then
+    export USE_ICECC=1 ICECC=no; [ $CACHE = 1 ] && export CCACHE_PREFIX=icecc
+    FARM_NOTE="$FARM_NOTE；本机并发经 iceccd 闸门(-m $LOCALCAP)"
+  else
+    export USE_ICECC=0; unset CCACHE_PREFIX ICECC 2>/dev/null || true
+    [ "$TARGET" != fe ] && echo "!! 本地 iceccd 不可用，本机并发无跨树闸门（仅 ninja -j$J）"
+  fi
 fi
 
 case $TARGET in
@@ -359,7 +421,33 @@ PARENT=$$
 SAMPLER=$!
 # review#5：构建被 Ctrl+C/kill 时采样器原来会活下来继续 touch /farm/last-build，让农场永远"忙"而无法休眠。
 # 用 trap 统一收尾（正常退出与 INT/TERM 都覆盖）；WAKER 在异步唤醒子 shell 起来后再补进来。
-trap 'kill $SAMPLER ${WAKER:-} 2>/dev/null; rm -f "$ANONF" "${RUNFLAG:-/nonexistent}" 2>/dev/null' EXIT INT TERM
+# review r7#7：EXIT 只清理；INT/TERM 要真正取消本次构建——杀构建自己的进程组、10s 宽限后仍有成员则 KILL、回收，再以 130/143 退出。
+# 原来一个 trap 兼任两职且不 exit：只 kill 驱动时，bash 等前台管道结束才跑 trap，采样器停了、构建照跑还可能报成功。
+HS=""   # 当前 run_build 的握手文件前缀；取消路径 on_signal 直接 exit，不会走到 run_build 末尾的清理，所以由 cleanup 兜底删
+cleanup(){ kill $SAMPLER ${WAKER:-} 2>/dev/null; rm -f "$ANONF" "${RUNFLAG:-/nonexistent}" "${PROBE:-/nonexistent}" 2>/dev/null
+  [ -n "$HS" ] && rm -f "$HS" "$HS.pgid" "$HS.ack" 2>/dev/null; }
+on_signal(){ local sig=$1 i
+  echo ""; echo "!! 收到 $sig，取消本次构建…"
+  if [ -n "${BPGID:-}" ]; then kill -TERM -- "-$BPGID" 2>/dev/null
+  elif [ -n "${BPID:-}" ]; then kill -TERM "$BPID" 2>/dev/null; fi        # 握手前只知道 wrapper 本体
+  for i in $(seq 1 100); do [ -n "${BPGID:-}" ] && pgrep -g "$BPGID" >/dev/null 2>&1 || break; sleep 0.1; done
+  [ -n "${BPGID:-}" ] && pgrep -g "$BPGID" >/dev/null 2>&1 && { echo "   组内仍有进程忽略 TERM，改发 KILL"; kill -KILL -- "-$BPGID" 2>/dev/null; }
+  [ -n "${BPID:-}" ] && wait "$BPID" 2>/dev/null
+  cleanup; if [ "$sig" = INT ]; then exit 130; else exit 143; fi; }
+trap cleanup EXIT; trap 'on_signal INT' INT; trap 'on_signal TERM' TERM
+# 构建包装：在新 session（自成进程组）里跑 build.sh|tee 并在里面取 PIPESTATUS，RC 由 setsid --wait 转发，不再跨后台管道用 PIPESTATUS。
+# 每次调用独立握手文件；wrapper 先公布 pgid、收到父确认后才开工，父在此之前就知道该杀谁（codex 第三轮：启动窗口与重试残留）。
+BPID=""; BPGID=""
+run_build(){ local i
+  HS=$(mktemp /tmp/sr-build.hs.XXXXXX); rm -f "$HS.pgid" "$HS.ack"
+  setsid --wait bash -c 'hs=$1; sr=$2; outf=$3; shift 3; echo $$ > "$hs.pgid"
+      for i in $(seq 1 50); do [ -f "$hs.ack" ] && break; sleep 0.1; done
+      cd "$sr" && ( ./build.sh "$@" ) 2>&1 | tee -a "$outf"; exit "${PIPESTATUS[0]}"' _ "$HS" "$SR" "$OUTF" "$@" 8>&- 9>&- &
+  BPID=$!
+  for i in $(seq 1 50); do [ -s "$HS.pgid" ] && break; sleep 0.1; done
+  BPGID=$(cat "$HS.pgid" 2>/dev/null); : > "$HS.ack"
+  wait "$BPID"; RC=$?
+  rm -f "$HS" "$HS.pgid" "$HS.ack"; HS=""; BPID=""; BPGID=""; }
 
 # 后台评估是否值得唤醒农场。ccache 命中一次只要 4-5ms，真编一个 TU 要几秒到几分钟，
 # 两者差着三四个数量级，所以观察 15 秒的 miss 增量就足以分辨，不需要任何预测。
@@ -397,7 +485,13 @@ S=$(date +%s)
 OUTF=$(mktemp /tmp/sr-build.XXXXXX)
 # 调试钩子：SR_EXPLAIN=1 时在开工前让 ninja 解释哪些边为什么脏（排查"明明没改代码却全量"用）
 [ -n "${SR_EXPLAIN:-}" ] && [ -f "$TREE/build.ninja" ] && { echo "== ninja explain（开工前，前 15 条）:"; ninja -C "$TREE" -n -d explain 2>&1 | grep "^ninja explain" | head -15 | cut -c1-220; }
-( cd "$SR" && ./build.sh "${ARGS[@]}" ) 2>&1 | tee "$OUTF"; RC=${PIPESTATUS[0]}
+# review r7#1：强制 clean 前在目录外记 pending（想切到的 digest），并在树内放唯一探针；结束后“探针消失 + 构建文件重新存在”才证明真的清过
+PENDING=${PENDING:-$TREE_BASE/.sr_pending_$(basename "$TREE")}; PROBE=""
+if [ "$TARGET" != fe ] && [ $CLEAN = 1 ] && [ -n "${SR_TPDIGEST:-}" ]; then
+  echo "$SR_TPDIGEST" > "$PENDING" 2>/dev/null || true
+  [ -d "$TREE" ] && { PROBE=$TREE/.sr_clean_probe.$RANDOM$$; : > "$PROBE" 2>/dev/null || PROBE=""; }
+fi
+run_build "${ARGS[@]}"
 E=$(date +%s)
 : > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null
 
@@ -430,12 +524,22 @@ if [ $RC -ne 0 ] && { [ "${OOM1:-0}" -gt "${OOM0:-0}" ] || [ "${KILLED:-0}" -gt 
   done
   RARGS+=(-j "$RETRY")
   echo "   重试: ./build.sh ${RARGS[*]}" | tee -a "$OUTF"
-  ( cd "$SR" && ./build.sh "${RARGS[@]}" ) 2>&1 | tee -a "$OUTF"; RC=${PIPESTATUS[0]}   # 输出追加进同一份日志
+  run_build "${RARGS[@]}"   # 输出追加进同一份日志；复用同一包装，进程组/取消语义与首次一致（review r7#7）
   E=$(date +%s)
   fi
 fi
-# 给 BE 构建树打上本次用的依赖 digest 戳（下次 digest 变了据此强制 --clean，见前面 review#2 处）。build.sh 已建好目录才写得进
-[ "$TARGET" != fe ] && [ -d "$TREE" ] && [ -n "${SR_TPDIGEST:-}" ] && { echo "$SR_TPDIGEST" > "$TREE/.sr_tpdigest" 2>/dev/null || true; }
+# 依赖戳写入（review r7#1 定案）：RC=0 写；失败时只有“本次强制 clean 且探针已被清掉且生成器构建文件重新存在”才写——
+# 这证明目录真的被清并重新配置过、树里已是新依赖的产物。写成功即删 pending。其它情况保留旧戳/pending，下次照样强制 clean（多清不漏清）。
+# 原来无条件写戳：build.sh 因非法参数在 clean 前退出也会被记成新依赖，下次不再清理、旧对象残留。
+if [ "$TARGET" != fe ] && [ -n "${SR_TPDIGEST:-}" ] && [ -d "$TREE" ]; then
+  WS=0; [ $RC = 0 ] && WS=1
+  if [ $WS = 0 ] && [ $CLEAN = 1 ] && [ -n "${PROBE:-}" ] && [ ! -e "$PROBE" ]; then
+    BF=build.ninja; [ "$GEN" = make ] && BF=Makefile
+    [ -f "$TREE/$BF" ] && WS=1
+  fi
+  if [ $WS = 1 ]; then echo "$SR_TPDIGEST" > "$TREE/.sr_tpdigest" 2>/dev/null && rm -f "${PENDING:-/nonexistent}"; fi
+fi
+rm -f "${PROBE:-/nonexistent}" 2>/dev/null
 rm -f $RUNFLAG      # 采样与异步唤醒循环到这里才退出：重试期间也要继续采样、继续心跳
 : > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null
 kill $SAMPLER 2>/dev/null

@@ -24,21 +24,26 @@ def load_cfg(path):
     cp = configparser.ConfigParser()
     cp.read(os.path.expanduser(path))
     d = cp["default"]
-    ep = d["endpoint"].strip().rstrip("/").split("://", 1)[-1]
-    return d["accessKeyID"].strip(), d["accessKeySecret"].strip(), ep
+    raw = d["endpoint"].strip().rstrip("/")
+    # review r7 存疑2：显式 https:// 必须遵守（原来一律剥成 HTTP）；无协议保持 http，兼容现网内网端点
+    scheme = "https" if raw.lower().startswith("https://") else "http"
+    ep = raw.split("://", 1)[-1]
+    return d["accessKeyID"].strip(), d["accessKeySecret"].strip(), ep, scheme
 
 
 class OSS:
     """每线程复用一条到 OSS 的长连接；失败重连一次。"""
 
-    def __init__(self, ak, sk, endpoint, bucket):
+    def __init__(self, ak, sk, endpoint, bucket, scheme="http"):
         self.ak, self.sk, self.host, self.bucket = ak, sk, f"{bucket}.{endpoint}", bucket
+        self.scheme = scheme
         self._local = threading.local()
 
     def _conn(self):
         c = getattr(self._local, "c", None)
         if c is None:
-            c = http.client.HTTPConnection(self.host, timeout=60)
+            cls = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
+            c = cls(self.host, timeout=60)
             self._local.c = c
         return c
 
@@ -88,6 +93,18 @@ class Handler(BaseHTTPRequestHandler):
     oss = None
     prefix = ""
     logf = None
+    token = None   # review r7#4：每用户随机 Bearer 令牌；None 仅供无鉴权测试
+
+    def _authed(self):
+        # review r7#4(P1)：容器 --network host，监听 127.0.0.1 挡不住本机其他用户；无鉴权时任何人都能用所有者凭据
+        # PUT 污染 / DELETE 清空共享缓存前缀。所有方法（含 GET、/_stats）都校验 Authorization: Bearer <token>。
+        if self.token is None:
+            return True
+        if self.headers.get("Authorization", "") == f"Bearer {self.token}":
+            return True
+        self._reply(401, b"unauthorized\n")
+        self._log(401, 0, 0.0)
+        return False
 
     def _key(self):
         return self.prefix + unquote(self.path.split("?", 1)[0].lstrip("/"))
@@ -135,6 +152,8 @@ class Handler(BaseHTTPRequestHandler):
         self._log(st, n, ms)
 
     def do_GET(self):
+        if not self._authed():
+            return
         if self.path == "/_stats":
             with STATS["lock"]:
                 snap = {k: dict(v) for k, v in STATS.items() if k != "lock"}
@@ -144,14 +163,20 @@ class Handler(BaseHTTPRequestHandler):
         self._forward("GET")
 
     def do_HEAD(self):
+        if not self._authed():
+            return
         self._forward("HEAD")
 
     def do_PUT(self):
         n = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(n) if n else b""
+        body = self.rfile.read(n) if n else b""   # 先读完 body 再鉴权，否则 keep-alive 连接会错位
+        if not self._authed():
+            return
         self._forward("PUT", body, "application/octet-stream")
 
     def do_DELETE(self):
+        if not self._authed():
+            return
         self._forward("DELETE")
 
     def log_message(self, *a):  # 关掉默认的 stderr 访问日志，用 _log
@@ -165,9 +190,16 @@ def main():
     ap.add_argument("--listen", default="127.0.0.1:8384")
     ap.add_argument("--config", default="~/.ossutilconfig")
     ap.add_argument("--log", default=None, help="逐请求日志文件（默认不记）")
+    ap.add_argument("--token-file", default=None, help="Bearer 令牌文件（review r7#4）：所有请求必须携带；不给则不鉴权，仅供测试")
     a = ap.parse_args()
-    ak, sk, ep = load_cfg(a.config)
-    Handler.oss = OSS(ak, sk, ep, a.bucket)
+    ak, sk, ep, scheme = load_cfg(a.config)
+    Handler.oss = OSS(ak, sk, ep, a.bucket, scheme)
+    if a.token_file:
+        with open(os.path.expanduser(a.token_file)) as f:
+            Handler.token = f.read().strip() or None
+        if Handler.token is None:
+            print("oss-ccache-proxy: 令牌文件为空，拒绝启动（无鉴权只允许显式不传 --token-file）", file=sys.stderr)
+            sys.exit(2)
     Handler.prefix = a.prefix
     Handler.logf = open(a.log, "a") if a.log else None
     host, port = a.listen.rsplit(":", 1)

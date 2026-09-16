@@ -32,7 +32,9 @@ case " $* " in *" -x c++-header "*|*" -x c-header "*) ;; *) case "$out" in *.gch
 # PCH 本体的生成不走 ccache，直接调编译器：ccache 不哈希 -ffile-prefix-map 的值，会把另一组映射目标下生成的 .gch 当命中恢复
 # 回来（合成工程实测：__FILE__ 已烘进 .gch，TU 再新鲜编也是错的）；而 .gch 字节本就不可复现、缓存它只省 65×~1s，TU 的缓存
 # 靠 .sum 与 .gch 字节无关。不能外发（icecc 不支持远端生成 PCH），这里也不设 CCACHE_PREFIX。
-"$@"; rc=$?
+# review r7#6：PCH 本体经 icerun 走本机 daemon 的槽位——原来直连编译器绕过并发闸门，clean 时多个目标的 PCH 会同时挤本机。
+# icerun 只做本地限流：不外发、不改命令与产物，与 .sum 逻辑无关。icerun 或 daemon 套接字不在时回退直连（今天的行为）。
+if command -v icerun >/dev/null 2>&1 && [ -S /var/run/icecc/iceccd.socket ]; then icerun "$@"; else "$@"; fi; rc=$?
 { [ $rc = 0 ] && [ -n "$out" ]; } || exit $rc
 
 base=${CCACHE_BASEDIR:-}

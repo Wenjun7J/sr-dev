@@ -91,7 +91,15 @@ ensure_container(){
   running && return 0
   ensure_image || { echo "!! 镜像构建失败"; return 1; }
   mkdir -p $BASE/ccache $BASE/m2 $BASE/farm $BASE/.tsp $BASE/iceccrun $TPDIR
-  chmod 777 $BASE/farm 2>/dev/null; chmod 777 $BASE/iceccrun 2>/dev/null || true
+  # review r7#3(P1)：原来 farm 是 0777 且无 sticky，本机任何用户都能删掉再放一个 state.env，容器 root 会读它 → 提权。
+  # 改 0700：owner 仍能删容器 root 建的文件（删文件只看目录 w 位），容器 root 不受目录权限限制，其他用户进不来。
+  # iceccrun 不能 0700：daemon 以 nobody 跑、要在里面建 socket（实测目录属主已是 nobody，chmod 会 EPERM）；它保持 0755，
+  # 不可写就不是"替换文件"的向量。残余：socket 本身 0777（icecc 默认），靠 $HOME 0750 挡住非同组用户；换 daemon uid 另议。
+  chmod 700 $BASE/farm 2>/dev/null || echo "!! 无法把 $BASE/farm 设为 0700，请手动 chmod 700（否则其他用户可替换 state.env）"
+  # review r7#2(P1)：两次首次 sr build 并发，慢的一方会在快的一方已开工后 docker rm -f 掉它的容器。按容器名加锁、锁内复查。
+  exec 8>"$BASE/farm/.container.lock" 2>/dev/null || { echo "!! 无法打开 $BASE/farm/.container.lock（目录权限？），拒绝在无互斥下起容器"; return 1; }
+  flock -w 120 8 || { echo "!! 等待容器启动锁超时（另一个 sr 正在起容器？）"; return 1; }
+  if running; then exec 8>&-; return 0; fi   # 等锁期间另一方已把容器起好，别再 rm -f
   local CGP=() CONF_MOUNT=()
   [ -f "$CONF_FILE" ] && CONF_MOUNT=(-v "$CONF_FILE":/etc/srdev.conf:ro)
   if [ -n "$SLICE" ] && command -v systemctl >/dev/null; then
@@ -106,8 +114,9 @@ ensure_container(){
     -v $WORK:$WORK -v $BASE/ccache:/ccache -v $BASE/m2:/root/.m2 \
     -v $BASE/farm:/farm -v $BASE/.tsp:/root/.tsp -v $BASE/iceccrun:/var/run/icecc \
     -v $TPDIR:/tp ${CONF_MOUNT[@]+"${CONF_MOUNT[@]}"} \
-    -e SR_USER="$SR_USER" -e SR_UID="$(id -u)" -e SR_OSSCFG="$HOME/.ossutilconfig" -w $WORK $IMG sleep infinity >/dev/null \
-    || { echo "!! 容器启动失败（docker run 返回非零）"; return 1; }
+    -e SR_USER="$SR_USER" -e SR_UID="$(id -u)" -e SR_OSSCFG="$HOME/.ossutilconfig" -w $WORK $IMG sleep infinity >/dev/null
+  local drc=$?; exec 8>&-   # 容器起完就放锁（无论成败）
+  [ $drc = 0 ] || { echo "!! 容器启动失败（docker run 返回非零）"; return 1; }
   echo "== 容器 $NAME 已启动（单容器，编所有版本；限额 ${CPUS}核/${MEM}）"
   # 看门狗随容器死。容器重建后若已有农场，必须立刻把它拉回来——否则 3 小时无续约，
   # 死人开关会把农场释放（踩过：一天里反复重建容器，农场被自己的保护机制清掉了）
