@@ -299,6 +299,10 @@ _wd) wd_ensure; exit 0 ;;
 _watchdog)
   while true; do
     [ -f "$STATE" ] || exit 0
+    # 热加载站点配置：看门狗是常驻进程，只在启动时读一次的话，改了 IDLE_MIN/RENEW_MIN/RENEW_H 同步进来也不生效
+    # （codex r8 存疑1）。放在 load_state 之前，两者键不重叠。
+    [ -f "$SRCONF" ] && { set -a; . "$SRCONF"; set +a; }
+    IDLE_MIN=${IDLE_MIN:-15}; RENEW_MIN=${RENEW_MIN:-15}; RENEW_H=${RENEW_H:-3}
     load_state || { echo "$(date '+%F %T') state.env 解析失败（损坏或被篡改），看门狗退出，停止续约" >>"$LOGF"; exit 1; }
     # 正在释放的集群不能再续约/唤醒：看门狗自己识别状态退出，不依赖 down 那一次 pkill
     [ "${FARM_STATUS:-}" = releasing ] && { echo "$(date '+%F %T') 农场正在释放，看门狗停止续约并退出" >>"$LOGF"; exit 0; }

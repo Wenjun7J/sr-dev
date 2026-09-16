@@ -19,9 +19,8 @@ FARM_STATE=${FARM_STATE:-/farm/state.env}
 LOCK=""   # 源码树定下来之后才能算，见下
 
 BT=Release ; DIST=auto ; JAVAEXT=1 ; CLEAN=0 ; GEN=ninja ; JLOCAL=16 ; JSET=0 ; VERBOSE=0 ; CACHE=1
-# 常驻本机 iceccd 的并发上限（全局、只在它首次启动时生效，不随单次 -j 变——不能为了某一次构建重启一个别的构建也在用的 daemon）。
-# 单次构建要限住本机内存，用显式 -j N：它现在是本次「总并发上限」，ninja 最多同时发 N 个任务，本机自然不会超过 N（review extra2#1）。
-LOCALCAP=${SR_LOCAL_JOBS:-16}
+# LOCALCAP（常驻 iceccd 的本机并发上限）挪到读完站点配置之后再算，见下面的 SRCONF 处：
+# 在这里算的话，srdev.conf 里的 SR_LOCAL_JOBS 永远不生效，配置模板里那个旋钮等于死的（codex r8#5）。
 TARGET=all  # be | fe | all（默认 all：BE+FE；只编一个用 --be / --fe）
 usage(){ cat <<'U'
 用法: sr-build [源码目录] [选项] [-- 透传给 build.sh 的参数]
@@ -117,6 +116,10 @@ export CCACHE_BASEDIR=$SR
 # 钉在容器创建时的 inode 上、编辑器保存后就过期，只作为老容器的兼容回退
 SRCONF=/farm/srdev.conf; [ -f "$SRCONF" ] || SRCONF=/etc/srdev.conf
 [ -f "$SRCONF" ] && { set -a; . "$SRCONF"; set +a; }
+# 常驻本机 iceccd 的并发上限（全局、只在它首次启动时生效，不随单次 -j 变——不能为了某一次构建重启别的构建也在用的 daemon）。
+# 必须在读完配置之后算，否则 srdev.conf 的 SR_LOCAL_JOBS 不生效（codex r8#5）。非正整数一律回退 16。
+# 单次构建要限住本机内存，用显式 -j N：它是本次「总并发上限」，ninja 最多同时发 N 个任务（review extra2#1）。
+LOCALCAP=${SR_LOCAL_JOBS:-16}; case "$LOCALCAP" in ''|*[!0-9]*|0) LOCALCAP=16;; *) LOCALCAP=$((10#$LOCALCAP));; esac   # 10# 防八进制（08）
 REMOTE_NOTE=""
 if [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] && [ -n "${SR_CCACHE_REMOTE_BUCKET:-}" ]; then
   PPORT=$(( 20700 + ${SR_UID:-0} % 500 )); RPFX=${SR_CCACHE_REMOTE_PREFIX:-ccache/}
@@ -166,7 +169,11 @@ MISS_MIN=${MISS_MIN:-8}      # 这段时间内 ccache miss 超过几次就算「
 TREE=$TREE_BASE/build_$BT
 # review r7#1（codex 第三轮）：透传 --with-gcov 时 build.sh 用 build_${BT}_gcov。探针/依赖戳/pending 必须对准真实目录，
 # 否则 gcov 构建成功会把普通树的戳改成新 digest、删掉 pending，普通 Debug 随后在新依赖下不再强制清理、残留旧对象。
-case " ${PASS[*]:-} " in *" --with-gcov "*) TREE=${TREE}_gcov;; esac
+# 上游 build.sh 同时支持 --with-gcov / --without-gcov，按出现顺序最后一个生效；驱动必须同样判定。
+# 只看"出现过 --with-gcov"的话，`--with-gcov --without-gcov` 会让我们选 build_${BT}_gcov 而上游用 build_${BT}，
+# 依赖戳/探针/清理判断全落到错目录（codex r8#6）。
+GCOV=0; for a in ${PASS[@]+"${PASS[@]}"}; do case "$a" in --with-gcov) GCOV=1;; --without-gcov) GCOV=0;; esac; done
+[ "$GCOV" = 1 ] && TREE=${TREE}_gcov
 # 老分支无法按生成器隔离目录：已有 CMakeCache 记的是另一种生成器时，CMake 会拒绝配置，提前识别并要求 --clean（review extra#5）
 if [ "$TARGET" != fe ] && [ "$TREE_BASE" = "$SR/be" ] && [ -f "$TREE/CMakeCache.txt" ] && [ $CLEAN = 0 ]; then
   PREVGEN=$(sed -n 's/^CMAKE_GENERATOR:[A-Z]*=//p' "$TREE/CMakeCache.txt" | head -1)

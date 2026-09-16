@@ -90,16 +90,25 @@ ensure_image(){ docker image inspect $IMG >/dev/null 2>&1 && return 0; echo "== 
 # 站点配置每次调用都同步进容器可见的目录。原来把 srdev.conf 作为单个文件 bind mount 到 /etc/srdev.conf：Docker 单文件挂载钉的是
 # inode，vim/sed -i 保存都是"写新文件再 rename"换了 inode，容器就永远读到容器创建那一刻的旧内容（实测：宿主 WORKERS=6/8c16g，
 # 容器仍 5/8c32g）。/farm 是目录挂载，文件替换可见；写临时文件再 mv 保证容器不会读到半截。/etc/srdev.conf 的挂载保留，仅作旧容器兼容。
-sync_conf(){ [ -f "$CONF_FILE" ] || return 0
-  mkdir -p -m 700 "$BASE/farm" 2>/dev/null
-  cp -f "$CONF_FILE" "$BASE/farm/srdev.conf.tmp" && chmod 600 "$BASE/farm/srdev.conf.tmp" && mv -f "$BASE/farm/srdev.conf.tmp" "$BASE/farm/srdev.conf"; }
+# 临时文件必须 mktemp 每次新建、不能用固定名 srdev.conf.tmp：固定名一来被两个并发 sr 同时写会发布半截配置（codex r8#2），
+# 二来目录还没收紧时可被别人预置成符号链接，cp 跟着写、mv 把链接发布出去，容器 root source 它就等于执行别人的文件（codex r8#3）。
+# 调用方必须检查返回码：同步失败还继续，容器就会按上一次的旧配置干活（codex r8#4）。
+sync_conf(){
+  if [ ! -f "$CONF_FILE" ]; then
+    [ -f "$BASE/farm/srdev.conf" ] && echo "   (提示：$CONF_FILE 不存在，容器仍在用上次同步的 $BASE/farm/srdev.conf)" >&2
+    return 0
+  fi
+  local tmp; tmp=$(mktemp "$BASE/farm/.srdev.conf.XXXXXX" 2>/dev/null) || return 1
+  cp -f "$CONF_FILE" "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$BASE/farm/srdev.conf" || { rm -f "$tmp" 2>/dev/null; return 1; }; }
 ensure_container(){
-  sync_conf
-  # 验证轮 偏差3：0700 迁移必须放在 running 短路之前，否则已在跑的老部署永远不会被修；改不动就拒绝——这是提权向量，不能带着跑
+  # 顺序要紧：先把 farm 目录收紧到 0700 再往里写配置——目录还开放时写固定路径会被预置的符号链接劫持（codex r8#3）。
+  # 0700 迁移也必须在 running 短路之前，否则已在跑的老部署永远不会被修；改不动就拒绝，这是提权向量，不能带着跑。
+  mkdir -p "$BASE/farm" 2>/dev/null
   if [ -d "$BASE/farm" ] && [ "$(stat -c %a "$BASE/farm" 2>/dev/null)" != 700 ]; then
     chmod 700 "$BASE/farm" 2>/dev/null || { echo "!! 无法把 $BASE/farm 设为 0700（其他用户可替换 state.env 提权），请先手动 chmod 700 后重试"; return 1; }
     echo "   (已把 $BASE/farm 收紧为 0700)"
   fi
+  sync_conf || { echo "!! 同步站点配置到 $BASE/farm/srdev.conf 失败（磁盘满/不可写？）。继续下去容器会按上一次的旧配置干活，已中止。"; return 1; }
   running && return 0
   ensure_image || { echo "!! 镜像构建失败"; return 1; }
   mkdir -p $BASE/ccache $BASE/m2 $BASE/farm $BASE/.tsp $BASE/iceccrun $TPDIR
@@ -180,8 +189,14 @@ ensure_tp(){
       [ -e "$d" ] && { echo "!! 无法移开旧依赖目录 $d，中止，不做嵌套发布" >&2; rm -rf "$t"; exit 1; }
     fi
     mv "$t" "$d" || { echo "!! 发布依赖目录失败" >&2; rm -rf "$t"; exit 1; }
-    # 顺手用 root（容器/镜像里 root）清掉被让路的 root 属主残留，避免 .stale 越攒越多；失败不影响本次成败
-    [ -d "$d.stale.$$" ] && docker run --rm -v "$TPDIR":/tp "$img" sh -c "rm -rf /tp/$dg.stale.$$" >/dev/null 2>&1
+    # 顺手用 root（容器/镜像里 root）清掉被让路的 root 属主残留，避免 .stale 越攒越多。
+    # 这是可选收尾，绝不能决定提取成败：它若是子 shell 的最后一条命令，正常（没有 stale）时 [ -d ] 返回 1，
+    # 会把已经发布成功的依赖判成失败，于是每个新 digest 的首次拉取都"失败"（codex r8#1）。故失败只提示，并显式 exit 0。
+    if [ -d "$d.stale.$$" ]; then
+      docker run --rm -v "$TPDIR":/tp "$img" sh -c "rm -rf /tp/$dg.stale.$$" >/dev/null 2>&1 \
+        || echo "   (提示：旧目录残留 $d.stale.$$ 未能清理，可稍后手工删；不影响本次依赖)" >&2
+    fi
+    exit 0
   ) 9<>"$lk"
   local rc=$?
   [ $rc = 0 ] && [ -f "$d/.ready" ] && { echo "$dg"; return 0; }
