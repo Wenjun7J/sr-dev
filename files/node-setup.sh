@@ -2,7 +2,10 @@
 # node-setup.sh <scheduler_ip> <role: sched|worker> <max_jobs> [netname] [scheduler_port] [apt_mirror]
 # 在农场节点上执行。独立成文件 + scp 投递，避免多层嵌套引号导致变量不展开（踩过）。
 set -u
-SCHED=$1; ROLE=$2; MAXJ=${3:-8}
+SCHED=$1; ROLE=$2; MAXJ=${3:-auto}
+# max_jobs=auto（默认）按本节点实际 CPU 核数定并发；也可显式传数字（内存受限时压低，如 16G 节点传 6）。
+# 非纯数字/0/空一律回退到 nproc；nproc 拿不到再退 8。
+case "$MAXJ" in ''|*[!0-9]*|0) MAXJ=$(nproc 2>/dev/null || echo 8);; esac
 # netname 让同一台机器上不同用户的农场互不串台；端口同理（共享开发机上必须区分）
 NET=${4:-srfarm}; SPORT=${5:-8765}
 MIRROR=${6:-}   # 非空则把 archive/security.ubuntu.com 换成它
@@ -71,9 +74,10 @@ SR=$(pgrep -c -f 'StarRocksFE|starrocks_be|BrokerBootstrap'); SR=${SR:-0}
 # 「成功」了但节点上还是旧值，查了很久才发现是观测和动作走了同一条链路）
 RB_HOST=$(sed -n 's/^ICECC_SCHEDULER_HOST="\(.*\)"$/\1/p' /etc/icecc/icecc.conf 2>/dev/null)
 RB_NET=$(sed -n 's/^ICECC_NETNAME="\(.*\)"$/\1/p' /etc/icecc/icecc.conf 2>/dev/null)
+RB_JOBS=$(sed -n 's/^ICECC_MAX_JOBS="\(.*\)"$/\1/p' /etc/icecc/icecc.conf 2>/dev/null)   # 回读实际写入的并发数
 OK=$([ "$RB_HOST" = "$SCHED:$SPORT" ] && [ "$RB_NET" = "$NET" ] && echo "写入OK" || echo "写入不符!")
 ICE_STATE=$(systemctl is-active iceccd 2>/dev/null); icecc_ok || ICE_STATE="未装好(dpkg=$(dpkg-query -W -f='${Status}' icecc 2>/dev/null | awk '{print $3}'),见/tmp/apt.log)"
-printf "%-15s role=%-6s 回读sched=%-21s 回读net=%-11s %s iceccd=%-8s sched服务=%-8s SR残留=%s 内存=%sG\n" \
-  "$(hostname -I|awk '{print $1}')" "$ROLE" "${RB_HOST:-空}" "${RB_NET:-空}" "$OK" \
+printf "%-15s role=%-6s 回读sched=%-21s 回读net=%-11s -m%-3s %s iceccd=%-8s sched服务=%-8s SR残留=%s 内存=%sG\n" \
+  "$(hostname -I|awk '{print $1}')" "$ROLE" "${RB_HOST:-空}" "${RB_NET:-空}" "${RB_JOBS:-?}" "$OK" \
   "$ICE_STATE" "$(systemctl is-active icecc-scheduler)" \
   "$SR" "$(free -g|awk '/Mem:/{print $7}')"

@@ -238,7 +238,9 @@ if [ "$DIST" != off ]; then
 fi
 if [ $USE_FARM = 1 ]; then
   # 并发 = 远端总核 + 本机 16。写死 48 会在 worker 数变化时吃亏（5 台时容量其实是 56）
-  export USE_ICECC=1; J=$(( ${WORKERS:-4} * 8 + JLOCAL ))
+  # 总并发 = 每台 worker 的槽数(NCPU，init 时按节点核数或 SR_NODE_JOBS 写进 state.env) × 台数 + 本地。
+  # 老的 state.env 没有 NCPU 时退回 8（旧农场都是 8 核，行为不变）。
+  export USE_ICECC=1; J=$(( ${WORKERS:-4} * ${NCPU:-8} + JLOCAL ))
   # icecc 拒绝符号链接，必须给真实文件；给错了会静默退回本地编译。
   # 单容器带多套 gcc，工具链包必须和当前 STARROCKS_GCC_HOME 配对——
   # 传错版本的包，worker 上就用错编译器编，产物 ABI 不一致且不报错。

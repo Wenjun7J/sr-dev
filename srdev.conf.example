@@ -18,6 +18,9 @@ SR_NODE_USER=sr                    # 节点上的 ssh 用户
 SR_NODE_PASSWORD=                  # 节点初始密码，仅首次铺 ssh 密钥用；之后全走专用密钥 ~/farm/ssh/id_farm
 WORKERS=5                          # worker 台数
 ITYPE=8c32g                        # 节点规格（平台侧的名字）
+#SR_NODE_JOBS=                     # 每台 worker 的编译并发（icecc -m，也决定总 -j=台数×此值+本地）。
+                                   # 留空=按节点实际 CPU 核数自动定；内存受限时压低（8c16g 编 ASAN 每槽~2G，
+                                   # 8 并发超 16G，设 6 更稳）。改了要 sr farm down 再 init 才生效。
 #TSP_REGION=cn-zhangjiakou         # 平台申请参数
 #TSP_CSP=aliyun
 

@@ -60,9 +60,16 @@ provision_nodes(){ local first=${1:-0} ip
   for ip in $NODES; do
     ( [ "$first" = 1 ] && sshpass -p "$NODEPW" ssh-copy-id -i $KEY.pub $SSHO $NUSER@$ip >/dev/null 2>&1
       scp -q -i $KEY $SSHO /usr/local/bin/node-setup.sh $NUSER@$ip:/tmp/ 2>/dev/null
-      ssh -n -i $KEY $SSHO $NUSER@$ip "bash /tmp/node-setup.sh $SCHED worker 8 $NETNAME $SPORT ${SR_APT_MIRROR:-}" 2>/dev/null ) &
+      ssh -n -i $KEY $SSHO $NUSER@$ip "bash /tmp/node-setup.sh $SCHED worker ${SR_NODE_JOBS:-auto} $NETNAME $SPORT ${SR_APT_MIRROR:-}" 2>/dev/null ) &
   done; wait; }
 wait_workers(){ local i; for i in $(seq 1 "$1"); do sleep 2; [ "$(dcount)" -ge "$WORKERS" ] && return 0; done; return 1; }
+# 每台 worker 的编译并发槽（= icecc -m）。显式 SR_NODE_JOBS 优先（内存受限时压低）；
+# 否则读一台节点的实际核数；再退回 ITYPE 前缀里的核数（如 8c16g→8）；最后 8。
+# sr-build 用它算总并发 J = WORKERS*NCPU + 本地，所以要写进 state.env。
+node_jobs(){ local ip n
+  [ -n "${SR_NODE_JOBS:-}" ] && { echo "$SR_NODE_JOBS"; return; }
+  for ip in ${NODES:-}; do n=$(timeout 8 ssh -n -i $KEY $SSHO $NUSER@$ip nproc 2>/dev/null); [ -n "$n" ] && { echo "$n"; return; }; done
+  n=$(printf '%s' "$ITYPE" | grep -oE '^[0-9]+'); echo "${n:-8}"; }
 
 case "${1:-}" in
 init)
@@ -90,8 +97,9 @@ init)
        echo "!! 只有 $(dcount)/$NW 台 worker 连上 scheduler，已标 degraded。上面每行的 iceccd= 字段能看出哪台没装上。"
        echo "   修复：sr farm resume（会重新下发并校验）"
   fi
-  printf 'CLUSTER=%s\nCID=%s\nSCHED=%s\nNODES="%s"\nWORKERS=%s\nNETNAME=%s\nSPORT=%s\nDPORT=%s\nFARM_STATUS=%s\n' \
-         "$NAME" "$ID" "$SCHED" "$NODES" "$NW" "$NETNAME" "$SPORT" "$DPORT" "$INIT_STATUS" > "$STATE"
+  NCPU=$(node_jobs)   # 每台并发槽，供 sr-build 算总 J；nodes 已部署好，此处 ssh 能通
+  printf 'CLUSTER=%s\nCID=%s\nSCHED=%s\nNODES="%s"\nWORKERS=%s\nNCPU=%s\nNETNAME=%s\nSPORT=%s\nDPORT=%s\nFARM_STATUS=%s\n' \
+         "$NAME" "$ID" "$SCHED" "$NODES" "$NW" "$NCPU" "$NETNAME" "$SPORT" "$DPORT" "$INIT_STATUS" > "$STATE"
   beat; wd_ensure
   echo ""
   echo "== 农场就绪 =========================================="
