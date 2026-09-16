@@ -39,7 +39,10 @@ SR_USER=${SR_USER:-$(id -un)}
 # 宿主机的 sr 用 -e SR_UID 把真实 uid 传进来；没传时才退回 id -u。
 UIDN=${SR_UID:-$(id -u 2>/dev/null || echo 0)}
 NETNAME=${NETNAME:-${SR_USER}_farm}
-SPORT=${SPORT:-$(( 18700 + UIDN % 500 ))}    # scheduler
+# scheduler 占 SPORT 和 SPORT+1（文本管理口）两个端口，所以按 uid 每人跨 2：否则相邻 uid 的 SPORT 正撞上前一个人的
+# SPORT+1（review#1 P1，实测第二个 scheduler Address already in use 退出）。250 人落在 [18700,19198]，不越到 DPORT 段。
+# 已有农场的端口记在各自 state.env 里、source 时覆盖此默认值，老农场不受影响，新 init 才用新分配。
+SPORT=${SPORT:-$(( 18700 + 2 * (UIDN % 250) ))}    # scheduler（+1 为文本管理口）
 DPORT=${DPORT:-$(( 19700 + UIDN % 500 ))}    # 本机 iceccd
 # 多 profile 容器共用一个农场：容器都是 --network host，8765 全机唯一。
 # 必须查端口而不是查进程——各容器 PID namespace 独立，pgrep 看不到别家的 scheduler，
@@ -67,21 +70,39 @@ wait_workers(){ local i; for i in $(seq 1 "$1"); do sleep 2; [ "$(dcount)" -ge "
 # 否则读一台节点的实际核数；再退回 ITYPE 前缀里的核数（如 8c16g→8）；最后 8。
 # sr-build 用它算总并发 J = WORKERS*NCPU + 本地，所以要写进 state.env。
 node_jobs(){ local ip n
-  [ -n "${SR_NODE_JOBS:-}" ] && { echo "$SR_NODE_JOBS"; return; }
-  for ip in ${NODES:-}; do n=$(timeout 8 ssh -n -i $KEY $SSHO $NUSER@$ip nproc 2>/dev/null); [ -n "$n" ] && { echo "$n"; return; }; done
-  n=$(printf '%s' "$ITYPE" | grep -oE '^[0-9]+'); echo "${n:-8}"; }
+  # 一律归一化成正整数：客户端拿它做 Bash 算术，auto/空/0/08 这类字串会让构建 "unbound variable"/八进制报错/算出 J=16
+  # （review 0916b）。SR_NODE_JOBS 只认正整数，其它往下按实测核数；10# 防八进制。init 已在申请前挡掉非法值，这里再兜一层。
+  case "${SR_NODE_JOBS:-}" in ''|*[!0-9]*) ;; *) n=$((10#$SR_NODE_JOBS)); [ "$n" -gt 0 ] && { echo "$n"; return; };; esac
+  for ip in ${NODES:-}; do
+    n=$(timeout 8 ssh -n -i $KEY $SSHO $NUSER@$ip nproc 2>/dev/null); n=${n//[!0-9]/}
+    [ -n "$n" ] && [ "$((10#$n))" -gt 0 ] && { echo "$((10#$n))"; return; }
+  done
+  n=$(printf '%s' "$ITYPE" | grep -oE '^[0-9]+')
+  [ -n "$n" ] && [ "$((10#$n))" -gt 0 ] && { echo "$((10#$n))"; return; }
+  echo 8; }
 
 case "${1:-}" in
 init)
   [ -f "$STATE" ] && { echo "已有农场，先 sr-farm down 或用 sr-farm status 查看"; exit 1; }
   [ -n "$NODEPW" ] || { echo "!! 首次给节点铺 ssh 密钥需要节点初始密码：在 srdev.conf 里设 SR_NODE_PASSWORD 后重试"; exit 1; }
+  # 非法配置要在申请集群之前挡住（review 0916b）：SR_NODE_JOBS 要么留空（按节点核数自动），要么正整数
+  if [ -n "${SR_NODE_JOBS:-}" ] && ! printf '%s' "$SR_NODE_JOBS" | grep -qE '^[1-9][0-9]*$'; then
+    echo "!! SR_NODE_JOBS='$SR_NODE_JOBS' 非法：留空=按节点 CPU 核数自动定，或填正整数（如 6）。已中止，未申请集群。"; exit 1
+  fi
+  [ "${WORKERS:-0}" -ge 1 ] 2>/dev/null || { echo "!! WORKERS 必须是 ≥1 的整数（现为 '${WORKERS:-}'）"; exit 1; }
   [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N "" -f "$KEY" -C sr-farm   # 专用密钥，不碰你个人的 ~/.ssh
   sched_ensure
-  echo "== 申请集群 $NAME（$((WORKERS+1)) × $ITYPE，磁盘 ${DISK}G，全部当 worker；scheduler 跑在本容器）…"
-  $API create "$NAME" "$WORKERS" 2 "$ITYPE" "$DISK"
+  # review extra2#3：WORKERS 就是要申请的机器总数（用户按它估费用）。平台每个集群必带 1 台 FE，全部当 worker，
+  # 所以 BE 台数 = WORKERS-1，总数正好 = WORKERS（原来传 WORKERS 台 BE 再加 1 台 FE，写 5 实际开 6 台）。
+  echo "== 申请集群 $NAME（$WORKERS × $ITYPE，磁盘 ${DISK}G，全部当 worker；scheduler 跑在本容器）…"
+  $API create "$NAME" "$(( WORKERS - 1 ))" 2 "$ITYPE" "$DISK"
   echo "== 等待 RUNNING（约 5-6 分钟）…"
   for i in $(seq 1 45); do sleep 20; S=$($API row "$NAME"|cut -d'|' -f1); [ "$S" = Running ] && break; done
   ID=$($API cid "$NAME"); [ -n "$ID" ] || { echo "创建失败"; exit 1; }
+  # review#3：拿到 CID 立刻落一份最小 state.env（initializing）。之后取节点/部署/连接检查任一步失败或被 Ctrl+C，
+  # sr farm down 都能凭这份 CID 回收集群；成功后下面再覆盖成完整记录。
+  printf 'CLUSTER=%s\nCID=%s\nSCHED=%s\nNETNAME=%s\nSPORT=%s\nDPORT=%s\nFARM_STATUS=initializing\n' \
+    "$NAME" "$ID" "$HOSTIP" "$NETNAME" "$SPORT" "$DPORT" > "$STATE"
   # 必须在 RUNNING 之后调：APPLYING 阶段调用会静默失效（实测）
   $API op "$ID" disable_auto_release >/dev/null
   NODES=$($API nodes "$NAME")
@@ -190,10 +211,17 @@ resume|up)
       exit 1
     fi
   fi
-  sed -i 's/^FARM_STATUS=.*/FARM_STATUS=running/' "$STATE"; wd_ensure ;;
+  # review latest#4：手动 resume 要重置空闲计时，否则看门狗按休眠前的 last-build 算空闲、刚醒又睡，用户拿不到 15 分钟准备窗口
+  beat; sed -i 's/^FARM_STATUS=.*/FARM_STATUS=running/' "$STATE"; wd_ensure ;;
 suspend)
-  . "$STATE"; $API op "$CID" stop >/dev/null
-  sed -i 's/^FARM_STATUS=.*/FARM_STATUS=suspended/' "$STATE"; echo "已休眠（仍继续续约，否则睡着也会到期）" ;;
+  . "$STATE"
+  # review#4：原来不看返回码就写 suspended——机器其实还在跑，看门狗却以为睡了、不再尝试休眠还继续续约。失败就保持原状态并返回非零，
+  # 下个空闲周期会再试（tspapi op 业务失败/HTTP 失败都以非零退出）
+  if $API op "$CID" stop >/dev/null; then
+    sed -i 's/^FARM_STATUS=.*/FARM_STATUS=suspended/' "$STATE"; echo "已休眠（仍继续续约，否则睡着也会到期）"
+  else
+    echo "!! 休眠请求未成功，状态保持 ${FARM_STATUS:-?}（机器仍在跑，继续计费）。下个空闲周期会重试，或手动 sr farm suspend"; exit 1
+  fi ;;
 down|release)
   if [ -f "$STATE" ]; then . "$STATE"
     # 先看平台上还在不在（第二次 down 时集群可能已经没了，先发 release 会报错、本地记录永远清不掉）。

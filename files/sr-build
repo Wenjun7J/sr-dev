@@ -6,7 +6,7 @@ set -uo pipefail
 
 # 源码树跟着当前目录走：从 $PWD 逐级上溯找 StarRocks 根（build.sh + env.sh + be/src）。
 # 这台机上有 20+ 个 worktree，写死一个路径等于每次都编错仓库。
-find_root(){ local d=$PWD
+find_root(){ local d; d=$(pwd -P)   # 物理路径：软链接进来与真路径算同一棵树、同一把锁（review latest#1）
   while [ "$d" != / ]; do
     [ -f "$d/build.sh" ] && [ -f "$d/env.sh" ] && [ -d "$d/be/src" ] && { echo "$d"; return 0; }
     d=$(dirname "$d")
@@ -18,19 +18,22 @@ FARM_STATE=${FARM_STATE:-/farm/state.env}
 # 本机同时编译的 cc1plus 都不会超过 16 个，scheduler 会把其余的派到农场。
 LOCK=""   # 源码树定下来之后才能算，见下
 
-BT=Debug ; DIST=auto ; JAVAEXT=1 ; CLEAN=0 ; GEN=ninja ; JLOCAL=16 ; VERBOSE=0 ; CACHE=1
+BT=Release ; DIST=auto ; JAVAEXT=1 ; CLEAN=0 ; GEN=ninja ; JLOCAL=16 ; JSET=0 ; VERBOSE=0 ; CACHE=1
+# 常驻本机 iceccd 的并发上限（全局、只在它首次启动时生效，不随单次 -j 变——不能为了某一次构建重启一个别的构建也在用的 daemon）。
+# 单次构建要限住本机内存，用显式 -j N：它现在是本次「总并发上限」，ninja 最多同时发 N 个任务，本机自然不会超过 N（review extra2#1）。
+LOCALCAP=${SR_LOCAL_JOBS:-16}
 TARGET=all  # be | fe | all（默认 all：BE+FE；只编一个用 --be / --fe）
 usage(){ cat <<'U'
 用法: sr-build [源码目录] [选项] [-- 透传给 build.sh 的参数]
   不给源码目录就从当前目录上溯找 StarRocks 根
   --be | --fe | --all            编译目标（默认 all=BE+FE；FE 走原生 maven，不经农场/ccache）
-  --debug | --release | --asan   构建类型（默认 debug，仅对 be 生效）
+  --debug | --release | --asan   构建类型（默认 release；debug/asan 需显式指定，仅对 be 生效）
   --dist auto|on|off             是否用编译农场（默认 auto）
   --no-java-ext                  跳过 java-extensions（默认构建，仅约 6 秒）
   --clean                        清空该类型的构建树后重建
   --make                         回退到 Unix Makefiles（默认 ninja）
   --no-ccache                    绕过 ccache（仅用于做纯编译计时对比）
-  -j N                           本地并发（默认 16）
+  -j N                           本次总并发上限。不给=农场容量+本地16；显式给则整次最多 N 个并发（含本机），内存紧时真能限住本机
   --why                          打印各默认值背后的实测依据
 U
 }
@@ -60,11 +63,11 @@ while [ $# -gt 0 ]; do case "$1" in
   --debug) BT=Debug; shift;; --release) BT=Release; shift;; --asan) BT=ASAN; shift;;
   --dist) DIST=$2; shift 2;; --no-java-ext) JAVAEXT=0; shift;;
   --clean) CLEAN=1; shift;; --make) GEN=make; shift;; --no-ccache) CACHE=0; shift;;
-  -j) JLOCAL=$2; shift 2;; --why) why; exit 0;; -h|--help) usage; exit 0;;
+  -j) JLOCAL=$2; JSET=1; shift 2;; --why) why; exit 0;; -h|--help) usage; exit 0;;
   -v) VERBOSE=1; shift;;
   --) shift; PASS+=("$@"); break;;
   # 目录型位置参数 = 指定源码树，放前放后都行
-  *) if [ -d "$1" ] && [ -z "$SRARG" ]; then SRARG=$(cd "$1" && pwd); shift
+  *) if [ -d "$1" ] && [ -z "$SRARG" ]; then SRARG=$(cd "$1" && pwd -P); shift   # pwd -P：软链接与真路径同一把锁（review latest#1）
      else echo "未知参数: $1"; usage; exit 1; fi;;
 esac; done
 
@@ -89,10 +92,12 @@ export STARROCKS_HOME=$SR
 # 隔离构建树，避免和原生 be/build_* 打架。但老分支的 build.sh 不认这个变量——
 # 认不认要看它自己，猜错会导致头部显示的构建树是假的、edges() 数不到边、--clean 删错目录。
 if grep -q CMAKE_BUILD_PREFIX "$SR/build.sh" 2>/dev/null; then
-  export CMAKE_BUILD_PREFIX=$SR/be/nj
-  TREE_BASE=$SR/be/nj
+  # review extra#5：Ninja 与 Make 不能共用一个 CMake 构建目录（换生成器 CMake 拒绝配置）。新分支认 CMAKE_BUILD_PREFIX，
+  # 就按生成器给不同前缀，各自一份互不撞；build.sh 在前缀下仍按 build_$BT 建目录，所以 TREE 仍能算准。
+  export CMAKE_BUILD_PREFIX=$SR/be/nj; [ "$GEN" = make ] && export CMAKE_BUILD_PREFIX=$SR/be/nj-make
+  TREE_BASE=$CMAKE_BUILD_PREFIX
 else
-  TREE_BASE=$SR/be                          # 老分支：只能用它原生的位置
+  TREE_BASE=$SR/be                          # 老分支：只能用它原生的位置，生成器无法隔离（见下面的冲突检测）
   TREE_NOTE="  (该分支 build.sh 不支持 CMAKE_BUILD_PREFIX，用原生位置)"
 fi
 # build.sh 把 $CCACHE 当 CMAKE_CXX_COMPILER_LAUNCHER。
@@ -137,11 +142,20 @@ GH=$(basename "${STARROCKS_GCC_HOME:-/opt/gcc-toolset-14}")
 TOOLCHAIN=$(ls -1 /opt/icecc/$GH/*.tar.gz 2>/dev/null | head -1)
 MISS_MIN=${MISS_MIN:-8}      # 这段时间内 ccache miss 超过几次就算「真在编」
 TREE=$TREE_BASE/build_$BT
+# 老分支无法按生成器隔离目录：已有 CMakeCache 记的是另一种生成器时，CMake 会拒绝配置，提前识别并要求 --clean（review extra#5）
+if [ "$TARGET" != fe ] && [ "$TREE_BASE" = "$SR/be" ] && [ -f "$TREE/CMakeCache.txt" ] && [ $CLEAN = 0 ]; then
+  PREVGEN=$(sed -n 's/^CMAKE_GENERATOR:[A-Z]*=//p' "$TREE/CMakeCache.txt" | head -1)
+  WANTGEN=Ninja; [ "$GEN" = make ] && WANTGEN="Unix Makefiles"
+  if [ -n "$PREVGEN" ] && [ "$PREVGEN" != "$WANTGEN" ]; then
+    echo "!! 该分支的构建目录 $TREE 上次用的是「$PREVGEN」，本次要用「$WANTGEN」，老分支无法隔离目录，CMake 会拒绝。"
+    echo "   请加 --clean 重来（会清掉该类型的构建树）。"; exit 1
+  fi
+fi
 # review #2：.sum 算法升级到 v5 后，旧 .sum（或有 .gch 无 .sum）的 PCH 强制重建，让新算法落地。只删 .sum 不行——
 # PCH 内容只含标准库头，自然重建几乎不会发生，跨机共享会一直断。此处已在源码树锁内、configure/数边之前；
 # 只碰 wrapper 管理的产物（*/CMakeFiles/*/cmake_pch.hxx.gch）。C 语言的 cmake_pch.h.gch 不管：build.sh 只给 C++ 配了
 # launcher，C 编译不经 ccache，永远不会有 .sum，纳入只会每次误删重建（踩过）。
-if [ "$TARGET" != fe ] && [ -d "$TREE" ]; then   # --fe 不碰 BE 构建树（review）
+if [ -z "${SR_DRYRUN:-}" ] && [ "$TARGET" != fe ] && [ -d "$TREE" ]; then   # --fe 不碰 BE 构建树；SR_DRYRUN 不改任何产物（review latest#3）
   OLDPCH=0
   while IFS= read -r g; do
     if [ ! -f "$g.sum" ] || [ "$(head -c 3 "$g.sum" 2>/dev/null)" != "v5 " ]; then rm -f "$g" "$g.sum"; OLDPCH=$((OLDPCH+1)); fi
@@ -171,7 +185,7 @@ if [ ! -f "$FARM_STATE" ] && [ "$DIST" != off ]; then
   echo "!! 还没有编译农场：无法分布式编译（全量约慢 1.9 倍），只能本机 -j$JLOCAL。"
   echo "   建农场: sr farm init（约 6~9 分钟建 5 台 worker；之后休眠/唤醒/续约/自愈全自动，不用再管）"
   if [ -t 0 ] || [ -n "${SR_TTY:-}" ]; then   # SR_TTY 由宿主机 sr 按自己的 stdin 设置：docker exec -i 下容器内 -t 0 恒为假
-    read -r -p "   现在先用本机编译吗？[y/N] " ans
+    printf '   现在先用本机编译吗？[y/N] ' >&2; read -r ans   # 提示走 stderr：stdin 非终端（docker exec -i / | tee）时 read -p 不打印提示（review#6）
     case "$ans" in y|Y|yes|YES) DIST=off; NOFARM=1; FARM_NOTE="本地（尚无农场，用户确认）";; *) echo "   已取消。"; exit 1;; esac
   elif [ -n "${SR_LOCAL_OK:-}" ]; then
     DIST=off; NOFARM=1; FARM_NOTE="本地（尚无农场，SR_LOCAL_OK=1）"
@@ -193,6 +207,18 @@ fi
 if [ "$DIST" != off ] && [ ! -f "$TOOLCHAIN" ]; then
   DIST=off; FARM_NOTE="本地（镜像里没有与 $GH 配对的 icecc 工具链包，不能外发）"
   echo "!! /opt/icecc/$GH/ 下没有工具链包，本次不用农场（重建镜像应修复；绝不拿别的 gcc 的包顶替）"
+fi
+# review extra#2：--output-compile-time 会让 build.sh 把 launcher 换成 compile_time.sh，直接调编译器、不经 ccache/icecc；
+# 此时再按农场容量设 -j 会把几十个编译全压到本机、丢掉 iceccd 的本机上限 → 强制本地并发。
+case " ${PASS[*]:-} " in *" --output-compile-time "*)
+  [ "$DIST" != off ] && echo " (检测到 --output-compile-time：计时 launcher 不经农场/ccache，强制本地 -j$JLOCAL)"; DIST=off;; esac
+# review#2(P1)：容器内 thirdparty 路径恒为 /var/local/thirdparty，提取又用 cp -a 保留时间戳；ninja 只看 mtime，
+# 切回旧 digest、或新依赖文件时间早于现有 .o 时会误判"无需重编"、残留旧产物（ccache 救不了：命令根本没跑）。
+# 按 digest 给 BE 构建树打戳：戳变了就强制 --clean（交给 build.sh 删真实目录，不自己 rm 猜的路径）。
+if [ "$TARGET" != fe ] && [ -n "${SR_TPDIGEST:-}" ] && [ -f "$TREE/.sr_tpdigest" ] \
+   && [ "$(cat "$TREE/.sr_tpdigest" 2>/dev/null)" != "$SR_TPDIGEST" ] && [ $CLEAN = 0 ]; then
+  echo "   依赖 digest 变了（$(cat "$TREE/.sr_tpdigest") -> $SR_TPDIGEST）→ 强制 --clean 全量，防时间戳误判残留旧产物"
+  CLEAN=1
 fi
 if [ "$DIST" != off ]; then
   sr-farm _wd 2>/dev/null || true   # 容器重启后把看门狗拉回来
@@ -240,7 +266,8 @@ if [ $USE_FARM = 1 ]; then
   # 并发 = 远端总核 + 本机 16。写死 48 会在 worker 数变化时吃亏（5 台时容量其实是 56）
   # 总并发 = 每台 worker 的槽数(NCPU，init 时按节点核数或 SR_NODE_JOBS 写进 state.env) × 台数 + 本地。
   # 老的 state.env 没有 NCPU 时退回 8（旧农场都是 8 核，行为不变）。
-  export USE_ICECC=1; J=$(( ${WORKERS:-4} * ${NCPU:-8} + JLOCAL ))
+  # 显式 -j N 是本次总并发上限（review extra2#1：原来 -j 只加在远端容量上，用户为省内存写 -j4 却仍 -j44 且本机可跑 16 个）
+  export USE_ICECC=1; if [ "$JSET" = 1 ]; then J=$JLOCAL; else J=$(( ${WORKERS:-4} * ${NCPU:-8} + JLOCAL )); fi
   # icecc 拒绝符号链接，必须给真实文件；给错了会静默退回本地编译。
   # 单容器带多套 gcc，工具链包必须和当前 STARROCKS_GCC_HOME 配对——
   # 传错版本的包，worker 上就用错编译器编，产物 ABI 不一致且不报错。
@@ -259,7 +286,7 @@ if [ $USE_FARM = 1 ]; then
     mkdir -p /var/run/icecc
     # 9>&- 必须加：daemon 会继承持有构建锁的 fd 9，它常驻就把锁永久占住（踩过，
     # 症状是编译结束后再也拿不到锁、报「已有构建在进行」而 ps 里根本没有 sr-build）
-    /usr/sbin/iceccd -d -s "$SCHED:${SPORT:-8765}" -n "${NETNAME:-srfarm}" -m $JLOCAL \
+    /usr/sbin/iceccd -d -s "$SCHED:${SPORT:-8765}" -n "${NETNAME:-srfarm}" -m $LOCALCAP \
       -p "${DPORT:-10245}" -N "$(hostname)-${SR_USER:-u}" -u nobody -l /tmp/iceccd.log </dev/null >/dev/null 2>&1 9>&-
     sleep 3; }
   # 兜底：daemon 没起来就绝不能用远端级别的并发，否则全落本地把容器撑爆
@@ -275,7 +302,9 @@ case $TARGET in
   all) ARGS=(--be --fe -j "$J") ;;
 esac
 [ "$TARGET" != fe ] && [ $JAVAEXT = 0 ] && ARGS+=(--without-java-ext)
-[ $CLEAN = 1 ] && [ "$TARGET" != fe ] && rm -rf "$TREE"
+# --clean 只传给 build.sh，由它删自己真正在用的目录。此处不再 rm 我们猜的 $TREE：
+# 透传 --with-gcov 时 build.sh 用 build_Debug_gcov，猜 build_Debug 会把普通 Debug 产物误删（review latest#2）；
+# 同时 SR_DRYRUN 也就不会再动任何产物（review latest#3）。
 [ $CLEAN = 1 ] && ARGS+=(--clean)
 [ ${#PASS[@]} -gt 0 ] && ARGS+=("${PASS[@]}")
 
@@ -314,9 +343,13 @@ CALL0=$(ccache -s 2>/dev/null | awk -F'[ /]+' '/^Cacheable calls:/{print $3; exi
 # 不能用 memory.peak 判断内存紧不紧：它把 page cache 算在内，而编译要写 20G 构建树，
 # 峰值必然贴满上限（实测 48.0/48.0G 但 oom_kill=0，全是可回收的 file cache）。
 # 真正会撑爆的是 anon，所以自己采样 anon 峰值。
-ANONF=/tmp/sr-build-anonpeak
+ANONF=/tmp/sr-build-anonpeak.$$   # 每次构建独立：并行构建共用一个文件会互相覆盖峰值（review#5）
+PARENT=$$
 ( echo 0 > $ANONF
   while :; do
+    # 双保险：trap 在 bash 等待前台 build.sh 时会被推迟执行，若有人只 kill 了 sr-build 本身，采样器要能自己发现父亡而退出，
+    # 否则它会一直 touch /farm/last-build 让农场永远"忙"（review#5 复现的正是这个）
+    kill -0 $PARENT 2>/dev/null || break
     a=$(awk '/^anon /{print $2}' $CG/memory.stat 2>/dev/null); [ -n "$a" ] || break
     m=$(cat $ANONF 2>/dev/null || echo 0); [ "$a" -gt "${m:-0}" ] && echo "$a" > $ANONF
     # 顺带打心跳：看门狗跨容器看不到编译进程，只能靠这个文件的 mtime 判断忙闲
@@ -324,6 +357,9 @@ ANONF=/tmp/sr-build-anonpeak
     sleep 5
   done ) >/dev/null 2>&1 9>&- &
 SAMPLER=$!
+# review#5：构建被 Ctrl+C/kill 时采样器原来会活下来继续 touch /farm/last-build，让农场永远"忙"而无法休眠。
+# 用 trap 统一收尾（正常退出与 INT/TERM 都覆盖）；WAKER 在异步唤醒子 shell 起来后再补进来。
+trap 'kill $SAMPLER ${WAKER:-} 2>/dev/null; rm -f "$ANONF" "${RUNFLAG:-/nonexistent}" 2>/dev/null' EXIT INT TERM
 
 # 后台评估是否值得唤醒农场。ccache 命中一次只要 4-5ms，真编一个 TU 要几秒到几分钟，
 # 两者差着三四个数量级，所以观察 15 秒的 miss 增量就足以分辨，不需要任何预测。
@@ -352,6 +388,7 @@ if [ "${ASYNC_WAKE:-0}" = 1 ]; then
       fi
     done
     echo "   [农场] 全程仅 ${D:-0} 次 ccache miss，基本全命中 -> 未唤醒，农场继续睡" ) 9>&- &
+  WAKER=$!   # 纳入 trap 收尾，构建被杀时异步唤醒循环不再独自活着
 fi
 
 S=$(date +%s)
@@ -377,7 +414,11 @@ if [ $RC -ne 0 ] && { [ "${OOM1:-0}" -gt "${OOM0:-0}" ] || [ "${KILLED:-0}" -gt 
   echo "   cgroup oom_kill: $OOM0 -> $OOM1   g++ 自报被杀: $KILLED 次"
   [ "${MAXM:-0}" != 0 ] && [ "$MAXM" != max ] && \
     echo "   anon 峰值 $(g ${PEAK:-0})G / 上限 $(g $MAXM)G"
-  RETRY=$(( J / 2 )); [ $RETRY -lt 4 ] && RETRY=4
+  # review extra#4：重试并发绝不能高于原并发（用户为省内存手动 -j2，OOM 后原来会被抬到 4）；已是 -j1 无从再降就不重试
+  RETRY=$(( J / 2 )); [ "$RETRY" -lt 1 ] && RETRY=1; [ "$RETRY" -ge "$J" ] && RETRY=$(( J > 1 ? J - 1 : 1 ))
+  if [ "$J" -le 1 ]; then
+    echo "   已是 -j1，无法再降并发重试；内存仍不够请减小容器内其它占用或换更大内存"
+  else
   echo "   -> 自动降到 -j$RETRY 重试（ninja 增量，只补没编完的部分）"
   # 从原参数派生：只换并发、去掉 --clean（重试是增量）。目标（--fe/--all）和 -- 透传全部保留（review #5：
   # 原来重建成 --be 会把 FE 和透传丢掉，BE 重试成功还会把整体报成成功）。build.sh 只认 "-j N"，-jN 顺手也处理
@@ -391,7 +432,10 @@ if [ $RC -ne 0 ] && { [ "${OOM1:-0}" -gt "${OOM0:-0}" ] || [ "${KILLED:-0}" -gt 
   echo "   重试: ./build.sh ${RARGS[*]}" | tee -a "$OUTF"
   ( cd "$SR" && ./build.sh "${RARGS[@]}" ) 2>&1 | tee -a "$OUTF"; RC=${PIPESTATUS[0]}   # 输出追加进同一份日志
   E=$(date +%s)
+  fi
 fi
+# 给 BE 构建树打上本次用的依赖 digest 戳（下次 digest 变了据此强制 --clean，见前面 review#2 处）。build.sh 已建好目录才写得进
+[ "$TARGET" != fe ] && [ -d "$TREE" ] && [ -n "${SR_TPDIGEST:-}" ] && { echo "$SR_TPDIGEST" > "$TREE/.sr_tpdigest" 2>/dev/null || true; }
 rm -f $RUNFLAG      # 采样与异步唤醒循环到这里才退出：重试期间也要继续采样、继续心跳
 : > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null
 kill $SAMPLER 2>/dev/null
@@ -444,7 +488,7 @@ if [ $RC -eq 0 ]; then
       NM=$(printf '%s\n' "$MODS" | grep -c .)
       if [ "$NM" -gt 0 ]; then
         echo "   javac 重编 $NM 个模块：$(printf '%s\n' "$MODS" | awk '{printf "%s%s %s 文件", (NR>1?"，":""), $1, $2}')（maven 的增量粒度是整模块：fe-core 有一个文件变就整模块重编）"
-      else echo "   javac 没有重编任何模块（全部已是最新）"; fi
+      else echo "   javac 未识别到重编记录（日志里没匹配到 Compiling … to …/target/classes；可能确实没重编，也可能日志格式变了，不据此断言全新）"; fi
       rm -f "$FELOG"
     fi
   fi

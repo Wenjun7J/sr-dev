@@ -128,19 +128,31 @@ ensure_tp(){
   # 多用户可能同时拉同一 digest：flock 串行，先拷到 .tmp 再原子 mv，别人永远看不到半成品
   # 锁文件要能被所有用户打开：A 建的 644 文件 B 打不开写就 flock 不了。建成 666，打不开写就以只读 fd 上锁
   local lk="$TPDIR/.lock.$dg"; ( umask 000; : >>"$lk" ) 2>/dev/null; chmod 666 "$lk" 2>/dev/null
-  exec 7<>"$lk" 2>/dev/null || exec 7<"$lk"; flock 7
-  if [ -f "$d/.ready" ]; then echo "$dg"; return 0; fi   # 等锁期间别人拷完了
-  local t="$d.tmp.$$"; rm -rf "$t" "$d" 2>/dev/null; mkdir -p "$t/installed"
-  # 布局必须是 <dir>/installed/...：build.sh 检查 $STARROCKS_THIRDPARTY/installed/llvm/lib/libLLVMInstCombine.a，
-  # 找不到就会去跑 build-thirdparty.sh 现场编（踩过：平铺后 rc=127）
-  # 用 docker run 而不是 docker cp：实测 7s vs 18s，docker cp 要把 6.6G 序列化成 tar 流过 daemon
-  docker run --rm -v "$t/installed":/dst "$img" cp -a /var/local/thirdparty/installed/. /dst/ >/dev/null 2>&1 || {
-    echo "!! 依赖拉取失败" >&2; rm -rf "$t"; return 1; }
-  # 记下这个镜像用哪个 gcc 大版本，编译时据此选 /opt/gccNN
-  local gv
-  gv=$(docker run --rm "$img" bash -c 'G=$(ls -d /opt/gcc-toolset-*/bin/gcc 2>/dev/null|sort -V|tail -1); [ -n "$G" ]||G=$(command -v gcc); $G -dumpversion' 2>/dev/null)
-  docker run --rm -v "$t":/dst "$img" bash -c "echo ${gv:-14} > /dst/.gccmajor; echo $tagname > /dst/.image; echo $img > /dst/.ref; echo sha256:$dg > /dst/.digest; chmod -R a+rX /dst; touch /dst/.ready" >/dev/null 2>&1
-  mv "$t" "$d" && echo "$dg"; }
+  # 提取放进子 shell 持锁：子 shell 一退锁就放（review extra#3：原来 exec 7 在主 shell 拿锁不放，B 要等 A 整轮编译结束
+  # 才能用已经就绪的依赖）。里面任何一步失败都不发布半成品（review extra#1：原来元数据写失败仍 mv、探测不到 gcc 就默认 14）。
+  (
+    flock 9 || exit 1
+    [ -f "$d/.ready" ] && exit 0   # 等锁期间别人拷完了
+    t="$d.tmp.$$"; rm -rf "$t" "$d" 2>/dev/null; mkdir -p "$t/installed"
+    # 布局必须是 <dir>/installed/...：build.sh 检查 $STARROCKS_THIRDPARTY/installed/llvm/lib/libLLVMInstCombine.a，
+    # 找不到就会去跑 build-thirdparty.sh 现场编（踩过：平铺后 rc=127）
+    # 用 docker run 而不是 docker cp：实测 7s vs 18s，docker cp 要把 6.6G 序列化成 tar 流过 daemon
+    docker run --rm -v "$t/installed":/dst "$img" cp -a /var/local/thirdparty/installed/. /dst/ >/dev/null 2>&1 \
+      || { echo "!! 依赖拉取失败" >&2; rm -rf "$t"; exit 1; }
+    # 这个镜像用哪个 gcc 大版本，编译时据此选 /opt/gccNN。探测失败就中止——绝不能默认 14 继续编（会选错编译器）
+    gv=$(docker run --rm "$img" bash -c 'G=$(ls -d /opt/gcc-toolset-*/bin/gcc 2>/dev/null|sort -V|tail -1); [ -n "$G" ]||G=$(command -v gcc); $G -dumpversion' 2>/dev/null)
+    gv=${gv%%.*}; gv=${gv//[!0-9]/}
+    [ -n "$gv" ] || { echo "!! 探测不到 $img 的 gcc 版本，不敢默认 14，已中止（检查镜像或重试）" >&2; rm -rf "$t"; exit 1; }
+    docker run --rm -v "$t":/dst "$img" bash -c "echo $gv > /dst/.gccmajor; echo $tagname > /dst/.image; echo $img > /dst/.ref; echo sha256:$dg > /dst/.digest; chmod -R a+rX /dst; touch /dst/.ready" >/dev/null 2>&1 \
+      || { echo "!! 依赖元数据写入失败，不发布半成品目录，已中止" >&2; rm -rf "$t"; exit 1; }
+    # 发布前完整性自检：.ready 与数字 .gccmajor 都必须在
+    { [ -f "$t/.ready" ] && grep -qE '^[0-9]+$' "$t/.gccmajor" 2>/dev/null; } \
+      || { echo "!! 依赖目录完整性检查未过（缺 .ready 或 .gccmajor 非数字），已中止" >&2; rm -rf "$t"; exit 1; }
+    mv "$t" "$d"
+  ) 9<>"$lk"
+  local rc=$?
+  [ $rc = 0 ] && [ -f "$d/.ready" ] && { echo "$dg"; return 0; }
+  return 1; }
 
 case "${1:-}" in
 image)   build_image ;;   # 显式重建（改了 Dockerfile 之后）；平时 sr up / sr build 发现没镜像会自动构建
@@ -197,11 +209,19 @@ U
       TSTART=""; skipv=0
       for a in "$@"; do
         [ $skipv = 1 ] && { skipv=0; continue; }
-        case "$a" in --) break;; -j|--dist) skipv=1;; -*) ;; *) [ -d "$a" ] && { TSTART=$(cd "$a" && pwd); break; };; esac
+        case "$a" in --) break;; -j|--dist) skipv=1;; -*) ;; *) [ -d "$a" ] && { TSTART=$(cd "$a" && pwd -P); break; };; esac   # pwd -P：软链接与真路径同一个 key（review latest#1）
+      done
+      # review#7：只有会真用农场的 BE 编译才值得预唤醒——--fe 纯 Java 不碰农场，--dist off 明确禁分布式，都不该把整套农场叫醒
+      WANTS_FARM=1; prevd=""
+      for a in "$@"; do
+        [ "$a" = -- ] && break
+        [ "$a" = --fe ] && WANTS_FARM=0
+        [ "$prevd" = --dist ] && [ "$a" = off ] && WANTS_FARM=0
+        prevd=$a
       done
       root_of(){ local d
           if [ -n "$TSTART" ]; then [ -f "$TSTART/build.sh" ] && [ -d "$TSTART/be/src" ] && { echo "$TSTART"; return 0; }; return 1; fi
-          d=$PWD; while [ "$d" != / ]; do
+          d=$(pwd -P); while [ "$d" != / ]; do   # 物理路径：软链接进来也算同一棵树（review latest#1）
           [ -f "$d/build.sh" ] && [ -d "$d/be/src" ] && { echo "$d"; return 0; }; d=$(dirname "$d"); done; return 1; }
       WROOT=$(root_of || true); PDIR=$BASE/farm/versions; KEY=""
       if [ -n "$WROOT" ]; then
@@ -237,7 +257,7 @@ U
       echo "   依赖镜像 $PBASE  digest=$DGS$([ -n "${SR_TP_REPO:-}" ] && echo "  (SR_TP_REPO 强制，忽略 ee/os 命名空间)")"
       # 要拉依赖 = 这个 digest 第一次用 = 必然全量重编 = 必然要农场。农场若在睡，
       # 现在就后台唤醒（29s），和拉依赖（7s）+ configure 并行，不用等到编译开始再叫醒它。
-      if [ ! -f "$TPDIR/$DG/.ready" ] && grep -q '^FARM_STATUS=suspended' "$BASE/farm/state.env" 2>/dev/null; then
+      if [ "$WANTS_FARM" = 1 ] && [ ! -f "$TPDIR/$DG/.ready" ] && grep -q '^FARM_STATUS=suspended' "$BASE/farm/state.env" 2>/dev/null; then
         echo "   农场休眠中且需拉依赖 → 后台先唤醒，与拉取并行"
         docker exec -d $NAME sr-farm resume >/dev/null 2>&1
       fi
