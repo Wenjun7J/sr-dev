@@ -7,6 +7,9 @@ set -uo pipefail
 # 优先读宿主机每次调用同步进来的 /farm/srdev.conf（目录挂载，改了立刻可见）；/etc/srdev.conf 是旧的单文件挂载，
 # 钉在容器创建时的 inode 上、编辑器保存后就过期（实测容器读到的一直是旧 WORKERS/ITYPE），只作为老容器的兼容回退
 SRCONF=/farm/srdev.conf; [ -f "$SRCONF" ] || SRCONF=/etc/srdev.conf
+# 先记下纯环境变量给的值（source 之前），看门狗每轮热加载时按它复位——否则从配置里删掉某项后，
+# 变量在长跑进程里仍留着上一轮的值，`${VAR:-默认}` 永远取不到默认（codex r9#1）。同时保持"环境覆盖配置"的优先级。
+ENVBASE_IDLE_MIN=${IDLE_MIN:-}; ENVBASE_RENEW_MIN=${RENEW_MIN:-}; ENVBASE_RENEW_H=${RENEW_H:-}
 [ -f "$SRCONF" ] && { set -a; . "$SRCONF"; set +a; }
 API=${SR_TSPAPI:-/usr/local/bin/tspapi.py}   # SR_TSPAPI/SR_FARM_DIR 供隔离测试替换平台客户端与状态目录
 FARM=${SR_FARM_DIR:-/farm}
@@ -93,6 +96,58 @@ provision_nodes(){ local first=${1:-0} ip
       ssh -n -i $KEY $SSHO $NUSER@$ip "bash /tmp/node-setup.sh $SCHED worker ${SR_NODE_JOBS:-auto} $NETNAME $SPORT ${SR_APT_MIRROR:-}" 2>/dev/null ) &
   done; wait; }
 wait_workers(){ local i; for i in $(seq 1 "$1"); do sleep 2; [ "$(dcount)" -ge "$WORKERS" ] && return 0; done; return 1; }
+# scheduler 的文本管理口（端口 = SPORT+1，icecream 自带）。原来只在 usage 分支里定义，预热也要用，提到全局。
+sched_q(){ exec 3<>/dev/tcp/127.0.0.1/$((SPORT+1)) 2>/dev/null || return 1; printf '%s\nquit\n' "$1" >&3; timeout 2 cat <&3; exec 3>&-; }
+# ---- worker 预热 ----
+# icecc 的 pick_server 对「从没编过、又没有 env」的 worker 只当 bestui，永远输给任何已有评分的 best；于是 scheduler 每次
+# 重启后，重连较晚的那台会永久零任务（192.0.2.10 与 192.0.2.11 各实测复现过一次，农场白白少一台）。
+# 就绪后主动给还没评分的 worker 各派一个「有真实编译成本」的任务：把 env 传过去并拿到 speed，此后它就正常参与调度。
+# 关键约束（codex r9）：scheduler 的 add_job_stats 会丢弃产物 <4096 字节或 user_msec=0 的任务计时——我第一次用一行函数
+# 预热，env 传过去了但 speed 仍是 0。所以既要产物够大又要真花 CPU；成败以「该 worker 的 speed 变成非 0」为准，不看 icecc 返回码。
+# 只需一种 gcc：统计按 worker 累计、不分工具链；别的工具链首次用时再传包即可。
+warm_workers(){
+  command -v icecc >/dev/null 2>&1 || return 0
+  local envf gxx dir src cs ip name sp i n=0 fail="" deadline got want
+  envf=$(ls -t /opt/icecc/*/*.tar.gz 2>/dev/null | head -1)
+  gxx=$(ls -d /opt/gcc-toolset-*/bin/g++ /opt/gcc[0-9]*/bin/g++ 2>/dev/null | head -1)
+  { [ -n "$envf" ] && [ -n "$gxx" ]; } || { echo "   (跳过预热：镜像里没有可用的 icecc 工具链包或编译器)"; return 0; }
+  # rebalance 刚重启 scheduler 时 worker 还没重连完，有界等待它们注册（最多 60 秒）。
+  # 必须按 $NODES 里的 IP 逐个数：listcs 的总行数含本机提交端，拿它和 WORKERS 比会提前满足，
+  # 结果最后重连的那台被当成"未注册"跳过预热——正是我们要防的那台（实测 192.0.2.12 中招）。
+  want=$(printf '%s\n' ${NODES:-} | grep -c .)
+  for i in $(seq 1 30); do
+    cs=$(sched_q listcs 2>/dev/null); got=0
+    for ip in ${NODES:-}; do printf '%s\n' "$cs" | grep -qE "^ [^ ]+ \(${ip//./\\.}:" && got=$((got+1)); done
+    [ "$got" -ge "${want:-1}" ] && break
+    sleep 2
+  done
+  [ -n "$cs" ] || { echo "   (跳过预热：读不到 scheduler 的主机列表)"; return 0; }
+  dir=$(mktemp -d /tmp/sr-warm.XXXXXX) || return 0; src=$dir/w.cpp
+  { echo '#include <string>'; echo '#include <vector>'
+    for i in $(seq 1 200); do
+      echo "std::vector<std::string> sr_warm_$i(int x){std::vector<std::string> v;for(int i=0;i<x;i++)v.push_back(std::to_string(i*$i));return v;}"
+    done; } > "$src"
+  echo "== 预热 worker（让每台都拿到 env 与速度评分，避免 scheduler 重启后有机器零任务）…"
+  deadline=$(( $(date +%s) + 300 ))   # 总预算，超了就不再开新任务（生命周期锁已在调用前释放，但也不该无限拖）
+  for ip in ${NODES:-}; do
+    [ "$(date +%s)" -lt "$deadline" ] || { fail="$fail $ip(超预算未预热)"; continue; }
+    name=$(printf '%s\n' "$cs" | sed -nE "s/^ ([^ ]+) \(${ip//./\\.}:[0-9]+\).*/\1/p" | head -1)
+    [ -n "$name" ] || { fail="$fail $ip(未注册)"; continue; }
+    sp=$(printf '%s\n' "$cs" | sed -nE "s/^ [^ ]+ \(${ip//./\\.}:[0-9]+\).*speed=([0-9.]+).*/\1/p" | head -1)
+    case "${sp:-0}" in 0|0.0|0.00) ;; *) continue;; esac     # 已有评分的跳过
+    ( unset ICECC; ICECC_VERSION="$envf" ICECC_PREFERRED_HOST="$name" \
+        timeout 180 icecc "$gxx" -O2 -c "$src" -o "$dir/$name.o" >/dev/null 2>&1 ) &
+    n=$((n+1)); [ $(( n % 2 )) = 0 ] && wait     # 每台一个、全局最多 2 个并发，别和正在跑的构建抢
+  done
+  wait
+  cs=$(sched_q listcs 2>/dev/null)                # 以 speed 判定，不看 icecc 返回码
+  for ip in ${NODES:-}; do
+    sp=$(printf '%s\n' "$cs" | sed -nE "s/^ [^ ]+ \(${ip//./\\.}:[0-9]+\).*speed=([0-9.]+).*/\1/p" | head -1)
+    case "${sp:-}" in ''|0|0.0|0.00) case "$fail" in *"$ip"*) ;; *) fail="$fail $ip";; esac;; esac
+  done
+  rm -rf "$dir"
+  [ -n "$fail" ] && echo "   !! 这些 worker 预热后仍无速度评分，可能接不到任务：$fail（稍后可 sr farm rebalance 重试）"
+  return 0; }
 # 每台 worker 的编译并发槽（= icecc -m）。显式 SR_NODE_JOBS 优先（内存受限时压低）；
 # 否则读一台节点的实际核数；再退回 ITYPE 前缀里的核数（如 8c16g→8）；最后 8。
 # sr-build 用它算总并发 J = WORKERS*NCPU + 本地，所以要写进 state.env。
@@ -150,6 +205,8 @@ init)
   printf 'CLUSTER=%s\nCID=%s\nSCHED=%s\nNODES="%s"\nWORKERS=%s\nNCPU=%s\nNETNAME=%s\nSPORT=%s\nDPORT=%s\nFARM_STATUS=%s\n' \
          "$NAME" "$ID" "$SCHED" "$NODES" "$NW" "$NCPU" "$NETNAME" "$SPORT" "$DPORT" "$INIT_STATUS" > "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
   beat; wd_ensure
+  # 预热前先放生命周期锁：预热会编译几分钟，不该把 suspend/down 一直挡在外面（codex r9）
+  exec 8>&- 2>/dev/null; warm_workers
   echo ""
   if [ "$INIT_STATUS" = degraded ]; then echo "== 初始化未完成（degraded）==============================="; else echo "== 农场就绪 =========================================="; fi
   printf "   集群 %s (id=%s)   区域 %s\n" "$NAME" "$ID" "$($API spec "$NAME" | cut -d'|' -f4)"
@@ -173,8 +230,7 @@ init)
 usage)
   [ -f "$STATE" ] || { echo "当前无农场"; exit 1; }
   { load_state || exit 1; }
-  sched_q(){ exec 3<>/dev/tcp/127.0.0.1/$((SPORT+1)) 2>/dev/null || return 1; printf '%s\nquit\n' "$1" >&3; timeout 2 cat <&3; exec 3>&-; }
-  CG=/sys/fs/cgroup
+  CG=/sys/fs/cgroup   # sched_q 已提到全局定义
   once(){
     local hdr cs jobs u0 u1 cores mem memmax
     cs=$(sched_q listcs 2>/dev/null); hdr=$(printf '%s\n' "$cs" | sed -n 's/^200-ICECC \([^:]*\): \([0-9]*\)s uptime, \([0-9]*\) hosts, \([0-9]*\) jobs in queue (\([0-9]*\) total).*/scheduler \1 · 已运行 \2s · \3 台 daemon · 排队 \4 · 累计派发 \5/p')
@@ -247,7 +303,8 @@ resume|up)
     fi
   fi
   # review latest#4：手动 resume 要重置空闲计时，否则看门狗按休眠前的 last-build 算空闲、刚醒又睡，用户拿不到 15 分钟准备窗口
-  beat; sed -i 's/^FARM_STATUS=.*/FARM_STATUS=running/' "$STATE"; wd_ensure ;;
+  beat; sed -i 's/^FARM_STATUS=.*/FARM_STATUS=running/' "$STATE"; wd_ensure
+  exec 8>&- 2>/dev/null; warm_workers ;;   # 放锁后再预热（休眠唤醒同样会让 worker 重新注册，可能出现零任务的机器）
 suspend)
   lifecycle_lock
   { load_state || exit 1; }
@@ -294,13 +351,17 @@ down|release)
 rebalance)
   lifecycle_lock; [ -f "$STATE" ] || { echo "当前无农场"; exit 1; }; { load_state || exit 1; }
   pkill -x icecc-scheduler 2>/dev/null; sleep 1; sched_ensure
-  echo "scheduler 已重启（:$SPORT）。worker 在 1~3 分钟内重连，之后 sr farm usage 里各台 speed 应都 > 0" ;;
+  echo "scheduler 已重启（:$SPORT）。worker 在 1~3 分钟内重连…"
+  exec 8>&- 2>/dev/null; warm_workers   # 重启 scheduler 正是"重连晚的那台被饿死"的高发时刻，直接预热掉
+  echo "完成。sr farm usage 里各台 speed 应都 > 0" ;;
 _wd) wd_ensure; exit 0 ;;
 _watchdog)
   while true; do
     [ -f "$STATE" ] || exit 0
     # 热加载站点配置：看门狗是常驻进程，只在启动时读一次的话，改了 IDLE_MIN/RENEW_MIN/RENEW_H 同步进来也不生效
     # （codex r8 存疑1）。放在 load_state 之前，两者键不重叠。
+    # 复位到"纯环境"基线再 source，配置里删掉的项才能回到默认值（re-source 不会清除已消失的变量）
+    IDLE_MIN=$ENVBASE_IDLE_MIN; RENEW_MIN=$ENVBASE_RENEW_MIN; RENEW_H=$ENVBASE_RENEW_H
     [ -f "$SRCONF" ] && { set -a; . "$SRCONF"; set +a; }
     IDLE_MIN=${IDLE_MIN:-15}; RENEW_MIN=${RENEW_MIN:-15}; RENEW_H=${RENEW_H:-3}
     load_state || { echo "$(date '+%F %T') state.env 解析失败（损坏或被篡改），看门狗退出，停止续约" >>"$LOGF"; exit 1; }

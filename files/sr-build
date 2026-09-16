@@ -119,7 +119,9 @@ SRCONF=/farm/srdev.conf; [ -f "$SRCONF" ] || SRCONF=/etc/srdev.conf
 # 常驻本机 iceccd 的并发上限（全局、只在它首次启动时生效，不随单次 -j 变——不能为了某一次构建重启别的构建也在用的 daemon）。
 # 必须在读完配置之后算，否则 srdev.conf 的 SR_LOCAL_JOBS 不生效（codex r8#5）。非正整数一律回退 16。
 # 单次构建要限住本机内存，用显式 -j N：它是本次「总并发上限」，ninja 最多同时发 N 个任务（review extra2#1）。
-LOCALCAP=${SR_LOCAL_JOBS:-16}; case "$LOCALCAP" in ''|*[!0-9]*|0) LOCALCAP=16;; *) LOCALCAP=$((10#$LOCALCAP));; esac   # 10# 防八进制（08）
+# 先十进制归一化再判正数：只比字面量 "0" 的话，"00"/"000" 会绕过检查、算出 0，daemon 拿到 -m 0（codex r9#2）
+LOCALCAP=${SR_LOCAL_JOBS:-16}
+case "$LOCALCAP" in ''|*[!0-9]*) LOCALCAP=16;; *) LOCALCAP=$((10#$LOCALCAP)); [ "$LOCALCAP" -gt 0 ] || LOCALCAP=16;; esac
 REMOTE_NOTE=""
 if [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] && [ -n "${SR_CCACHE_REMOTE_BUCKET:-}" ]; then
   PPORT=$(( 20700 + ${SR_UID:-0} % 500 )); RPFX=${SR_CCACHE_REMOTE_PREFIX:-ccache/}
