@@ -150,8 +150,9 @@ shell)   ensure_container && docker exec -it $NAME bash -l ;;
 history|log)
   F=$BASE/farm/builds.tsv
   [ -f "$F" ] || { echo "还没有编译记录"; exit 0; }
-  printf "%-16s %-8s %-22s %-14s %-6s %-5s %-4s %-7s %-6s %s\n" 时间 用户 源码树@分支 版本 模式 边数 rc 用时 anon峰 命中/编译
-  tail -n "${2:-20}" "$F" | awk -F"\t" '{printf "%-16s %-8s %-22s %-14s %-6s %-5s %-4s %-7s %-6s %s\n",$1,$2,substr($3,1,22),$4,$5,$6,$7,$8,$9,$10}' ;;
+  printf "%-16s %-8s %-22s %-14s %-6s %-5s %-6s %-7s %-6s %s\n" 时间 用户 源码树@分支 版本 模式 边数 结果 用时 anon峰 命中/编译
+  # 第 7 列是 build.sh 的退出码：0=成功，其余=失败。history 只报成功/失败，不写原因（用户要求）；要查原因看末列日志路径
+  tail -n "${2:-20}" "$F" | awk -F"\t" '{r=($7==0?"成功":"失败"); printf "%-16s %-8s %-22s %-14s %-6s %-5s %-6s %-7s %-6s %s\n",$1,$2,substr($3,1,22),$4,$5,$6,r,$8,$9,$10}' ;;
 tp)
   echo "依赖目录: $TPDIR $([ "$TPDIR" = "$SHARED_TP" ] && echo "（全机共享）" || echo "（个人）")"
   printf "%-14s %-8s %-7s %s\n" DIGEST GCC 大小 状态
@@ -172,7 +173,7 @@ versions)
 
   up                 起容器（没镜像会先自动构建，约 5 分钟；单个容器编所有版本）
   image              强制重建镜像（改了 Dockerfile 之后用）
-  build [目录] [选项] 编译（默认 BE+FE；--be / --fe 单选）。首次会弹出版本选择（或用 -v 指定），之后记住；换版本再 -v
+  build [目录] [选项] 编译（默认 BE+FE；--be / --fe 单选）。首次会询问依赖版本（或用 -v 指定），之后记住；换版本再 -v
   farm {init|status|usage [--watch [秒]]|rebalance|resume|suspend|down}
   tp                 列出已拉下来的各版本依赖（全机共享目录）
   history [N]        最近 N 次编译概况（默认 20）
@@ -212,17 +213,18 @@ U
         SPEC=$(cut -d' ' -f1 "$PDIR/$KEY")
         echo "(依赖=$SPEC · $(basename "${WROOT:-?}")@${BR:-?}，你之前指定过；换用 -v)" >&2
       fi
-      # 首次编译且没给 -v：交互时列出可选版本让用户挑（main 与各 minor），选定后记住；之后换版本才需要 -v。
+      # 首次编译且没给 -v：交互时让用户直接输入依赖版本（main / 4.0 这样），能解析就记住；之后换版本才需要 -v。
+      # 不列菜单（用户要求：输入比选编号直观）；输错时才把 registry 里当前能解析的版本打出来当提示。
       # 不自动推断（分支名和依赖版本未必对应，猜错代价是一次失败的全量）。非交互环境仍要求 -v。
       if [ -z "$SPEC" ]; then
-        if [ -t 0 ]; then   # 只看 stdin：sr build | tee log 这种 stdout 接管道的用法也该能弹出选择；菜单走 stderr
-          echo "首次编译 $(basename "${WROOT:-?}")@${BR:-?}：请选择依赖版本（对应官方 dev-env 镜像；之后会记住，换版本用 sr -v <版本> build）" >&2
-          mapfile -t CANDS < <(candidate_versions)
-          [ ${#CANDS[@]} -gt 0 ] || { echo "!! 取不到 registry 的版本列表，请用 sr -v <版本> build 指定" >&2; exit 1; }
-          i=1; for c in "${CANDS[@]}"; do printf '  %2d) %s\n' $i "$c" >&2; i=$((i+1)); done
-          read -r -p "输入编号，或直接输入版本号（如 3.5.20）: " ans
-          if [[ "$ans" =~ ^[0-9]+$ ]] && [ "$ans" -ge 1 ] && [ "$ans" -le ${#CANDS[@]} ]; then SPEC=${CANDS[ans-1]}; else SPEC=$ans; fi
-          [ -n "$SPEC" ] || { echo "!! 未选择版本，已取消"; exit 1; }
+        if [ -t 0 ]; then   # 只看 stdin：sr build | tee log 这种 stdout 接管道的用法也该能询问；提示走 stderr
+          echo "首次编译 $(basename "${WROOT:-?}")@${BR:-?}：需要指定依赖版本（对应官方 dev-env 镜像；之后会记住，换版本用 sr -v <版本> build）" >&2
+          while :; do
+            read -r -p "请输入依赖版本（如 main 或 4.0）: " ans
+            [ -n "$ans" ] || { echo "!! 未输入版本，已取消" >&2; exit 1; }
+            resolve "$ans" 2>/dev/null && { SPEC=$ans; break; }
+            echo "!! 找不到 $ans 对应的依赖镜像。当前能解析的有：$(candidate_versions | paste -sd' ' -)；也可输入 3.5.20 这样的具体版本" >&2
+          done
           echo "   已选 $SPEC（记住到这棵树的这个分支；换版本: sr -v <版本> build）"
         else
           echo "!! 首次编译需指定依赖版本，例: sr -v main build（sr versions 看可选项；交互终端下会弹出选择）"; exit 1

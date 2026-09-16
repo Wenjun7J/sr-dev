@@ -46,7 +46,7 @@ git clone <this repo> ~/srdev && cd ~/srdev
 cp srdev.conf.example srdev.conf          # 填 registry、base 镜像、apt 源、公共依赖目录、节点账号
 cp registries.conf.example registries.conf # 填版本号 -> dev-env 镜像的映射
 ln -s ~/srdev/sr ~/bin/sr
-cd /path/to/starrocks && sr build          # 默认 BE+FE（--be / --fe 单选）；首次会列出可选版本让你选（或 -v 直接指定）；没镜像会先自动构建（~5 分钟）
+cd /path/to/starrocks && sr build          # 默认 BE+FE（--be / --fe 单选）；首次会问你依赖版本，输 main 或 4.0 这样即可（或 -v 直接指定）；没镜像会先自动构建（~5 分钟）
 sr farm init                               # 可选：建农场。没有农场时 sr build 会询问是否先本机编
 ```
 
