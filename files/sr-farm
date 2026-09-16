@@ -114,6 +114,13 @@ sched_q(){ exec 3<>/dev/tcp/127.0.0.1/$((SPORT+1)) 2>/dev/null || return 1; prin
 # 关键约束（codex r9）：scheduler 的 add_job_stats 会丢弃产物 <4096 字节或 user_msec=0 的任务计时——我第一次用一行函数
 # 预热，env 传过去了但 speed 仍是 0。所以既要产物够大又要真花 CPU；成败以「该 worker 的 speed 变成非 0」为准，不看 icecc 返回码。
 # 只需一种 gcc：统计按 worker 累计、不分工具链；别的工具链首次用时再传包即可。
+# 预热被信号打断时的收尾。靠 bash 的动态作用域看到 warm_workers 里的 pids/dir（trap 是在 warm_workers 作用域内触发的）。
+warm_abort(){ local rc=$1 p
+  kill ${pids[@]+"${pids[@]}"} 2>/dev/null
+  for p in ${pids[@]+"${pids[@]}"}; do wait "$p" 2>/dev/null; done
+  rm -rf "${dir:-/nonexistent}" 2>/dev/null
+  echo "   预热被中断（农场本身已就绪；稍后可 sr farm rebalance 补预热）" >&2
+  exit "$rc"; }
 warm_workers(){
   command -v icecc >/dev/null 2>&1 || return 0
   local envf="" gxx="" gccdir gh dir src cs ip name sp i n=0 fail="" deadline got want rem alive=0 q st pids=() p
@@ -147,8 +154,10 @@ warm_workers(){
       echo "std::vector<std::string> sr_warm_$i(int x){std::vector<std::string> v;for(int i=0;i<x;i++)v.push_back(std::to_string(i*$i));return v;}"
     done; } > "$src"
   echo "== 预热 worker（让每台都拿到 env 与速度评分，避免 scheduler 重启后有机器零任务）…"
-  # 被 Ctrl+C / kill 时收掉预热子进程和临时目录（codex r10#3）
-  trap 'kill ${pids[@]+"${pids[@]}"} 2>/dev/null; rm -rf "$dir" 2>/dev/null' INT TERM
+  # 被 Ctrl+C / kill 时收掉预热子进程和临时目录，并**退出**——只清理不退出的话，信号打断 wait 后循环会继续给剩下的 worker
+  # 派任务，而源码临时目录已经删了，最后还可能返回 0（codex r11#1；和第 7 轮 sr-build 的 on_signal 是同一类错，那边改对了这边漏了）。
+  # 此处农场状态已写好、生命周期锁也已释放，中途退出是安全的：农场就绪，只是没预热完。
+  trap 'warm_abort 130' INT; trap 'warm_abort 143' TERM
   deadline=$(( $(date +%s) + 300 ))
   for ip in ${NODES:-}; do
     # 单任务时限取 min(180, 剩余预算)，并给 TERM→KILL 宽限，总预算才是真的封顶（codex r10#3）
