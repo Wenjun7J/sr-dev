@@ -88,6 +88,11 @@ build_image(){
 # 没镜像就地构建（首次约 5 分钟）：sr up / sr build 都不该因为"还没跑 sr image"停下来；sr image 保留为显式重建
 ensure_image(){ docker image inspect $IMG >/dev/null 2>&1 && return 0; echo "== 镜像 $IMG 不存在，先构建（一次性）"; build_image; }
 ensure_container(){
+  # 验证轮 偏差3：0700 迁移必须放在 running 短路之前，否则已在跑的老部署永远不会被修；改不动就拒绝——这是提权向量，不能带着跑
+  if [ -d "$BASE/farm" ] && [ "$(stat -c %a "$BASE/farm" 2>/dev/null)" != 700 ]; then
+    chmod 700 "$BASE/farm" 2>/dev/null || { echo "!! 无法把 $BASE/farm 设为 0700（其他用户可替换 state.env 提权），请先手动 chmod 700 后重试"; return 1; }
+    echo "   (已把 $BASE/farm 收紧为 0700)"
+  fi
   running && return 0
   ensure_image || { echo "!! 镜像构建失败"; return 1; }
   mkdir -p $BASE/ccache $BASE/m2 $BASE/farm $BASE/.tsp $BASE/iceccrun $TPDIR
@@ -97,7 +102,8 @@ ensure_container(){
   # 不可写就不是"替换文件"的向量。残余：socket 本身 0777（icecc 默认），靠 $HOME 0750 挡住非同组用户；换 daemon uid 另议。
   chmod 700 $BASE/farm 2>/dev/null || echo "!! 无法把 $BASE/farm 设为 0700，请手动 chmod 700（否则其他用户可替换 state.env）"
   # review r7#2(P1)：两次首次 sr build 并发，慢的一方会在快的一方已开工后 docker rm -f 掉它的容器。按容器名加锁、锁内复查。
-  exec 8>"$BASE/farm/.container.lock" 2>/dev/null || { echo "!! 无法打开 $BASE/farm/.container.lock（目录权限？），拒绝在无互斥下起容器"; return 1; }
+  # 验证轮 #5：无命令的 `exec ... 2>/dev/null` 会永久吞掉本 shell 后续的 stderr；用 { } 把重定向限定在这一句
+  { exec 8>"$BASE/farm/.container.lock"; } 2>/dev/null || { echo "!! 无法打开 $BASE/farm/.container.lock（目录权限？），拒绝在无互斥下起容器"; return 1; }
   flock -w 120 8 || { echo "!! 等待容器启动锁超时（另一个 sr 正在起容器？）"; return 1; }
   if running; then exec 8>&-; return 0; fi   # 等锁期间另一方已把容器起好，别再 rm -f
   local CGP=() CONF_MOUNT=()

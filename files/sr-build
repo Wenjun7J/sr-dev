@@ -121,7 +121,13 @@ if [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] && [ -n "${SR_CCACHE_RE
   # review r7#4(P1)：容器 --network host，127.0.0.1 挡不住本机其他用户；代理无鉴权时任何人都能用所有者凭据 PUT 污染 / DELETE 共享缓存。
   # 每用户随机令牌存 /farm/ccache-token（0600，目录已是 0700），ccache 用 http 后端自带的 bearer-token 属性携带，代理对所有方法校验。
   TOKF=/farm/ccache-token
-  [ -s "$TOKF" ] || { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$TOKF" && chmod 600 "$TOKF"; }
+  # 验证轮 #4：令牌只能生成一次、绝不覆盖——两棵树并发首次生成会一个起代理用 A、另一个把文件盖成 B，客户端此后永久 401。
+  # 短锁内复查 + 临时文件 + mv -n（不覆盖）原子发布。
+  if [ ! -s "$TOKF" ]; then
+    ( { exec 7>"$TOKF.lock"; } 2>/dev/null && flock -w 10 7 && [ ! -s "$TOKF" ] \
+        && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$TOKF.tmp.$$" && chmod 600 "$TOKF.tmp.$$" && mv -n "$TOKF.tmp.$$" "$TOKF" ) 2>/dev/null
+    rm -f "$TOKF.tmp.$$" 2>/dev/null
+  fi
   TOK=$(cat "$TOKF" 2>/dev/null)
   # 旧版（无鉴权）代理还在跑时，不带令牌 GET /_stats 会得 200 → 杀掉重起，否则鉴权形同虚设（kill 只影响本用户端口的代理）
   if proxy_up && command -v curl >/dev/null 2>&1 \
@@ -257,16 +263,34 @@ load_farm_state(){ local k v; [ -f "$FARM_STATE" ] || return 1
       ''|'#'*) continue;;
       *) return 1;;
     esac; printf -v "$k" '%s' "$v"; done < "$FARM_STATE"; }
-if [ "$DIST" != off ] && [ -f "$FARM_STATE" ] && ! load_farm_state; then
+# 只要状态文件在就加载（含 --dist off）：本地模式起 daemon 也要用它记的 scheduler/端口/netname，否则先本地后农场时 daemon 配置对不上
+if [ -f "$FARM_STATE" ] && ! load_farm_state; then
   echo "!! $FARM_STATE 格式不符（可能损坏或被篡改），本次不用农场，本地 -j$JLOCAL"; DIST=off; FARM_NOTE="本地（state.env 解析失败）"
 fi
 # review r7#6：本地 iceccd 两种模式共用（原来只在农场分支里起，本地模式直连编译器、无跨树并发闸门）。起不来返回 1。
 # 必须排除僵尸：pgrep 会匹配 <defunct> 的 iceccd；端口全机唯一，多 profile 容器只有第一个能 bind，其余共用同一 daemon。
 iceccd_alive(){ local p st; for p in $(pgrep -x iceccd 2>/dev/null); do st=$(awk '{print $3}' /proc/$p/stat 2>/dev/null); [ "$st" != Z ] && return 0; done; return 1; }
 port_taken(){ [ -n "$(ss -ltnH "sport = :${DPORT:-10245}" 2>/dev/null)" ]; }
-ensure_local_daemon(){ local sopt=()
-  { iceccd_alive || port_taken; } && return 0
-  [ -n "${SCHED:-}" ] && sopt=(-s "$SCHED:${SPORT:-8765}")   # 没农场时不给 -s，daemon 独立跑只做本机限流
+ensure_local_daemon(){ local sopt=() p cl
+  # 验证轮 #3：--dist off 先跑时没有农场状态，原来会起一个默认端口/默认 netname/无 -s 的 daemon，之后农场构建发现它活着就沿用，
+  # 却连不上用户的 scheduler。这里优先用 state.env 加载到的值（上面无论 --dist 都会加载），没有农场时按与 sr-farm 完全相同的
+  # 公式从 uid/用户名派生，两种模式起出来的 daemon 配置一致；scheduler 常驻本容器，地址就是本机 IP，没起也只是 daemon 后台重试。
+  SCHED=${SCHED:-$(hostname -I 2>/dev/null | awk '{print $1}')}
+  SPORT=${SPORT:-$(( 18700 + 2 * (${SR_UID:-0} % 250) ))}
+  DPORT=${DPORT:-$(( 19700 + ${SR_UID:-0} % 500 ))}
+  NETNAME=${NETNAME:-${SR_USER:-u}_farm}
+  if { iceccd_alive || port_taken; }; then
+    # daemon 已在：核对它启动时的 -n/-s 是否就是本次期望的配置。不一致只警告不重启——别的构建可能正在用它（重启由 sr down/up 完成）
+    for p in $(pgrep -x iceccd 2>/dev/null); do
+      cl=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)
+      case "$cl" in *" -n $NETNAME "*" -s $SCHED:$SPORT "*|*" -s $SCHED:$SPORT "*" -n $NETNAME "*) ;;
+        *iceccd*) echo "!! 常驻 iceccd 的配置与本次期望不同（期望 -n $NETNAME -s $SCHED:$SPORT）：$(echo "$cl" | grep -oE -- '-n [^ ]+|-s [^ ]+' | tr '\n' ' ')"
+                  echo "   它可能是在别的农场配置下启动的；农场构建会连不上 scheduler。空闲时 sr down && sr up 重建容器即可刷新。"; break;;
+      esac
+    done
+    return 0
+  fi
+  [ -n "${SCHED:-}" ] && sopt=(-s "$SCHED:$SPORT")
   mkdir -p /var/run/icecc
   # 8>&- 9>&-：daemon 常驻，不得继承农场锁/构建锁的 fd（踩过：锁被永久占住，编完再也拿不到锁）
   /usr/sbin/iceccd -d ${sopt[@]+"${sopt[@]}"} -n "${NETNAME:-srfarm}" -m $LOCALCAP -p "${DPORT:-10245}" \
@@ -440,13 +464,20 @@ trap cleanup EXIT; trap 'on_signal INT' INT; trap 'on_signal TERM' TERM
 BPID=""; BPGID=""
 run_build(){ local i
   HS=$(mktemp /tmp/sr-build.hs.XXXXXX); rm -f "$HS.pgid" "$HS.ack"
+  # 只关 fd 8（农场锁），**保留 fd 9**：构建包装是有限生命周期，让它继承源码树锁，驱动被 SIGKILL 时仍在跑的构建才继续持锁，
+  # 同树第二个构建拿不到锁（codex 验证轮 #1：原来连 9 也关了，驱动一死锁就放，会并发写 gensrc）。常驻 daemon 才关 9。
+  # 握手 fail closed（验证轮 #2）：wrapper 30s 内没收到 ACK 就退出不开工；父 30s 内没拿到合法 pgid 就杀掉 wrapper，本次判失败。
   setsid --wait bash -c 'hs=$1; sr=$2; outf=$3; shift 3; echo $$ > "$hs.pgid"
-      for i in $(seq 1 50); do [ -f "$hs.ack" ] && break; sleep 0.1; done
-      cd "$sr" && ( ./build.sh "$@" ) 2>&1 | tee -a "$outf"; exit "${PIPESTATUS[0]}"' _ "$HS" "$SR" "$OUTF" "$@" 8>&- 9>&- &
+      for i in $(seq 1 300); do [ -f "$hs.ack" ] && break; sleep 0.1; done
+      [ -f "$hs.ack" ] || { echo "!! 构建包装 30s 未收到驱动确认，不开工" >&2; exit 250; }
+      cd "$sr" && ( ./build.sh "$@" ) 2>&1 | tee -a "$outf"; exit "${PIPESTATUS[0]}"' _ "$HS" "$SR" "$OUTF" "$@" 8>&- &
   BPID=$!
-  for i in $(seq 1 50); do [ -s "$HS.pgid" ] && break; sleep 0.1; done
-  BPGID=$(cat "$HS.pgid" 2>/dev/null); : > "$HS.ack"
+  for i in $(seq 1 300); do [ -s "$HS.pgid" ] && break; sleep 0.1; done
+  BPGID=$(cat "$HS.pgid" 2>/dev/null)
+  if [[ "$BPGID" =~ ^[0-9]+$ ]]; then : > "$HS.ack"
+  else echo "!! 构建包装 30s 内未公布进程组，握手失败，终止本次构建"; BPGID=""; kill -TERM "$BPID" 2>/dev/null; fi
   wait "$BPID"; RC=$?
+  [ "$RC" = 250 ] && echo "!! 构建包装因握手超时未开工（rc=250）"
   rm -f "$HS" "$HS.pgid" "$HS.ack"; HS=""; BPID=""; BPGID=""; }
 
 # 后台评估是否值得唤醒农场。ccache 命中一次只要 4-5ms，真编一个 TU 要几秒到几分钟，

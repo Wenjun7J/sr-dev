@@ -29,7 +29,8 @@ load_state(){ local k v
 # suspended 覆盖回 running。常驻进程（看门狗、scheduler）启动时必须关掉继承的 fd 8，否则锁被永久占住。
 lifecycle_lock(){
   # 拿不到锁文件就拒绝操作（fail closed）：无互斥地改农场状态比拒绝更危险；/farm 打不开本身就说明环境坏了
-  exec 8>"$FARM/lifecycle.lock" 2>/dev/null || { echo "!! 无法打开 $FARM/lifecycle.lock，拒绝在无互斥保护下操作农场"; exit 1; }
+  # 验证轮 #5：无命令的 `exec ... 2>/dev/null` 会把 stderr 永久重定向到 /dev/null，后续所有报错都被吞；用 { } 把它限定在这一句
+  { exec 8>"$FARM/lifecycle.lock"; } 2>/dev/null || { echo "!! 无法打开 $FARM/lifecycle.lock，拒绝在无互斥保护下操作农场"; exit 1; }
   flock -w 600 8 || { echo "!! 另一个农场操作正在进行（等锁 10 分钟超时），稍后再试"; exit 1; }; }
 LOGF=$FARM/watchdog.log
 KEY=$FARM/ssh/id_farm
