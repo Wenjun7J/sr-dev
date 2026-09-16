@@ -4,7 +4,10 @@
 #   这是刻意的死人开关设计。
 set -uo pipefail
 # 站点配置由宿主机 sr 只读挂进来；set -a 让 tspapi.py / ssh 子进程也看得到
-[ -f /etc/srdev.conf ] && { set -a; . /etc/srdev.conf; set +a; }
+# 优先读宿主机每次调用同步进来的 /farm/srdev.conf（目录挂载，改了立刻可见）；/etc/srdev.conf 是旧的单文件挂载，
+# 钉在容器创建时的 inode 上、编辑器保存后就过期（实测容器读到的一直是旧 WORKERS/ITYPE），只作为老容器的兼容回退
+SRCONF=/farm/srdev.conf; [ -f "$SRCONF" ] || SRCONF=/etc/srdev.conf
+[ -f "$SRCONF" ] && { set -a; . "$SRCONF"; set +a; }
 API=${SR_TSPAPI:-/usr/local/bin/tspapi.py}   # SR_TSPAPI/SR_FARM_DIR 供隔离测试替换平台客户端与状态目录
 FARM=${SR_FARM_DIR:-/farm}
 STATE=$FARM/state.env

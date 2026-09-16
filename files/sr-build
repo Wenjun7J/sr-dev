@@ -113,7 +113,10 @@ export CCACHE_BASEDIR=$SR
 # 两级读穿：本地命中不走网，本地 miss 才查远端并回填本地。代理端口按 uid（多用户不撞），
 # 凭据用各人自己的 ~/.ossutilconfig（宿主机 sr 以 SR_OSSCFG 传路径）。实测 main 全量：
 # 空本地 + 已填充远端 1m51s（对照本地全命中 1m32s、真编 8~11 分钟）；一份 Debug 基线约 3.2 GB / 3244 个对象。
-[ -f /etc/srdev.conf ] && { set -a; . /etc/srdev.conf; set +a; }
+# 站点配置：优先读宿主机每次调用同步进来的 /farm/srdev.conf（目录挂载，改了立刻可见）；/etc/srdev.conf 是旧的单文件挂载，
+# 钉在容器创建时的 inode 上、编辑器保存后就过期，只作为老容器的兼容回退
+SRCONF=/farm/srdev.conf; [ -f "$SRCONF" ] || SRCONF=/etc/srdev.conf
+[ -f "$SRCONF" ] && { set -a; . "$SRCONF"; set +a; }
 REMOTE_NOTE=""
 if [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] && [ -n "${SR_CCACHE_REMOTE_BUCKET:-}" ]; then
   PPORT=$(( 20700 + ${SR_UID:-0} % 500 )); RPFX=${SR_CCACHE_REMOTE_PREFIX:-ccache/}

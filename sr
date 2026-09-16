@@ -87,7 +87,14 @@ build_image(){
   docker build -f "$HERE/Dockerfile" "${BA[@]}" -t $IMG "$HERE"; }
 # 没镜像就地构建（首次约 5 分钟）：sr up / sr build 都不该因为"还没跑 sr image"停下来；sr image 保留为显式重建
 ensure_image(){ docker image inspect $IMG >/dev/null 2>&1 && return 0; echo "== 镜像 $IMG 不存在，先构建（一次性）"; build_image; }
+# 站点配置每次调用都同步进容器可见的目录。原来把 srdev.conf 作为单个文件 bind mount 到 /etc/srdev.conf：Docker 单文件挂载钉的是
+# inode，vim/sed -i 保存都是"写新文件再 rename"换了 inode，容器就永远读到容器创建那一刻的旧内容（实测：宿主 WORKERS=6/8c16g，
+# 容器仍 5/8c32g）。/farm 是目录挂载，文件替换可见；写临时文件再 mv 保证容器不会读到半截。/etc/srdev.conf 的挂载保留，仅作旧容器兼容。
+sync_conf(){ [ -f "$CONF_FILE" ] || return 0
+  mkdir -p -m 700 "$BASE/farm" 2>/dev/null
+  cp -f "$CONF_FILE" "$BASE/farm/srdev.conf.tmp" && chmod 600 "$BASE/farm/srdev.conf.tmp" && mv -f "$BASE/farm/srdev.conf.tmp" "$BASE/farm/srdev.conf"; }
 ensure_container(){
+  sync_conf
   # 验证轮 偏差3：0700 迁移必须放在 running 短路之前，否则已在跑的老部署永远不会被修；改不动就拒绝——这是提权向量，不能带着跑
   if [ -d "$BASE/farm" ] && [ "$(stat -c %a "$BASE/farm" 2>/dev/null)" != 700 ]; then
     chmod 700 "$BASE/farm" 2>/dev/null || { echo "!! 无法把 $BASE/farm 设为 0700（其他用户可替换 state.env 提权），请先手动 chmod 700 后重试"; return 1; }

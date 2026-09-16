@@ -1,5 +1,6 @@
 # srdev 站点配置。复制为 srdev.conf 按环境填写；srdev.conf 在 .gitignore 里，不要提交。
-# 宿主机的 sr 直接 source 它；容器内以 /etc/srdev.conf 只读挂入，sr-farm 读同一份。
+# 宿主机的 sr 直接 source 它，并在每次调用时把它同步为 ~/farm/srdev.conf（0600），容器内的 sr-build/sr-farm 读 /farm/srdev.conf——
+# 所以改完立刻生效，不用重建容器。（早先是把文件 bind mount 到 /etc/srdev.conf：单文件挂载钉 inode，编辑器保存后容器读到的仍是旧内容。）
 
 ## 镜像来源
 SR_BASE_IMAGE=REGISTRY_HOST:5000/starrocks/toolchains-ubuntu:main-20260707   # sr image 的 base：官方 toolchains 镜像（不是 dev-env）
