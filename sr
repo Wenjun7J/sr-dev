@@ -155,7 +155,10 @@ ensure_tp(){
   (
     flock 9 || exit 1
     [ -f "$d/.ready" ] && exit 0   # 等锁期间别人拷完了
-    t="$d.tmp.$$"; rm -rf "$t" "$d" 2>/dev/null; mkdir -p "$t/installed"
+    t="$d.tmp.$$"; rm -rf "$t" 2>/dev/null; mkdir -p "$t/installed"
+    # 不在这里 rm "$d"：旧目录里的 installed 是 cp -a 从镜像拷来的、属主是 root，developer 的 rm -rf 删不动它，
+    # $d 会残留，随后 mv 把 $t 塞进 $d 变成嵌套（<digest>/<digest>.tmp.NNN，顶层永远没 .ready，容器挂载报 installed 不存在——2026-09-16 踩过）。
+    # 发布见下面的"重命名让路"。
     # 布局必须是 <dir>/installed/...：build.sh 检查 $STARROCKS_THIRDPARTY/installed/llvm/lib/libLLVMInstCombine.a，
     # 找不到就会去跑 build-thirdparty.sh 现场编（踩过：平铺后 rc=127）
     # 用 docker run 而不是 docker cp：实测 7s vs 18s，docker cp 要把 6.6G 序列化成 tar 流过 daemon
@@ -170,7 +173,15 @@ ensure_tp(){
     # 发布前完整性自检：.ready 与数字 .gccmajor 都必须在
     { [ -f "$t/.ready" ] && grep -qE '^[0-9]+$' "$t/.gccmajor" 2>/dev/null; } \
       || { echo "!! 依赖目录完整性检查未过（缺 .ready 或 .gccmajor 非数字），已中止" >&2; rm -rf "$t"; exit 1; }
-    mv "$t" "$d"
+    # 发布：$d 若还在（含删不动的 root 属主 installed），先重命名让路——developer 拥有父目录 $TPDIR，rename 只看父目录写权限、
+    # 不受 $d 内容属主影响，所以一定成功；这样 mv 目标必不存在，绝不会嵌套。只有 .ready 缺失（不完整）的目录才会走到这里，不会误动在用的依赖。
+    if [ -e "$d" ]; then
+      mv -f "$d" "$d.stale.$$" 2>/dev/null
+      [ -e "$d" ] && { echo "!! 无法移开旧依赖目录 $d，中止，不做嵌套发布" >&2; rm -rf "$t"; exit 1; }
+    fi
+    mv "$t" "$d" || { echo "!! 发布依赖目录失败" >&2; rm -rf "$t"; exit 1; }
+    # 顺手用 root（容器/镜像里 root）清掉被让路的 root 属主残留，避免 .stale 越攒越多；失败不影响本次成败
+    [ -d "$d.stale.$$" ] && docker run --rm -v "$TPDIR":/tp "$img" sh -c "rm -rf /tp/$dg.stale.$$" >/dev/null 2>&1
   ) 9<>"$lk"
   local rc=$?
   [ $rc = 0 ] && [ -f "$d/.ready" ] && { echo "$dg"; return 0; }
