@@ -123,9 +123,12 @@ if [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] && [ -n "${SR_CCACHE_RE
   TOKF=/farm/ccache-token
   # 验证轮 #4：令牌只能生成一次、绝不覆盖——两棵树并发首次生成会一个起代理用 A、另一个把文件盖成 B，客户端此后永久 401。
   # 短锁内复查 + 临时文件 + mv -n（不覆盖）原子发布。
+  # 锁内复查“不存在或为空”才生成（非空令牌绝不碰）；临时令牌校验为 64 位 hex 后用 mv -f 原子发布——
+  # 不能用 mv -n：它连零字节的残留文件也拒绝替换，空令牌就永远修不好、远端缓存持续禁用（codex 第五轮）。
   if [ ! -s "$TOKF" ]; then
     ( { exec 7>"$TOKF.lock"; } 2>/dev/null && flock -w 10 7 && [ ! -s "$TOKF" ] \
-        && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$TOKF.tmp.$$" && chmod 600 "$TOKF.tmp.$$" && mv -n "$TOKF.tmp.$$" "$TOKF" ) 2>/dev/null
+        && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$TOKF.tmp.$$" && chmod 600 "$TOKF.tmp.$$" \
+        && [[ "$(cat "$TOKF.tmp.$$")" =~ ^[0-9a-f]{64}$ ]] && mv -f "$TOKF.tmp.$$" "$TOKF" ) 2>/dev/null
     rm -f "$TOKF.tmp.$$" 2>/dev/null
   fi
   TOK=$(cat "$TOKF" 2>/dev/null)
