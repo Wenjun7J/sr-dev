@@ -729,9 +729,15 @@ if [ $RC -eq 0 ]; then
     # 拆分调试符号只做在本次重新链接出来的二进制上（mtime 不早于开工、且还没有 debuglink）。
     # 用户显式传了 --without-debug-symbol-split 就完全不拆。pipefail 下不能 `readelf | grep -q`（SIGPIPE 141 恒为假，踩过）。
     NOSPLIT=0; case " ${PASS[*]:-} " in *" --without-debug-symbol-split "*) NOSPLIT=1;; esac
+    # 判据只看"有没有 .gnu_debuglink"，不看 mtime。
+    # 原来还要求 mtime 不早于本次开工，本意是别重复拆，但 .gnu_debuglink 这个判据本身就够幂等，
+    # 加上 mtime 反而漏掉一类：某次构建把二进制链出来了却在后面的边上失败（rc!=0），拆分这一步根本没跑；
+    # 下次构建 ninja 认为它已是最新不再重链，mtime 就永远早于开工，于是它永远拆不了。
+    # 现场：starrocks_test 15:57 由一次失败的构建链出，之后每次都显示"未更新"且始终带着完整符号，
+    # 而同目录的 starrocks_dw_test 因为本次重链了就被拆——同一个目录两种状态，没有道理。
+    # readelf -S 只读节头表，3.1G 的二进制实测 0.21 秒，每次都查不值一提。
     split_fresh(){ local b=$1 d
       [ -f "$b" ] || return 0
-      [ "$(stat -c %Y "$b" 2>/dev/null || echo 0)" -ge "$S" ] || return 0
       [ -n "$(readelf -S "$b" 2>/dev/null | grep -F .gnu_debuglink)" ] && return 0
       d=$b.debuginfo
       # 必须先说一声再动手：ASAN 的测试二进制有 3G+，objcopy 要把 DWARF 整个搬出来，实测一个要 3~5 分钟，
