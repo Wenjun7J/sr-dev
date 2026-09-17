@@ -143,10 +143,13 @@ case "$LOCALCAP" in ''|*[!0-9]*) LOCALCAP=$JDEF;; *) LOCALCAP=$((10#$LOCALCAP));
 # 池大小按容器内存算：(内存 - 4G 给 FE/BE/代理) / 每个链接 8G 余量，钳在 1~4；SR_LINK_JOBS 可覆盖。也放在读完配置之后算。
 MEMGB=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
 case "$MEMGB" in ''|max|*[!0-9]*) MEMGB=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}');; *) MEMGB=$(( MEMGB / 1073741824 ));; esac
-# 单个链接进程的内存按构建类型估（2026-09-17 现场实测 ASAN 单测：三个 ld.lld 同时 10.7G/9.3G/9.2G）：
-# ASAN 是 -O0 -ggdb3 -gdwarf-5 加 asan 运行时，链接期要把全部调试信息读进内存，单个峰值可到 11G；
-# Debug 约 4~5G，Release 约 3G。再扣掉容器里的常驻大户：ccache 代理约 1.2G、sr deploy 起的 FE+BE 约 2G。
-case "$BT" in ASAN) LKMEM=12;; Debug) LKMEM=5;; *) LKMEM=3;; esac
+# 单个链接进程的内存按构建类型估。2026-09-17 现场实测 ASAN 单测：三个 ld.lld 同时占 15.5G/13.2G/12.2G，
+# 把 48G 容器也填满（memory.peak 49151M/49152M）并被内核 OOM 杀掉一个。单个链接为什么这么贵：
+#   每个测试可执行文件静态链入整个 BE（libExec 137M + libExpr 136M + libStorage 125M …，单次链接 393 个输入），
+#   ASAN 插桩让代码和元数据翻倍，-O0 不内联所以函数全量发射，-ggdb3 -gdwarf-5 是最啰嗦的调试信息（含宏定义），
+#   产出的单个测试二进制就有 2.8~3.2G；而 -fuse-ld=lld 的 lld 为了快会把全部输入读进内存再合并 DWARF。
+# 所以按 ASAN 16G / Debug 5G / Release 3G 估，再扣常驻大户：ccache 代理约 1.2G、sr deploy 起的 FE+BE 约 2G。
+case "$BT" in ASAN) LKMEM=16;; Debug) LKMEM=5;; *) LKMEM=3;; esac
 LINKJ=${SR_LINK_JOBS:-$(( (${MEMGB:-24} - 5) / LKMEM ))}
 case "$LINKJ" in ''|*[!0-9]*) LINKJ=1;; *) LINKJ=$((10#$LINKJ));; esac; [ "$LINKJ" -lt 1 ] && LINKJ=1; [ "$LINKJ" -gt 4 ] && LINKJ=4
 export SR_LINK_JOBS=$LINKJ SR_REAL_CMAKE=${CUSTOM_CMAKE:-cmake} CUSTOM_CMAKE=/usr/local/bin/cmake-linkpool
