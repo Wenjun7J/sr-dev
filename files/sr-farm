@@ -349,7 +349,7 @@ status)
   # 平台上查不到 = 集群已不在（到期释放/被清扫），本地记录只是残影，别把空状态当正常打出来
   if [ -z "$S" ]; then
     echo "!! 集群 $CLUSTER (id=$CID) 在平台上已不存在——很可能到期被释放（看门狗停过 3 小时以上？）。"
-    echo "   本地记录状态=$FARM_STATUS 已失效。处理：sr farm down 清记录，再 sr farm init 重建（6~9 分钟）。"
+    echo "   本地记录状态=$FARM_STATUS 已失效。处理：sr farm down 清记录，再 sr farm init 重建。"
     exit 1
   fi
   LB=$(stat -c %Y $FARM/last-build 2>/dev/null || echo 0)
@@ -483,12 +483,14 @@ _watchdog)
     done
   done ;;
 *) cat <<U
-用法: sr-farm {init|status|resume|suspend|down}
-  init     申请农场并部署（约 6 分钟），之后自动续约 + 空闲自动休眠
-  status   集群状态 / 到期 / daemon 连接数 / 距上次编译 / 看门狗
-  resume   唤醒（实测 29 秒到可派活）
-  suspend  休眠
-  down     释放并停看门狗
+用法: sr-farm {init|status|usage|rebalance|resume|suspend|down}
+  init                 申请农场并部署；之后自动续约、空闲自动休眠、故障自愈
+  status               集群状态 / 到期 / daemon 连接数 / 距上次编译 / 看门狗
+  usage [--watch [秒]]  scheduler 各 worker 槽位与负载、节点实际负载、本容器 CPU/内存
+  rebalance            重启 scheduler 并预热所有 worker（有 worker 长期拿不到任务时用）
+  resume               唤醒
+  suspend              休眠
+  down                 释放并停看门狗
 U
 ;;
 esac

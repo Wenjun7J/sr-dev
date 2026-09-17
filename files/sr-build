@@ -31,7 +31,7 @@ usage(){ cat <<'U'
   --run                          与 --ut 搭配：编完接着跑单测；-- 后面的参数透传给 run-be-ut.sh（--test X / --gtest_filter / --module）
   --debug | --release | --asan   构建类型（默认 release，单测默认 asan；仅对 be/ut 生效）
   --dist auto|on|off             是否用编译农场（默认 auto）
-  --no-java-ext                  跳过 java-extensions（默认构建，仅约 6 秒）
+  --no-java-ext                  跳过 java-extensions（默认构建；跳过则产物缺 jni-packages 等 jar）
   --clean                        清空该类型的构建树后重建
   --make                         回退到 Unix Makefiles（默认 ninja）
   --no-ccache                    绕过 ccache（仅用于做纯编译计时对比）
@@ -229,7 +229,7 @@ edges(){ [ -f "$TREE/build.ninja" ] || { echo "99999 0"; return; }
 NOFARM=""
 if [ ! -f "$FARM_STATE" ] && [ "$DIST" != off ]; then
   echo "!! 还没有编译农场：无法分布式编译（全量约慢 1.9 倍），只能本机 -j$JLOCAL。"
-  echo "   建农场: sr farm init（约 6~9 分钟建 5 台 worker；之后休眠/唤醒/续约/自愈全自动，不用再管）"
+  echo "   建农场: sr farm init（之后续约/休眠/唤醒/自愈全自动，不用再管）"
   if [ -t 0 ] || [ -n "${SR_TTY:-}" ]; then   # SR_TTY 由宿主机 sr 按自己的 stdin 设置：docker exec -i 下容器内 -t 0 恒为假
     printf '   现在先用本机编译吗？[y/N] ' >&2; read -r ans   # 提示走 stderr：stdin 非终端（docker exec -i / | tee）时 read -p 不打印提示（review#6）
     case "$ans" in y|Y|yes|YES) DIST=off; NOFARM=1; FARM_NOTE="本地（尚无农场，用户确认）";; *) echo "   已取消。"; exit 1;; esac
