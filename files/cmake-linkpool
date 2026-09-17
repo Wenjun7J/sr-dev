@@ -1,0 +1,20 @@
+#!/bin/bash
+# cmake-linkpool —— 给 configure 注入 ninja 的「链接并发池」。
+#
+# 为什么需要：上游 be/CMakeLists.txt / build.sh / run-be-ut.sh 里没有任何 JOB_POOL，链接并发 = 编译并发。
+# 编译有 iceccd -m 卡着本机数量，链接不经 icecc、只受 ninja -j 约束。ASAN 单测是动态链接 + 上百个测试可执行文件，
+# 每个 ld.lld 2~4G：-j80 时同时 35 个 ld.lld 吃掉 30G 撞容器上限被内核杀；-j8 时 8 个也把 24G 容器顶在 memory.max 上
+# 反复回收，进度停在 "Checking thrift generation" 之后一动不动，连 docker exec 都进不去（2026-09-17 两次现场）。
+#
+# 怎么接进去：上游 env.sh 认 CUSTOM_CMAKE 覆盖 CMAKE_CMD，build.sh 与 run-be-ut.sh 的 configure 都经它。
+# 只在 configure 调用（参数里有 -G）时注入 -DCMAKE_JOB_POOLS=link=N -DCMAKE_JOB_POOL_LINK=link；
+# 池不进 ninja 的命令哈希，重新 configure 不会让已编好的边变脏。Makefile 生成器忽略池，无害。
+# N 由 sr-build 按容器内存算好放进 SR_LINK_JOBS；没有该变量就原样透传，等于没装这个包装。
+real=${SR_REAL_CMAKE:-cmake}
+[ "$(readlink -f "$(command -v "$real" 2>/dev/null || echo "$real")" 2>/dev/null)" = "$(readlink -f "$0")" ] && real=cmake   # 防止环境里残留指向自己
+if [[ "${SR_LINK_JOBS:-}" =~ ^[1-9][0-9]*$ ]]; then
+  for a in "$@"; do
+    [ "$a" = -G ] && exec "$real" "-DCMAKE_JOB_POOLS=link=$SR_LINK_JOBS" -DCMAKE_JOB_POOL_LINK=link "$@"
+  done
+fi
+exec "$real" "$@"

@@ -138,6 +138,14 @@ SRCONF=/farm/srdev.conf; [ -f "$SRCONF" ] || SRCONF=/etc/srdev.conf
 # 先十进制归一化再判正数：只比字面量 "0" 的话，"00"/"000" 会绕过检查、算出 0，daemon 拿到 -m 0（codex r9#2）
 LOCALCAP=${SR_LOCAL_JOBS:-$JDEF}
 case "$LOCALCAP" in ''|*[!0-9]*) LOCALCAP=$JDEF;; *) LOCALCAP=$((10#$LOCALCAP)); [ "$LOCALCAP" -gt 0 ] || LOCALCAP=$JDEF;; esac
+# 链接边单独一个 ninja 并发池，经 /usr/local/bin/cmake-linkpool 在 configure 时注入（原因见该脚本头注：ASAN 单测
+# 上百个 ld.lld 各 2~4G、链接不经 icecc 只受 -j 约束，-j80 时 35 个同时跑撞 32G，-j8 时 8 个也把 24G 顶死）。
+# 池大小按容器内存算：(内存 - 4G 给 FE/BE/代理) / 每个链接 8G 余量，钳在 1~4；SR_LINK_JOBS 可覆盖。也放在读完配置之后算。
+MEMGB=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
+case "$MEMGB" in ''|max|*[!0-9]*) MEMGB=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}');; *) MEMGB=$(( MEMGB / 1073741824 ));; esac
+LINKJ=${SR_LINK_JOBS:-$(( (${MEMGB:-24} - 4) / 8 ))}
+case "$LINKJ" in ''|*[!0-9]*) LINKJ=2;; *) LINKJ=$((10#$LINKJ));; esac; [ "$LINKJ" -lt 1 ] && LINKJ=1; [ "$LINKJ" -gt 4 ] && LINKJ=4
+export SR_LINK_JOBS=$LINKJ SR_REAL_CMAKE=${CUSTOM_CMAKE:-cmake} CUSTOM_CMAKE=/usr/local/bin/cmake-linkpool
 REMOTE_NOTE=""
 if [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] && [ -n "${SR_CCACHE_REMOTE_BUCKET:-}" ]; then
   PPORT=$(( 20700 + ${SR_UID:-0} % 500 )); RPFX=${SR_CCACHE_REMOTE_PREFIX:-ccache/}
@@ -465,7 +473,7 @@ esac
 echo "=========================================================="
 echo " 目标: $TARGET$([ "$TARGET" = fe ] && echo "   (maven，农场/ccache 不参与)")$([ "$TARGET" = ut ] && echo "   (BE 单测，run-be-ut.sh；$([ $RUN = 1 ] && echo 编完接着跑 || echo 只编不跑))")"
 [ "$TARGET" = ut ] && [ $CLEAN = 1 ] && echo " 注意: run-be-ut.sh --clean 除了删 $TREE，还会删 $SR/be/output/（上游行为，BE 主程序产物也没了）"
-[ "$TARGET" != fe ] && echo " 类型: $BT      生成器: $GEN      并发: -j$J"
+[ "$TARGET" != fe ] && echo " 类型: $BT      生成器: $GEN      并发: -j$J      链接池: $LINKJ 个 ld 同时跑（SR_LINK_JOBS 可改）"
 echo " 模式: $FARM_NOTE"
 [ -n "${SR_DRYRUN:-}" ] && { echo " (SR_DRYRUN=1：决策已打印，到此为止不编译)"; exit 0; }   # 测试钩子：验证农场/交互决策
 echo " 版本: ${SR_VER:-未指定}   编译器: $(${STARROCKS_GCC_HOME:-/usr}/bin/gcc -dumpfullversion 2>/dev/null || echo ?)   依赖: ${STARROCKS_THIRDPARTY:-默认}"
