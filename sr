@@ -131,8 +131,10 @@ ensure_container(){
   docker rm -f $NAME >/dev/null 2>&1
   # --init: tini 当 PID1 回收僵尸。否则被杀的 iceccd 留成 <defunct>，探活会误判 daemon 还在，
   # icecc 随即绕过并发闸门无限制本地编译 -> OOM（踩过）
+  # --ulimit nofile: BE 打开 storage engine 要求 fd 上限 >= 60000，docker 默认软上限 1024，
+  # 跑 BE 单测会直接 "file descriptors limit is too small" 退出（踩过）。给足一次，省得每处再抬。
   docker run -d --name $NAME --init --network host --privileged \
-    ${CGP[@]+"${CGP[@]}"} --cpus=$CPUS --memory=$MEM \
+    ${CGP[@]+"${CGP[@]}"} --cpus=$CPUS --memory=$MEM --ulimit nofile=655350:655350 \
     -v $WORK:$WORK -v $BASE/ccache:/ccache -v $BASE/m2:/root/.m2 \
     -v $BASE/farm:/farm -v $BASE/.tsp:/root/.tsp -v $BASE/iceccrun:/var/run/icecc \
     -v $TPDIR:/tp ${CONF_MOUNT[@]+"${CONF_MOUNT[@]}"} \

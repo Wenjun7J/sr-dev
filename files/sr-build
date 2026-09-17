@@ -781,6 +781,18 @@ if [ $RC -eq 0 ]; then
       RARGS+=("$a")
     done
     RARGS+=(-j "$JLOCAL")
+    # BE 打开 storage engine 前会检查 fd 上限，要求 >= 60000；容器默认软上限只有 1024（硬上限 524288），
+    # 不抬就直接 "file descriptors limit is too small" 退出，一个用例都跑不了（2026-09-17 现场 rc=255，10 秒）。
+    # 抬到 min(硬上限, 65536)；抬不动只提示不中止。ulimit 作用于本 shell 及其子进程，下面的 run-be-ut.sh 继承。
+    UTNOF=$(ulimit -Hn 2>/dev/null)
+    case "$UTNOF" in unlimited) UTNOF=65536;; ''|*[!0-9]*) UTNOF=0;; esac
+    [ "$UTNOF" -gt 65536 ] && UTNOF=65536
+    if [ "$UTNOF" -ge 60000 ] && ulimit -n "$UTNOF" 2>/dev/null; then
+      echo "   fd 上限已抬到 $(ulimit -Sn)（BE storage engine 要求 >= 60000）"
+    else
+      echo "   !! fd 上限抬不到 60000（软 $(ulimit -Sn) / 硬 $(ulimit -Hn)），BE 打开 storage engine 会失败。"
+      echo "      空闲时 sr down && sr up 重建容器（新容器带 --ulimit nofile=655350）。"
+    fi
     UTLOG=${LOGF%.log}.ut.log
     echo ""
     echo "== 开始跑单测: ./run-be-ut.sh ${RARGS[*]}"
