@@ -286,7 +286,22 @@ fi
 # 必须排除僵尸：pgrep 会匹配 <defunct> 的 iceccd；端口全机唯一，多 profile 容器只有第一个能 bind，其余共用同一 daemon。
 iceccd_alive(){ local p st; for p in $(pgrep -x iceccd 2>/dev/null); do st=$(awk '{print $3}' /proc/$p/stat 2>/dev/null); [ "$st" != Z ] && return 0; done; return 1; }
 port_taken(){ [ -n "$(ss -ltnH "sport = :${DPORT:-10245}" 2>/dev/null)" ]; }
-ensure_local_daemon(){ local sopt=() p cl
+# iceccd 的 env 基目录（默认 /var/tmp/icecc-envs）：daemon 会**先降权**到 -u <用户>，之后才在 cleanup_cache()
+# 里 chown/chmod 这个目录。降权后的进程只有在自己已经是属主时才动得了它，所以「目录属主」和「-u 用户」
+# 必须一致，否则 daemon 启动即退出：chown/chmod in cleanup_cache() failed(Error: Operation not permitted)
+# ——而且 -d 早已 fork 过，父进程照样 return 0，外面看着像起成功了（实测 2026-09-17，两个用户互换各复现一次）。
+# 原来写死 -u nobody 只是碰巧与目录当时的属主一致：谁先把目录建出来就锁定了谁。worker 节点上是 icecc
+# （发行版包的约定），这里统一也用 icecc 并把基目录 chown 过去，本机与节点行为一致，不再看建目录的先后。
+ICEENVDIR=/var/tmp/icecc-envs
+icecc_env_owner(){ stat -c %U "$ICEENVDIR" 2>/dev/null; }
+# 只在"准备启动 daemon"时调用：它会改目录属主。复用已有 daemon 的分支必须用 icecc_env_owner（只读），
+# 否则会把目录从正在跑的 daemon 脚下夺走，它下一次 cleanup_cache 就失败。
+icecc_user(){ local u=nobody
+  id icecc >/dev/null 2>&1 && u=icecc
+  mkdir -p "$ICEENVDIR" 2>/dev/null
+  chown "$u" "$ICEENVDIR" 2>/dev/null || u=$(icecc_env_owner)
+  echo "${u:-nobody}"; }
+ensure_local_daemon(){ local sopt=() p cl ru wu
   # 验证轮 #3：--dist off 先跑时没有农场状态，原来会起一个默认端口/默认 netname/无 -s 的 daemon，之后农场构建发现它活着就沿用，
   # 却连不上用户的 scheduler。这里优先用 state.env 加载到的值（上面无论 --dist 都会加载），没有农场时按与 sr-farm 完全相同的
   # 公式从 uid/用户名派生，两种模式起出来的 daemon 配置一致；scheduler 常驻本容器，地址就是本机 IP，没起也只是 daemon 后台重试。
@@ -304,6 +319,14 @@ ensure_local_daemon(){ local sopt=() p cl
         echo "!! 常驻 iceccd 的配置与本次期望不同（期望 -n $NETNAME -s $SCHED:$SPORT）：$(echo "$cl" | grep -oE -- '-n [^ ]+|-s [^ ]+' | tr '\n' ' ')"
         echo "   它可能是在别的农场配置下启动的；农场构建会连不上 scheduler。空闲时 sr down && sr up 重建容器即可刷新。"
       fi
+      # 同样核对降权用户与 env 基目录属主是否一致：不一致的话这个 daemon 一旦重启就再也起不来（见 icecc_user 注释）。
+      # 这里只读不改——改了会把目录从正在跑的 daemon 脚下夺走。
+      ru=$(echo "$cl" | grep -oE -- '-u [^ ]+' | awk '{print $2}' | head -1)
+      wu=$(icecc_env_owner)
+      if [ -n "$ru" ] && [ -n "$wu" ] && [ "$ru" != "$wu" ]; then
+        echo "!! 常驻 iceccd 以 -u $ru 运行，但 $ICEENVDIR 属主是 $wu —— 它一旦重启就会起不来。"
+        echo "   空闲时 sr down && sr up 重建容器即可对齐。"
+      fi
       break
     done
     return 0
@@ -312,7 +335,7 @@ ensure_local_daemon(){ local sopt=() p cl
   mkdir -p /var/run/icecc
   # 8>&- 9>&-：daemon 常驻，不得继承农场锁/构建锁的 fd（踩过：锁被永久占住，编完再也拿不到锁）
   /usr/sbin/iceccd -d ${sopt[@]+"${sopt[@]}"} -n "${NETNAME:-srfarm}" -m $LOCALCAP -p "${DPORT:-10245}" \
-    -N "$(hostname)-${SR_USER:-u}" -u nobody -l /tmp/iceccd.log </dev/null >/dev/null 2>&1 8>&- 9>&-
+    -N "$(hostname)-${SR_USER:-u}" -u "$(icecc_user)" -l /tmp/iceccd.log </dev/null >/dev/null 2>&1 8>&- 9>&-
   sleep 3; { iceccd_alive || port_taken; }; }
 if [ "$DIST" != off ]; then
   sr-farm _wd 2>/dev/null || true   # 容器重启后把看门狗拉回来
@@ -382,7 +405,7 @@ if [ $USE_FARM = 1 ]; then
     # 9>&- 必须加：daemon 会继承持有构建锁的 fd 9，它常驻就把锁永久占住（踩过，
     # 症状是编译结束后再也拿不到锁、报「已有构建在进行」而 ps 里根本没有 sr-build）
     /usr/sbin/iceccd -d -s "$SCHED:${SPORT:-8765}" -n "${NETNAME:-srfarm}" -m $LOCALCAP \
-      -p "${DPORT:-10245}" -N "$(hostname)-${SR_USER:-u}" -u nobody -l /tmp/iceccd.log </dev/null >/dev/null 2>&1 9>&-
+      -p "${DPORT:-10245}" -N "$(hostname)-${SR_USER:-u}" -u "$(icecc_user)" -l /tmp/iceccd.log </dev/null >/dev/null 2>&1 9>&-
     sleep 3; }
   # 兜底：daemon 没起来就绝不能用远端级别的并发，否则全落本地把容器撑爆
   { iceccd_alive || port_taken; } || { echo "!! 本地 iceccd 起不来，降级为本地编译 -j$JLOCAL"; \
