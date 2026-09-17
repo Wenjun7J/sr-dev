@@ -138,6 +138,14 @@ resize_if_needed(){
     echo "   本机 iceccd 已停，下次编译按新核数重新拉起"
   fi; }
 
+# 从 $PWD 上溯找 StarRocks 根；给了参数就只认那个目录本身（不上溯）。build 分支里另有一个同义的局部实现，
+# 那个还要兼顾"参数里哪个才是目录"的扫描，这里只服务 pack 这类简单场景。
+tree_root(){ local d
+  if [ -n "${1:-}" ]; then
+    [ -f "$1/build.sh" ] && [ -d "$1/be/src" ] && { (cd "$1" && pwd -P); return 0; }; return 1; fi
+  d=$(pwd -P); while [ "$d" != / ]; do
+    [ -f "$d/build.sh" ] && [ -d "$d/be/src" ] && { echo "$d"; return 0; }; d=$(dirname "$d"); done; return 1; }
+
 ensure_container(){
   # 顺序要紧：先把 farm 目录收紧到 0700 再往里写配置——目录还开放时写固定路径会被预置的符号链接劫持（codex r8#3）。
   # 0700 迁移也必须在 running 短路之前，否则已在跑的老部署永远不会被修；改不动就拒绝，这是提权向量，不能带着跑。
@@ -253,6 +261,67 @@ history|log)
   printf "%-16s %-8s %-22s %-14s %-6s %-5s %-6s %-7s %-6s %s\n" 时间 用户 源码树@分支 版本 模式 边数 结果 用时 anon峰 命中/编译
   # 第 7 列是 build.sh 的退出码：0=成功，其余=失败。history 只报成功/失败，不写原因（用户要求）；要查原因看末列日志路径
   tail -n "${2:-20}" "$F" | awk -F"\t" '{r=($7==0?"成功":"失败"); printf "%-16s %-8s %-22s %-14s %-6s %-5s %-6s %-7s %-6s %s\n",$1,$2,substr($3,1,22),$4,$5,$6,r,$8,$9,$10}' ;;
+pack)
+  # 把当前源码树的 output/ 打成和官方日构建同构的包：顶层目录名 = 文件名 = <树名>-<短sha>[-dirty]，
+  # 里面就是 be/ fe/（以及构建时带上的 apache_hdfs_broker/）和 LICENSE/NOTICE，不额外塞东西。
+  # 上传必须显式 --upload：往共享桶里推 4G+ 的对象是对外动作，不能顺手做。桶名/前缀是站点信息，只从 srdev.conf 读。
+  shift
+  P_UP=0; P_FORCE=0; P_NAME=""; P_OUT=${SR_PKG_DIR:-$BASE/pkg}; P_SRC=""; P_LEVEL=${SR_PKG_LEVEL:-6}; P_JOBS=${SR_PKG_JOBS:-16}
+  while [ $# -gt 0 ]; do case "$1" in
+    --upload) P_UP=1; shift;;
+    --force)  P_FORCE=1; shift;;
+    --name)   P_NAME=$2; shift 2;;
+    --out)    P_OUT=$2; shift 2;;
+    -h|--help) cat <<'PU'
+用法: sr pack [源码目录] [选项]      （不给目录就从当前目录上溯找源码树）
+  把该树的 output/ 打成 <树名>-<短sha>[-dirty].tar.gz，布局与官方日构建包一致
+  --upload        打完上传到 srdev.conf 里配的 SR_PKG_BUCKET/SR_PKG_PREFIX（不给就只打包）
+  --force         允许覆盖同名的本地文件与远端对象
+  --name NAME     自定义包名（同时决定包内顶层目录名）
+  --out DIR       本地输出目录（默认 $SR_PKG_DIR 或 ~/pkg）
+PU
+      exit 0;;
+    *) if [ -d "$1" ] && [ -z "$P_SRC" ]; then P_SRC=$1; shift
+       else echo "未知参数: $1"; exit 1; fi;;
+  esac; done
+  PSR=$(tree_root ${P_SRC:+"$P_SRC"}) || { echo "!! 当前目录不在任何 StarRocks 源码树里，也没给出有效的源码目录"; exit 1; }
+  POUTD=$PSR/output
+  [ -d "$POUTD" ] || { echo "!! $POUTD 不存在。先 sr build 产出 be/ 与 fe/ 再来打包。"; exit 1; }
+  { [ -d "$POUTD/be" ] || [ -d "$POUTD/fe" ]; } || { echo "!! $POUTD 下既没有 be/ 也没有 fe/，不像编译产物"; exit 1; }
+  if [ -z "$P_NAME" ]; then
+    PSHA=$(git -C "$PSR" rev-parse --short HEAD 2>/dev/null || echo nogit)
+    # 脏树要在包名里说清楚：官方包都来自干净的 CI 构建，拿一个带未提交改动的包去部署而不自知很容易查半天
+    [ -n "$(git -C "$PSR" status --porcelain 2>/dev/null)" ] && PDIRTY=-dirty || PDIRTY=""
+    P_NAME="$(basename "$PSR")-${PSHA}${PDIRTY}"
+  fi
+  case "$P_NAME" in */*|"") echo "!! 包名不能为空或含 /：$P_NAME"; exit 1;; esac
+  mkdir -p "$P_OUT" 2>/dev/null || { echo "!! 建不了输出目录 $P_OUT"; exit 1; }
+  PTGZ=$P_OUT/$P_NAME.tar.gz
+  [ -e "$PTGZ" ] && [ $P_FORCE = 0 ] && { echo "!! $PTGZ 已存在（--force 覆盖）"; exit 1; }
+  PNEED=$(du -sk "$POUTD" 2>/dev/null | cut -f1); PFREE=$(df -Pk "$P_OUT" | awk 'NR==2{print $4}')
+  [ "${PFREE:-0}" -lt "${PNEED:-0}" ] && { echo "!! $P_OUT 所在盘剩余 $((PFREE/1048576))G，产物 $((PNEED/1048576))G，空间可能不够，已中止（--out 换个盘）"; exit 1; }
+  echo "== 打包 $PSR/output -> $PTGZ"
+  echo "   包内顶层目录: $P_NAME/    内容: $(ls "$POUTD" | tr '\n' ' ')"
+  echo "   压缩: pigz -$P_LEVEL -p$P_JOBS（产物 $(du -sh "$POUTD" | cut -f1)，需要几分钟）"
+  PS0=$(date +%s)
+  # flags=r：改写只作用于成员名，不碰符号链接的目标（否则指向 output/... 的链接会被改坏）
+  tar -C "$PSR" --transform "flags=r;s|^output|$P_NAME|" -cf - output 2>/dev/null | pigz -$P_LEVEL -p"$P_JOBS" > "$PTGZ.part"
+  PRC=${PIPESTATUS[0]}
+  [ "$PRC" = 0 ] || { echo "!! tar 失败（rc=$PRC）"; rm -f "$PTGZ.part"; exit 1; }
+  mv -f "$PTGZ.part" "$PTGZ" || { echo "!! 发布 $PTGZ 失败"; rm -f "$PTGZ.part"; exit 1; }
+  echo "   完成: $(du -h "$PTGZ" | cut -f1)  用时 $(( ($(date +%s)-PS0)/60 ))m$(( ($(date +%s)-PS0)%60 ))s"
+  [ $P_UP = 0 ] && { echo "   （只打包。要上传加 --upload）"; exit 0; }
+  [ -n "${SR_PKG_BUCKET:-}" ] || { echo "!! 没配 SR_PKG_BUCKET，不知道往哪个桶传。在 srdev.conf 里配上桶名与前缀再试。"; exit 1; }
+  command -v ossutil >/dev/null || { echo "!! 宿主机上没有 ossutil，装好并 ossutil config 之后再试"; exit 1; }
+  PURL="oss://$SR_PKG_BUCKET/${SR_PKG_PREFIX:-}$P_NAME.tar.gz"
+  if ossutil stat "$PURL" >/dev/null 2>&1; then
+    [ $P_FORCE = 1 ] || { echo "!! 远端已有同名对象 $PURL（--force 覆盖）"; exit 1; }
+    echo "   远端已有同名对象，--force 覆盖"
+  fi
+  echo "== 上传 -> $PURL"
+  ossutil cp "$PTGZ" "$PURL" 2>&1 | tail -3
+  ossutil stat "$PURL" 2>/dev/null | grep -Ei "Content-Length|Last-Modified" | sed 's/^/   /'
+  ;;
 tp)
   echo "依赖目录: $TPDIR $([ "$TPDIR" = "$SHARED_TP" ] && echo "（全机共享）" || echo "（个人）")"
   printf "%-14s %-8s %-7s %s\n" DIGEST GCC 大小 状态
@@ -281,6 +350,7 @@ versions)
   tp                 列出已拉下来的各版本依赖（全机共享目录）
   deploy [选项]      在项目下执行：用该项目的产物部署/替换唯一一套单节点集群（FE+BE，跑在容器里）
                      已有集群在跑就先停再换。--status 看状态，--stop 停，--clean-data 连数据一起重建，--fe-heap 改 FE 堆（默认 2g）
+  pack [目录] [选项]  把该树 output/ 打成与官方日构建同构的 tar.gz；--upload 传到 srdev.conf 配的 OSS 桶
   history [N]        最近 N 次编译概况（默认 20）
   versions           列出 registry 里可用的版本
   shell / down

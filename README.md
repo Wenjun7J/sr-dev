@@ -91,6 +91,21 @@ maven-compiler-plugin 3.1 据此判定「Changes detected」整模块重编 4670
 上游没有任何 JOB_POOL，链接并发等于编译并发，而链接不经 icecc：ASAN 单测上百个 ld.lld 各 2~4G，实测 `-j80` 时 35 个同时跑撞上限被杀，
 `-j8` 时 8 个也把 24G 容器顶在 memory.max 上反复回收、进度停在 thrift 检查之后不动。池大小按容器内存算（(内存-4G)/8G，钳 1~4），`SR_LINK_JOBS` 可改。
 
+## 打包产物
+
+`sr pack` 把当前源码树的 `output/` 打成与官方日构建同构的 tar.gz：包名与包内顶层目录同名，都是 `<树名>-<短sha>[-dirty]`，
+里面就是 `be/`、`fe/`（构建时带上的话还有 `apache_hdfs_broker/`）和 `LICENSE.txt`/`NOTICE.txt`，不额外塞任何东西。
+树里有未提交改动时包名会带 `-dirty`——官方包都来自干净的 CI 构建，拿一个带未提交改动的包去部署而不自知很难查。
+
+```bash
+sr pack                      # 只打包，落在 ~/pkg（或 SR_PKG_DIR）
+sr pack --upload             # 打完传到 srdev.conf 里配的 SR_PKG_BUCKET/SR_PKG_PREFIX
+sr pack --name my-build-1    # 自定义包名（同时决定包内顶层目录名）
+```
+
+上传必须显式加 `--upload`：往共享桶里推 4G+ 的对象是对外动作。桶名与前缀是站点信息，只从不入库的 `srdev.conf` 读，
+没配就直接拒绝；远端已有同名对象时也要 `--force` 才覆盖。压缩走 `pigz`（默认 16 线程、级别 6），6G 产物压出来约 4.4G。
+
 ## 农场
 
 - scheduler 跑在客户端容器里（实测 3.2MB / 0.5% CPU，纯中介，源码和产物 client↔worker 直连），申请到的机器全部当 worker。

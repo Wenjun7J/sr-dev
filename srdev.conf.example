@@ -21,6 +21,11 @@ WORKERS=5                          # 申请的机器总数（全部当 worker；
 #SR_LOCAL_JOBS=8                   # 常驻本机 iceccd 的并发上限（默认=容器 CPU 配额；全局、只在 daemon 启动时生效）。单次构建限本机内存请用 sr build -j N（总并发上限）
 #SR_FE_HEAP=2g                     # sr deploy 起的 FE 堆上限（默认 2g；上游模板 8g 会和编译抢容器内存）
 #SR_LINK_JOBS=2                    # 同时跑几个链接器（默认按容器内存与构建类型估算；ASAN 单测单个 ld.lld 峰值可达 11G）
+
+## sr pack：把 output/ 打成与官方日构建同构的 tar.gz，可选上传 OSS（凭据同样只从各人自己的 ~/.ossutilconfig 读）
+#SR_PKG_BUCKET=<桶名>                # 不配就只能本地打包，sr pack --upload 会直接拒绝
+#SR_PKG_PREFIX=packages/main/Release/  # 对象前缀，要以 / 结尾
+#SR_PKG_DIR=/path/to/pkg     # 本地输出目录（默认 ~/pkg）；包有 4G+，别放小盘
 ITYPE=8c32g                        # 节点规格（平台侧的名字）
 #SR_NODE_JOBS=                     # 每台 worker 的编译并发（icecc -m，也决定总 -j=台数×此值+本地）。
                                    # 留空=按节点实际 CPU 核数自动定；内存受限时压低（8c16g 编 ASAN 每槽~2G，
