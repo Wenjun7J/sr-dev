@@ -227,7 +227,12 @@ init)
   [ -n "$PRE" ] && { echo "!! 平台上已存在同名集群 $NAME (id=$PRE)，不会认领它。"
                      echo "   若它是你的旧农场：先 sr farm down 释放；若本地已无记录，请到平台上核对后手工释放再重试。"; exit 1; }
   echo "== 申请集群 $NAME（$WORKERS × $ITYPE，磁盘 ${DISK}G，全部当 worker；scheduler 跑在本容器）…"
-  $API create "$NAME" "$(( WORKERS - 1 ))" 2 "$ITYPE" "$DISK" || { echo "!! 创建集群失败，已中止（未产生任何云资源）"; exit 1; }
+  # 创建失败只能断言"结果未确认"，不能断言"没建出来"：客户端返回非零也可能是平台已受理、只是响应超时/断连/解析失败，
+  # 那样会留下一台没有本地记录、无法 sr farm down 回收的计费集群（codex r15#1）。所以中止部署，但要求人工核对。
+  $API create "$NAME" "$(( WORKERS - 1 ))" 2 "$ITYPE" "$DISK" || {
+    echo "!! 创建集群的请求未确认成功，已中止部署。"
+    echo "   注意：这不代表平台上没建出来——响应超时或断连时集群可能已经创建并开始计费。"
+    echo "   请按名字 $NAME 和创建时间到平台核对；若确实建出来了，手工释放后再重试 sr farm init。"; exit 1; }
   echo "== 等待 RUNNING（约 5-6 分钟）…"
   for i in $(seq 1 45); do sleep 20; S=$($API row "$NAME"|cut -d'|' -f1); [ "$S" = Running ] && break; done
   # 走到这里才按名字取 CID 是安全的：创建前已确认无同名集群、且创建确实成功。取不到就停，不猜、不部署
