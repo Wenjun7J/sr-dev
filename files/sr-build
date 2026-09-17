@@ -18,7 +18,12 @@ FARM_STATE=${FARM_STATE:-/farm/state.env}
 # 本机同时编译的 cc1plus 都不会超过 16 个，scheduler 会把其余的派到农场。
 LOCK=""   # 源码树定下来之后才能算，见下
 
-BT=Release ; DIST=auto ; JAVAEXT=1 ; CLEAN=0 ; GEN=ninja ; JLOCAL=16 ; JSET=0 ; VERBOSE=0 ; CACHE=1
+# 本机并发默认跟容器 CPU 配额走（cgroup v2 cpu.max = "配额 周期"，如 "800000 100000" = 8 核；"max" = 不限，退回 nproc）。
+# 原来写死 16 只因当时容器就是 16 核；容器改成 8c24g 后若仍放 16 个 cc1plus，Release 16×1.6G 就撞 24G 上限（2026-09-17）。
+quota_cores(){ local q p; read -r q p < /sys/fs/cgroup/cpu.max 2>/dev/null || { nproc 2>/dev/null; return; }
+  [ "$q" = max ] && { nproc 2>/dev/null; return; }; echo $(( (q + p - 1) / p )); }
+JDEF=$(quota_cores); case "$JDEF" in ''|*[!0-9]*|0) JDEF=16;; esac
+BT=Release ; DIST=auto ; JAVAEXT=1 ; CLEAN=0 ; GEN=ninja ; JLOCAL=$JDEF ; JSET=0 ; VERBOSE=0 ; CACHE=1
 BTSET=0 ; RUN=0 ; BSCRIPT=build.sh   # BTSET：类型是否显式指定（单测默认 ASAN）；BSCRIPT：驱动上游哪个脚本
 # LOCALCAP（常驻 iceccd 的本机并发上限）挪到读完站点配置之后再算，见下面的 SRCONF 处：
 # 在这里算的话，srdev.conf 里的 SR_LOCAL_JOBS 永远不生效，配置模板里那个旋钮等于死的（codex r8#5）。
@@ -44,7 +49,7 @@ why(){ cat <<'W'
   ninja 而非 make      : 全量 2768s -> 1933s (1.43x)，CPU 利用率 56% -> 84%
   ccache sloppiness    : BE 开 WITH_PCH=ON，默认令 78.4% 的编译绕过缓存；
                          解开后回退/切分支场景 1825s -> 392s (4.66x)
-  本地 -j16            : 共享机约束；峰值内存 28.3GB(Debug) / 32.7GB(ASAN)
+  本地并发=容器CPU配额 : 16 核容器时实测 -j16 峰值内存 28.3GB(Debug) / 32.7GB(ASAN)；容器缩到 8c24g 后本地 8 槽
   分布式并发自适应     : worker数×8 + 本地16。写死 48 会在 worker 变化时吃亏
                          纯本地 -j16 1308s -> 4 worker 778s(1.68x) -> 5 worker 678s(1.93x)
   scheduler 放本容器   : 它只占 3.2MB/0.5%CPU（预处理源码和产物都是 client<->worker 直连，
@@ -131,8 +136,8 @@ SRCONF=/farm/srdev.conf; [ -f "$SRCONF" ] || SRCONF=/etc/srdev.conf
 # 必须在读完配置之后算，否则 srdev.conf 的 SR_LOCAL_JOBS 不生效（codex r8#5）。非正整数一律回退 16。
 # 单次构建要限住本机内存，用显式 -j N：它是本次「总并发上限」，ninja 最多同时发 N 个任务（review extra2#1）。
 # 先十进制归一化再判正数：只比字面量 "0" 的话，"00"/"000" 会绕过检查、算出 0，daemon 拿到 -m 0（codex r9#2）
-LOCALCAP=${SR_LOCAL_JOBS:-16}
-case "$LOCALCAP" in ''|*[!0-9]*) LOCALCAP=16;; *) LOCALCAP=$((10#$LOCALCAP)); [ "$LOCALCAP" -gt 0 ] || LOCALCAP=16;; esac
+LOCALCAP=${SR_LOCAL_JOBS:-$JDEF}
+case "$LOCALCAP" in ''|*[!0-9]*) LOCALCAP=$JDEF;; *) LOCALCAP=$((10#$LOCALCAP)); [ "$LOCALCAP" -gt 0 ] || LOCALCAP=$JDEF;; esac
 REMOTE_NOTE=""
 if [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] && [ -n "${SR_CCACHE_REMOTE_BUCKET:-}" ]; then
   PPORT=$(( 20700 + ${SR_UID:-0} % 500 )); RPFX=${SR_CCACHE_REMOTE_PREFIX:-ccache/}
@@ -313,7 +318,7 @@ icecc_user(){ local u=nobody
   mkdir -p "$ICEENVDIR" 2>/dev/null
   chown "$u" "$ICEENVDIR" 2>/dev/null || u=$(icecc_env_owner)
   echo "${u:-nobody}"; }
-ensure_local_daemon(){ local sopt=() p cl ru wu
+ensure_local_daemon(){ local sopt=() p cl ru wu dm
   # 验证轮 #3：--dist off 先跑时没有农场状态，原来会起一个默认端口/默认 netname/无 -s 的 daemon，之后农场构建发现它活着就沿用，
   # 却连不上用户的 scheduler。这里优先用 state.env 加载到的值（上面无论 --dist 都会加载），没有农场时按与 sr-farm 完全相同的
   # 公式从 uid/用户名派生，两种模式起出来的 daemon 配置一致；scheduler 常驻本容器，地址就是本机 IP，没起也只是 daemon 后台重试。
@@ -330,6 +335,11 @@ ensure_local_daemon(){ local sopt=() p cl ru wu
       if ! [[ "$cl" == *" -n $NETNAME "* && "$cl" == *" -s $SCHED:$SPORT "* ]]; then
         echo "!! 常驻 iceccd 的配置与本次期望不同（期望 -n $NETNAME -s $SCHED:$SPORT）：$(echo "$cl" | grep -oE -- '-n [^ ]+|-s [^ ]+' | tr '\n' ' ')"
         echo "   它可能是在别的农场配置下启动的；农场构建会连不上 scheduler。空闲时 sr down && sr up 重建容器即可刷新。"
+      fi
+      # 本机并发上限 -m 也核对：容器 CPU 配额或 SR_LOCAL_JOBS 改了，常驻 daemon 不会跟着变（它不随单次构建重启）
+      dm=$(echo "$cl" | grep -oE -- ' -m [0-9]+' | awk '{print $2}' | head -1)
+      if [ -n "$dm" ] && [ "$dm" != "$LOCALCAP" ]; then
+        echo "!! 常驻 iceccd 的本机并发是 -m $dm，本次期望 -m $LOCALCAP（容器 CPU 配额或 SR_LOCAL_JOBS 变了）。空闲时 sr down && sr up 刷新。"
       fi
       # 同样核对降权用户与 env 基目录属主是否一致：不一致的话这个 daemon 一旦重启就再也起不来（见 icecc_user 注释）。
       # 这里只读不改——改了会把目录从正在跑的 daemon 脚下夺走。
