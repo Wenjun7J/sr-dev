@@ -19,6 +19,19 @@ for p in StarRocksFE starrocks_be BrokerBootstrap; do sudo pkill -f $p 2>/dev/nu
 sudo pkill -f 'start_fe.sh|start_be.sh|start_cn.sh|start_broker.sh' 2>/dev/null
 sleep 2
 
+# --- 1.5) 关掉自动升级 ---
+# 农场 worker 是几小时就释放的临时机器，Ubuntu 的 unattended-upgrades 对它们只有坏处：
+#   它由 systemd 定时器以 root 启动（不经 sudo，审计里查不到），装包时带着 systemd 反复 reload，
+#   把 fwupd/packagekit/polkit/rsyslog/chronyd 以及 **iceccd** 一起停了再起。实测 2026-09-17：
+#   某台节点开机后 11:00~11:05 被卷着重启 8 轮，每次重启 iceccd 都以"零历史"重新向 scheduler 注册、
+#   评分清零，于是它永远拿不到编译任务（排队 67 个而它 0/16），只能人工唤醒。
+#   它也正是下面那段"等 dpkg 锁"要等的人——apt-daily-upgrade.timer 上次触发时刻就在装 icecc 的同一秒。
+# 只停定时器 + 关配置，不 kill 正在跑的那次：那可能把 dpkg 打断成半配置状态，下面的重试循环会等它自己结束。
+sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
+printf 'APT::Periodic::Update-Package-Lists "0";\nAPT::Periodic::Unattended-Upgrade "0";\n' \
+  | sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null 2>&1
+AUTOUPG=$(systemctl is-enabled apt-daily-upgrade.timer 2>/dev/null || echo disabled)
+
 # --- 2) 装 icecc（等开机自动升级放开 dpkg 锁）---
 # 云上节点往往也连不上 archive.ubuntu.com，给了镜像源就先换（22.04 sources.list / 24.04 *.sources 都处理）
 if [ -n "$MIRROR" ]; then
@@ -77,9 +90,9 @@ RB_NET=$(sed -n 's/^ICECC_NETNAME="\(.*\)"$/\1/p' /etc/icecc/icecc.conf 2>/dev/n
 RB_JOBS=$(sed -n 's/^ICECC_MAX_JOBS="\(.*\)"$/\1/p' /etc/icecc/icecc.conf 2>/dev/null)   # 回读实际写入的并发数
 OK=$([ "$RB_HOST" = "$SCHED:$SPORT" ] && [ "$RB_NET" = "$NET" ] && echo "写入OK" || echo "写入不符!")
 ICE_STATE=$(systemctl is-active iceccd 2>/dev/null); icecc_ok || ICE_STATE="未装好(dpkg=$(dpkg-query -W -f='${Status}' icecc 2>/dev/null | awk '{print $3}'),见/tmp/apt.log)"
-printf "%-15s role=%-6s 回读sched=%-21s 回读net=%-11s -m%-3s %s iceccd=%-8s sched服务=%-8s SR残留=%s 内存=%sG\n" \
+printf "%-15s role=%-6s 回读sched=%-21s 回读net=%-11s -m%-3s %s iceccd=%-8s sched服务=%-8s 自动升级=%-8s SR残留=%s 内存=%sG\n" \
   "$(hostname -I|awk '{print $1}')" "$ROLE" "${RB_HOST:-空}" "${RB_NET:-空}" "${RB_JOBS:-?}" "$OK" \
-  "$ICE_STATE" "$(systemctl is-active icecc-scheduler)" \
+  "$ICE_STATE" "$(systemctl is-active icecc-scheduler)" "${AUTOUPG:-?}" \
   "$SR" "$(free -g|awk '/Mem:/{print $7}')"
 
 # 退出码要反映真实结果：原来无论装没装上、配置写没写对、服务起没起来，最后一条 printf 成功就返回 0，

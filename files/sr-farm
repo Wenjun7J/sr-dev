@@ -49,6 +49,7 @@ WORKERS=${WORKERS:-4}
 ITYPE=${ITYPE:-8c32g}
 DISK=${DISK:-20}   # 实测 icecc 在 worker 上只占 4KB，不需要数据盘
 IDLE_MIN=${IDLE_MIN:-15}     # resume 实测 29 秒，可以激进休眠
+WARM_EVERY_MIN=${SR_WARM_EVERY_MIN:-5}   # 看门狗最多每 N 分钟自动预热一次（某台真坏了也不会每分钟空转）
 RENEW_MIN=${RENEW_MIN:-15}
 RENEW_H=${RENEW_H:-3}       # renew 语义是「重置为 now+N」而非累加，实测确认
 NUSER=${SR_NODE_USER:-sr}          # 节点 ssh 用户
@@ -127,6 +128,26 @@ warm_abort(){ local rc=$1 p
   rm -rf "${dir:-/nonexistent}" 2>/dev/null
   echo "   预热被中断（农场本身已就绪；稍后可 sr farm rebalance 补预热）" >&2
   exit "$rc"; }
+# 看门狗每分钟顺带查一次：有没有评分为 0 的 worker。有就预热。
+# 为什么必须periodic而不能只靠 init/resume/rebalance：那三处都是「某一时刻做一次」，而 worker 的 daemon
+# 可以在任何时刻重启（2026-09-17 实测：节点的 unattended-upgrades 把 iceccd 连带重启 8 轮，全发生在 rebalance
+# 预热之后），重启即以「零历史」重新注册、评分归零，此后永远拿不到任务。只有周期检查能自愈。
+# 限流 WARM_EVERY_MIN 分钟一次：某台真的坏了也不会每分钟空转一轮预热。
+warm_if_starving(){
+  [ "${FARM_STATUS:-}" = running ] || return 0
+  local now last cs ip sp need=0
+  now=$(date +%s); last=$(cat "$FARM/.last-warm" 2>/dev/null); last=${last//[!0-9]/}
+  [ $(( now - ${last:-0} )) -ge $(( WARM_EVERY_MIN * 60 )) ] || return 0
+  cs=$(sched_q listcs 2>/dev/null); [ -n "$cs" ] || return 0
+  for ip in ${NODES:-}; do
+    sp=$(printf '%s\n' "$cs" | sed -nE "s/^ [^ ]+ \(${ip//./\\.}:[0-9]+\).*speed=([0-9.]+).*/\1/p" | head -1)
+    case "${sp:-}" in 0|0.0|0.00) need=1; break;; esac    # 没注册（取不到）不算，那是另一回事
+  done
+  [ "$need" = 1 ] || return 0
+  echo "$now" > "$FARM/.last-warm"
+  echo "$(date '+%F %T') 发现评分为 0 的 worker，自动预热" >>"$LOGF"
+  warm_workers >>"$LOGF" 2>&1; }
+
 warm_workers(){
   command -v icecc >/dev/null 2>&1 || return 0
   local envf="" gxx="" gccdir gh dir src cs ip name sp i n=0 fail="" deadline got want rem alive=0 q st pids=() p
@@ -452,7 +473,7 @@ _watchdog)
     for _ in $(seq 1 $((RENEW_MIN))); do
       sleep 60
       [ -f "$STATE" ] || exit 0
-      [ "${FARM_STATUS:-}" = running ] && sched_ensure
+      [ "${FARM_STATUS:-}" = running ] && { sched_ensure; warm_if_starving; }
     done
   done ;;
 *) cat <<U
