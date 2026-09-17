@@ -19,14 +19,17 @@ FARM_STATE=${FARM_STATE:-/farm/state.env}
 LOCK=""   # 源码树定下来之后才能算，见下
 
 BT=Release ; DIST=auto ; JAVAEXT=1 ; CLEAN=0 ; GEN=ninja ; JLOCAL=16 ; JSET=0 ; VERBOSE=0 ; CACHE=1
+BTSET=0 ; RUN=0 ; BSCRIPT=build.sh   # BTSET：类型是否显式指定（单测默认 ASAN）；BSCRIPT：驱动上游哪个脚本
 # LOCALCAP（常驻 iceccd 的本机并发上限）挪到读完站点配置之后再算，见下面的 SRCONF 处：
 # 在这里算的话，srdev.conf 里的 SR_LOCAL_JOBS 永远不生效，配置模板里那个旋钮等于死的（codex r8#5）。
-TARGET=all  # be | fe | all（默认 all：BE+FE；只编一个用 --be / --fe）
+TARGET=all  # be | fe | all | ut（默认 all：BE+FE；只编一个用 --be / --fe；--ut 编 BE 单测，走上游 run-be-ut.sh）
 usage(){ cat <<'U'
 用法: sr-build [源码目录] [选项] [-- 透传给 build.sh 的参数]
   不给源码目录就从当前目录上溯找 StarRocks 根
   --be | --fe | --all            编译目标（默认 all=BE+FE；FE 走原生 maven，不经农场/ccache）
-  --debug | --release | --asan   构建类型（默认 release；debug/asan 需显式指定，仅对 be 生效）
+  --ut                           编 BE 单测（run-be-ut.sh，产物在 ut_build_<类型>/test/），同样走农场+ccache；默认只编不跑
+  --run                          与 --ut 搭配：编完接着跑单测；-- 后面的参数透传给 run-be-ut.sh（--test X / --gtest_filter / --module）
+  --debug | --release | --asan   构建类型（默认 release，单测默认 asan；仅对 be/ut 生效）
   --dist auto|on|off             是否用编译农场（默认 auto）
   --no-java-ext                  跳过 java-extensions（默认构建，仅约 6 秒）
   --clean                        清空该类型的构建树后重建
@@ -58,8 +61,8 @@ W
 }
 PASS=(); SRARG=""
 while [ $# -gt 0 ]; do case "$1" in
-  --be) TARGET=be; shift;; --fe) TARGET=fe; shift;; --all) TARGET=all; shift;;
-  --debug) BT=Debug; shift;; --release) BT=Release; shift;; --asan) BT=ASAN; shift;;
+  --be) TARGET=be; shift;; --fe) TARGET=fe; shift;; --all) TARGET=all; shift;; --ut) TARGET=ut; shift;; --run) RUN=1; shift;;
+  --debug) BT=Debug; BTSET=1; shift;; --release) BT=Release; BTSET=1; shift;; --asan) BT=ASAN; BTSET=1; shift;;
   --dist) DIST=$2; shift 2;; --no-java-ext) JAVAEXT=0; shift;;
   --clean) CLEAN=1; shift;; --make) GEN=make; shift;; --no-ccache) CACHE=0; shift;;
   -j) JLOCAL=$2; JSET=1; shift 2;; --why) why; exit 0;; -h|--help) usage; exit 0;;
@@ -79,6 +82,14 @@ else
                        echo "   进到某个 worktree 再跑，或者显式指定：sr build /path/to/starrocks [选项]"; exit 1; }
 fi
 
+# BE 单测走上游 run-be-ut.sh：它和 build.sh 一样认 $CCACHE（当 CMAKE_CXX_COMPILER_LAUNCHER）、CMAKE_BUILD_PREFIX、BUILD_TYPE、
+# STARROCKS_GCC_HOME、-j，所以下面整套农场/ccache/依赖挂载机制原样适用，只是构建树叫 ut_build_<类型>、边数翻倍（src+test）。
+# 它没有"只编不跑"的开关，但 --dry-run 正好是"全部编完、把要跑的测试打印出来但不执行"——我们拿它当只编。
+if [ "$TARGET" = ut ]; then
+  BSCRIPT=run-be-ut.sh
+  [ -f "$SR/$BSCRIPT" ] || { echo "!! $SR 里没有 run-be-ut.sh，编不了 BE 单测"; exit 1; }
+  [ $BTSET = 1 ] || BT=ASAN     # 跟上游 run-be-ut.sh 的默认（ASAN）；BE 主程序默认仍是 Release
+elif [ $RUN = 1 ]; then echo "!! --run 只能和 --ut 搭配（编完单测接着跑）"; exit 1; fi
 LOCK=/farm/sr-build.$(printf %s "$SR" | md5sum | cut -c1-12).lock
 command -v flock >/dev/null && exec 9>$LOCK && flock -n 9 || {
   echo "!! 这棵源码树已有构建在进行：$SR"
@@ -90,14 +101,14 @@ printf '%s\n' "$SR" > "$LOCK.tree" 2>/dev/null; chmod 666 "$LOCK.tree" 2>/dev/nu
 export STARROCKS_HOME=$SR
 # 隔离构建树，避免和原生 be/build_* 打架。但老分支的 build.sh 不认这个变量——
 # 认不认要看它自己，猜错会导致头部显示的构建树是假的、edges() 数不到边、--clean 删错目录。
-if grep -q CMAKE_BUILD_PREFIX "$SR/build.sh" 2>/dev/null; then
+if grep -q CMAKE_BUILD_PREFIX "$SR/$BSCRIPT" 2>/dev/null; then
   # review extra#5：Ninja 与 Make 不能共用一个 CMake 构建目录（换生成器 CMake 拒绝配置）。新分支认 CMAKE_BUILD_PREFIX，
   # 就按生成器给不同前缀，各自一份互不撞；build.sh 在前缀下仍按 build_$BT 建目录，所以 TREE 仍能算准。
   export CMAKE_BUILD_PREFIX=$SR/be/nj; [ "$GEN" = make ] && export CMAKE_BUILD_PREFIX=$SR/be/nj-make
   TREE_BASE=$CMAKE_BUILD_PREFIX
 else
   TREE_BASE=$SR/be                          # 老分支：只能用它原生的位置，生成器无法隔离（见下面的冲突检测）
-  TREE_NOTE="  (该分支 build.sh 不支持 CMAKE_BUILD_PREFIX，用原生位置)"
+  TREE_NOTE="  (该分支 $BSCRIPT 不支持 CMAKE_BUILD_PREFIX，用原生位置)"
 fi
 # build.sh 把 $CCACHE 当 CMAKE_CXX_COMPILER_LAUNCHER。
 # 用 ccache 当 launcher、靠 CCACHE_PREFIX 转发给 icecc —— 这样缓存和分布式能同时生效。
@@ -176,6 +187,7 @@ TREE=$TREE_BASE/build_$BT
 # 依赖戳/探针/清理判断全落到错目录（codex r8#6）。
 GCOV=0; for a in ${PASS[@]+"${PASS[@]}"}; do case "$a" in --with-gcov) GCOV=1;; --without-gcov) GCOV=0;; esac; done
 [ "$GCOV" = 1 ] && TREE=${TREE}_gcov
+[ "$TARGET" = ut ] && TREE=$TREE_BASE/ut_build_$BT   # run-be-ut.sh 固定用 ut_build_<类型>，gcov 也不加后缀
 # 老分支无法按生成器隔离目录：已有 CMakeCache 记的是另一种生成器时，CMake 会拒绝配置，提前识别并要求 --clean（review extra#5）
 if [ "$TARGET" != fe ] && [ "$TREE_BASE" = "$SR/be" ] && [ -f "$TREE/CMakeCache.txt" ] && [ $CLEAN = 0 ]; then
   PREVGEN=$(sed -n 's/^CMAKE_GENERATOR:[A-Z]*=//p' "$TREE/CMakeCache.txt" | head -1)
@@ -427,6 +439,11 @@ case $TARGET in
   be)  ARGS=(--be -j "$J") ;;
   fe)  ARGS=(--fe -j "$J") ;;
   all) ARGS=(--be --fe -j "$J") ;;
+  # 单测：--dry-run = 全部编完但不执行测试（上游没有单独的只编开关）。--run 时第二阶段再调一次不带 --dry-run 去跑。
+  # --without-debug-symbol-split：上游每次调用都无条件对 test/starrocks_test 做 objcopy 拆分调试符号，二进制没重新链接时
+  # 再拆一次会用已剥离的文件覆盖上一次完整的 .debuginfo（ASAN 报告就没有文件:行号了）。我们要调它两次、用户也会反复跑，
+  # 所以拆分收回来自己做（见下面 split_fresh：只拆本次真的重新链接出来的）。
+  ut)  ARGS=(-j "$J" --dry-run --without-debug-symbol-split) ;;
 esac
 [ "$TARGET" != fe ] && [ $JAVAEXT = 0 ] && ARGS+=(--without-java-ext)
 # --clean 只传给 build.sh，由它删自己真正在用的目录。此处不再 rm 我们猜的 $TREE：
@@ -436,7 +453,8 @@ esac
 [ ${#PASS[@]} -gt 0 ] && ARGS+=("${PASS[@]}")
 
 echo "=========================================================="
-echo " 目标: $TARGET$([ "$TARGET" = fe ] && echo "   (maven，农场/ccache 不参与)")"
+echo " 目标: $TARGET$([ "$TARGET" = fe ] && echo "   (maven，农场/ccache 不参与)")$([ "$TARGET" = ut ] && echo "   (BE 单测，run-be-ut.sh；$([ $RUN = 1 ] && echo 编完接着跑 || echo 只编不跑))")"
+[ "$TARGET" = ut ] && [ $CLEAN = 1 ] && echo " 注意: run-be-ut.sh --clean 除了删 $TREE，还会删 $SR/be/output/（上游行为，BE 主程序产物也没了）"
 [ "$TARGET" != fe ] && echo " 类型: $BT      生成器: $GEN      并发: -j$J"
 echo " 模式: $FARM_NOTE"
 [ -n "${SR_DRYRUN:-}" ] && { echo " (SR_DRYRUN=1：决策已打印，到此为止不编译)"; exit 0; }   # 测试钩子：验证农场/交互决策
@@ -508,10 +526,10 @@ run_build(){ local i
   # 只关 fd 8（农场锁），**保留 fd 9**：构建包装是有限生命周期，让它继承源码树锁，驱动被 SIGKILL 时仍在跑的构建才继续持锁，
   # 同树第二个构建拿不到锁（codex 验证轮 #1：原来连 9 也关了，驱动一死锁就放，会并发写 gensrc）。常驻 daemon 才关 9。
   # 握手 fail closed（验证轮 #2）：wrapper 30s 内没收到 ACK 就退出不开工；父 30s 内没拿到合法 pgid 就杀掉 wrapper，本次判失败。
-  setsid --wait bash -c 'hs=$1; sr=$2; outf=$3; shift 3; echo $$ > "$hs.pgid"
+  setsid --wait bash -c 'hs=$1; sr=$2; outf=$3; bs=$4; shift 4; echo $$ > "$hs.pgid"
       for i in $(seq 1 300); do [ -f "$hs.ack" ] && break; sleep 0.1; done
       [ -f "$hs.ack" ] || { echo "!! 构建包装 30s 未收到驱动确认，不开工" >&2; exit 250; }
-      cd "$sr" && ( ./build.sh "$@" ) 2>&1 | tee -a "$outf"; exit "${PIPESTATUS[0]}"' _ "$HS" "$SR" "$OUTF" "$@" 8>&- &
+      cd "$sr" && ( "./$bs" "$@" ) 2>&1 | tee -a "$outf"; exit "${PIPESTATUS[0]}"' _ "$HS" "$SR" "$OUTF" "$BSCRIPT" "$@" 8>&- &
   BPID=$!
   for i in $(seq 1 300); do [ -s "$HS.pgid" ] && break; sleep 0.1; done
   BPGID=$(cat "$HS.pgid" 2>/dev/null)
@@ -595,7 +613,7 @@ if [ $RC -ne 0 ] && { [ "${OOM1:-0}" -gt "${OOM0:-0}" ] || [ "${KILLED:-0}" -gt 
     RARGS+=("$a")
   done
   RARGS+=(-j "$RETRY")
-  echo "   重试: ./build.sh ${RARGS[*]}" | tee -a "$OUTF"
+  echo "   重试: ./$BSCRIPT ${RARGS[*]}" | tee -a "$OUTF"
   run_build "${RARGS[@]}"   # 输出追加进同一份日志；复用同一包装，进程组/取消语义与首次一致（review r7#7）
   E=$(date +%s)
   fi
@@ -624,8 +642,9 @@ printf "\n== 结束 rc=%d 用时 %dm%02ds ==\n" $RC $(( (E-S)/60 )) $(( (E-S)%60
 HIT1=$(ccache -s 2>/dev/null | awk -F'[ /]+' '/^ *Hits:/{print $3; exit}'); HIT1=${HIT1:-0}
 CALL1=$(ccache -s 2>/dev/null | awk -F'[ /]+' '/^Cacheable calls:/{print $3; exit}'); CALL1=${CALL1:-0}
 MODE_SHORT=本地; case "$FARM_NOTE" in 分布式*) MODE_SHORT=分布式;; esac
+[ "$TARGET" = ut ] && MODE_SHORT="UT$MODE_SHORT"   # history 里能一眼分出单测构建
 mkdir -p /farm/logs 2>/dev/null
-LOGF=/farm/logs/$(date +%Y%m%d-%H%M%S)-$(basename "$SR")-${BT}.log
+LOGF=/farm/logs/$(date +%Y%m%d-%H%M%S)-$(basename "$SR")-$([ "$TARGET" = ut ] && echo ut_)${BT}.log
 cp "$OUTF" "$LOGF" 2>/dev/null; chmod 666 "$LOGF" 2>/dev/null; ln -sfn "$LOGF" /tmp/sr-build-last.out; rm -f "$OUTF"
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
   "$(date '+%m-%d %H:%M:%S')" "${SR_USER:-?}" "$(basename "$SR")@${SR_BRANCH:-?}" "${SR_VER:-?}/${SR_TPDIGEST:-?}" \
@@ -669,6 +688,61 @@ if [ $RC -eq 0 ]; then
     fi
   fi
   [ "$TARGET" = fe ] && exit $RC
+  if [ "$TARGET" = ut ]; then
+    UTB=$TREE/test
+    echo " 单测产物: $UTB"
+    # 拆分调试符号只做在本次重新链接出来的二进制上（mtime 不早于开工、且还没有 debuglink）。
+    # 用户显式传了 --without-debug-symbol-split 就完全不拆。pipefail 下不能 `readelf | grep -q`（SIGPIPE 141 恒为假，踩过）。
+    NOSPLIT=0; case " ${PASS[*]:-} " in *" --without-debug-symbol-split "*) NOSPLIT=1;; esac
+    split_fresh(){ local b=$1 d
+      [ -f "$b" ] || return 0
+      [ "$(stat -c %Y "$b" 2>/dev/null || echo 0)" -ge "$S" ] || return 0
+      [ -n "$(readelf -S "$b" 2>/dev/null | grep -F .gnu_debuglink)" ] && return 0
+      d=$b.debuginfo
+      if objcopy --only-keep-debug "$b" "$d" && strip --strip-debug "$b" && objcopy --add-gnu-debuglink="$d" "$b"; then
+        echo "   已拆分调试符号: $(basename "$b") -> $(basename "$d")"
+      else echo "   !! 拆分 $(basename "$b") 的调试符号失败，二进制保持原样（带完整符号，只是加载慢些）"; rm -f "$d"; fi; }
+    for tb in starrocks_test starrocks_dw_test; do
+      B=$UTB/$tb; [ -f "$B" ] || continue
+      [ $NOSPLIT = 0 ] && split_fresh "$B"
+      AGE=$(( $(date +%s) - $(stat -c %Y "$B") ))
+      printf "   %-46s %s  (%s)\n" "test/$tb" "$(du -h "$B"|cut -f1)" "$([ $AGE -le $((E-S+120)) ] && echo 本次生成 || echo "未更新，仍是 $((AGE/60)) 分钟前那份")"
+    done
+    [ -f "$UTB/starrocks_test" ] || echo "   !! 没找到 test/starrocks_test"
+    # 各模块独立的 *test 二进制（与上游 starrocks_collect_test_binaries 同一口径）
+    NT=$(find "$UTB" -type f -perm -111 -name '*test' 2>/dev/null | grep -v -e starrocks_test -e starrocks_dw_test -e bench_test -e builtin_functions_fuzzy_test | wc -l)
+    [ "$NT" -gt 0 ] && echo "   另有 $NT 个模块独立测试二进制"
+    if [ $RUN = 0 ]; then
+      echo ""
+      echo " 跑单测: sr ut                         全部"
+      echo "         sr ut -- --test CompactionUtilsTest      某个测试（前缀匹配）"
+      echo "         sr ut -- --gtest_filter 'A*:B*'          gtest 过滤表达式"
+      echo "         sr ut -- --module storage                某个模块的独立二进制"
+      echo "   (别直接跑 ./run-be-ut.sh：它会用另一套 launcher/构建目录重新 configure，等于从头本地全编一遍)"
+      exit $RC
+    fi
+    # ---- 第二阶段：跑测试。再调一次 run-be-ut.sh，不带 --dry-run / --clean，-j 用本地值（ninja 此时应无事可做）。
+    # 其余参数（尤其影响 configure 的 --with-gcov/--enable-shared-data 之类）必须与第一阶段完全一致，否则 CMake 重新配置、全量重编。
+    # 环境（CCACHE/CMAKE_BUILD_PREFIX/BUILD_TYPE/STARROCKS_GCC_HOME）本来就是同一个进程的，天然一致。
+    # 不经 run_build 包装、不再采样心跳：测试可能跑一小时，农场该按空闲休眠，别被心跳钉着醒一小时。源码树锁保持持有——
+    # 测试跑着的时候另一个构建来替换二进制是坏事。Ctrl+C 走前台进程组直达测试进程，本驱动的 trap 随后收尾。
+    RARGS=(); skip=0
+    for a in "${ARGS[@]}"; do
+      [ $skip = 1 ] && { skip=0; continue; }
+      case "$a" in -j) skip=1; continue;; -j[0-9]*|--clean|--dry-run) continue;; esac
+      RARGS+=("$a")
+    done
+    RARGS+=(-j "$JLOCAL")
+    UTLOG=${LOGF%.log}.ut.log
+    echo ""
+    echo "== 开始跑单测: ./run-be-ut.sh ${RARGS[*]}"
+    echo "   (它会先再过一遍 maven/gensrc/cmake，ninja 应无事可做，约 1 分钟后进入测试；输出同时记到 $UTLOG)"
+    US=$(date +%s)
+    ( cd "$SR" && ./run-be-ut.sh "${RARGS[@]}" ) 2>&1 | tee "$UTLOG"; URC=${PIPESTATUS[0]}
+    chmod 666 "$UTLOG" 2>/dev/null; UE=$(date +%s)
+    printf "\n== 单测结束 rc=%d 用时 %dm%02ds  日志 %s ==\n" "$URC" $(( (UE-US)/60 )) $(( (UE-US)%60 )) "$UTLOG"
+    exit $URC
+  fi
   OUT=$SR/output/be
   BIN=$OUT/lib/starrocks_be
   echo " BE 产物: $OUT"
