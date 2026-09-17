@@ -19,6 +19,7 @@ SR_NODE_USER=sr                    # 节点上的 ssh 用户
 SR_NODE_PASSWORD=                  # 节点初始密码，仅首次铺 ssh 密钥用；之后全走专用密钥 ~/farm/ssh/id_farm
 WORKERS=5                          # 申请的机器总数（全部当 worker；平台自带的 1 台 FE 也算在内，写 5 就开 5 台）
 #SR_LOCAL_JOBS=8                   # 常驻本机 iceccd 的并发上限（默认=容器 CPU 配额；全局、只在 daemon 启动时生效）。单次构建限本机内存请用 sr build -j N（总并发上限）
+#SR_FE_HEAP=2g                     # sr deploy 起的 FE 堆上限（默认 2g；上游模板 8g 会和编译抢容器内存）
 ITYPE=8c32g                        # 节点规格（平台侧的名字）
 #SR_NODE_JOBS=                     # 每台 worker 的编译并发（icecc -m，也决定总 -j=台数×此值+本地）。
                                    # 留空=按节点实际 CPU 核数自动定；内存受限时压低（8c16g 编 ASAN 每槽~2G，

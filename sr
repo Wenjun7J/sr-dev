@@ -238,7 +238,7 @@ versions)
   farm {init|status|usage [--watch [秒]]|rebalance|resume|suspend|down}
   tp                 列出已拉下来的各版本依赖（全机共享目录）
   deploy [选项]      在项目下执行：用该项目的产物部署/替换唯一一套单节点集群（FE+BE，跑在容器里）
-                     已有集群在跑就先停再换。--status 看状态，--stop 停，--clean-data 连数据一起重建
+                     已有集群在跑就先停再换。--status 看状态，--stop 停，--clean-data 连数据一起重建，--fe-heap 改 FE 堆（默认 2g）
   history [N]        最近 N 次编译概况（默认 20）
   versions           列出 registry 里可用的版本
   shell / down

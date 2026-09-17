@@ -33,6 +33,7 @@ usage(){ cat <<U
   --status                看部署来源、进程与端口
   --clean-data            连 meta 与 storage 一起重建（清空数据！首次部署或元数据坏了才用）
   --no-start              只换产物，不启动
+  --fe-heap <大小>         FE 堆上限，如 2g / 4096m（默认 2g；也可在 srdev.conf 设 SR_FE_HEAP）
 U
 }
 
@@ -40,7 +41,10 @@ log(){ printf '%s\n' "$*"; }
 die(){ printf '!! %s\n' "$*" >&2; exit 1; }
 
 MODE=deploy; WANT_BE=1; WANT_FE=1; CLEAN_DATA=0; NO_START=0
+# FE 堆默认 2g：上游 fe.conf 模板是 -Xmx8192m，那是给生产机的；这套集群和编译一起挤在 24G 的容器里，8G 堆涨满就把编译挤爆
+FE_HEAP=${SR_FE_HEAP:-2g}
 while [ $# -gt 0 ]; do case "$1" in
+  --fe-heap) FE_HEAP=$2; shift 2;;
   --be-only) WANT_FE=0; shift;;
   --fe-only) WANT_BE=0; shift;;
   --stop) MODE=stop; shift;;
@@ -50,6 +54,7 @@ while [ $# -gt 0 ]; do case "$1" in
   -h|--help) usage; exit 0;;
   *) echo "未知参数: $1"; usage; exit 1;;
 esac; done
+[[ "$FE_HEAP" =~ ^[0-9]+[mMgG]$ ]] || die "--fe-heap 要像 2g 或 4096m 这样：$FE_HEAP"
 
 # ---- 进程发现 ----
 # 只认部署目录下的进程：同机其他人（甚至你自己在 ~/example-deploy 手搭的那套）也在跑 starrocks_be，
@@ -150,6 +155,21 @@ write_managed(){ local conf=$1; shift
     echo "# <<< sr-deploy managed"; } >> "$tmp"
   mv -f "$tmp" "$conf" || die "发布 $conf 失败"; }
 
+# FE 堆的落法：fe.conf 由 start_fe.sh 逐行 eval export，后写的覆盖先写的，而 managed 块在文件末尾，
+# 所以在块里再写一遍 JAVA_OPTS 就能覆盖模板那行。以块外现有的 JAVA_OPTS 为底（你手改的其它 -D/-XX 都保留），
+# 只把 -Xmx 换成 $FE_HEAP；没有 -Xmx 就补一个；整份 conf 都没有 JAVA_OPTS 时才自己写一条最小的。
+# 老分支的 JAVA_OPTS_FOR_JDK_* 同样处理（模式 JAVA_OPTS[A-Z_0-9]*）。
+fe_java_opts_lines(){ local conf=$1 heap=$2 line out=0
+  while IFS= read -r line; do
+    out=1
+    if [[ "$line" =~ -Xmx[0-9]+[kKmMgG]? ]]; then line=${line//"${BASH_REMATCH[0]}"/-Xmx$heap}
+    elif [[ "$line" == *\" ]]; then line="${line%\"} -Xmx$heap\""
+    else line="$line -Xmx$heap"; fi
+    printf '%s\n' "$line"
+  done < <(awk '/^# >>> sr-deploy managed/{s=1} !s{print} /^# <<< sr-deploy managed/{s=0}' "$conf" 2>/dev/null \
+           | grep -E '^[[:blank:]]*JAVA_OPTS[A-Z_0-9]*[[:blank:]]*=' | sed 's/^[[:blank:]]*//')
+  [ $out = 1 ] || printf 'JAVA_OPTS="-Xmx%s"\n' "$heap"; }
+
 if [ "$WANT_BE" = 1 ]; then
   log "== 部署 BE"
   mkdir -p "$DEPLOY/be"
@@ -171,10 +191,12 @@ if [ "$WANT_FE" = 1 ]; then
   seed_conf "$FE_SRC/conf" "$DEPLOY/fe/conf"
   [ "$CLEAN_DATA" = 1 ] && rm -rf "$DEPLOY/fe/meta"
   mkdir -p "$DEPLOY/fe/meta" "$DEPLOY/fe/log"
+  mapfile -t FEJ < <(fe_java_opts_lines "$DEPLOY/fe/conf/fe.conf" "$FE_HEAP")   # 必须在 write_managed 改写之前读
   write_managed "$DEPLOY/fe/conf/fe.conf" \
     "http_port = $FE_HTTP" "rpc_port = $FE_RPC" "query_port = $FE_QUERY" "edit_log_port = $FE_EDIT" \
-    "priority_networks = $HOSTIP/32" "meta_dir = $DEPLOY/fe/meta"
-  log "   产物已换 · 元数据保留$([ "$CLEAN_DATA" = 1 ] && echo '（--clean-data：已清空）')"
+    "priority_networks = $HOSTIP/32" "meta_dir = $DEPLOY/fe/meta" \
+    "# FE 堆 -Xmx$FE_HEAP（sr deploy --fe-heap 改）：以块外的 JAVA_OPTS 为底只换 -Xmx，后写的覆盖先写的" "${FEJ[@]}"
+  log "   产物已换 · 元数据保留$([ "$CLEAN_DATA" = 1 ] && echo '（--clean-data：已清空）') · FE 堆 -Xmx$FE_HEAP"
 fi
 
 printf '来源: %s\n提交: %s@%s\n时间: %s\n内容: %s\n' \
