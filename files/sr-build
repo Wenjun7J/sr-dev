@@ -724,8 +724,12 @@ if [ $RC -eq 0 ]; then
       [ "$(stat -c %Y "$b" 2>/dev/null || echo 0)" -ge "$S" ] || return 0
       [ -n "$(readelf -S "$b" 2>/dev/null | grep -F .gnu_debuglink)" ] && return 0
       d=$b.debuginfo
+      # 必须先说一声再动手：ASAN 的测试二进制有 3G+，objcopy 要把 DWARF 整个搬出来，实测一个要 3~5 分钟，
+      # 期间没有任何输出。原来不打这行，用户看到的就是"编完了却不退出"（2026-09-17 现场）。
+      local t0=$(date +%s)
+      echo "   拆分调试符号: $(basename "$b") ($(du -h "$b" | cut -f1))，几分钟，请稍候…"
       if objcopy --only-keep-debug "$b" "$d" && strip --strip-debug "$b" && objcopy --add-gnu-debuglink="$d" "$b"; then
-        echo "   已拆分调试符号: $(basename "$b") -> $(basename "$d")"
+        echo "   已拆分 -> $(basename "$d")（用时 $(( ($(date +%s) - t0) / 60 ))m$(( ($(date +%s) - t0) % 60 ))s）"
       else echo "   !! 拆分 $(basename "$b") 的调试符号失败，二进制保持原样（带完整符号，只是加载慢些）"; rm -f "$d"; fi; }
     for tb in starrocks_test starrocks_dw_test; do
       B=$UTB/$tb; [ -f "$B" ] || continue
@@ -743,7 +747,10 @@ if [ $RC -eq 0 ]; then
       echo "         sr ut -- --test CompactionUtilsTest      某个测试（前缀匹配）"
       echo "         sr ut -- --gtest_filter 'A*:B*'          gtest 过滤表达式"
       echo "         sr ut -- --module storage                某个模块的独立二进制"
-      echo "   (别直接跑 ./run-be-ut.sh：它会用另一套 launcher/构建目录重新 configure，等于从头本地全编一遍)"
+      echo "   (测试二进制不能直接执行：它动态依赖 libjvm.so 和 thirdparty 下的一堆 .so，还要 CLASSPATH、"
+      echo "    UDF_RUNTIME_DIR、ASAN_OPTIONS、conf/be_test.conf 里导出的变量——这些都由 run-be-ut.sh 现场准备。"
+      echo "    直接跑会报 error while loading shared libraries: libjvm.so。也别直接跑 ./run-be-ut.sh：它会用"
+      echo "    另一套 launcher/构建目录重新 configure，等于从头本地全编一遍。)"
       exit $RC
     fi
     # ---- 第二阶段：跑测试。再调一次 run-be-ut.sh，不带 --dry-run / --clean，-j 用本地值（ninja 此时应无事可做）。
