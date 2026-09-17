@@ -742,8 +742,13 @@ if [ $RC -eq 0 ]; then
       d=$b.debuginfo
       # 必须先说一声再动手：ASAN 的测试二进制有 3G+，objcopy 要把 DWARF 整个搬出来，实测一个要 3~5 分钟，
       # 期间没有任何输出。原来不打这行，用户看到的就是"编完了却不退出"（2026-09-17 现场）。
-      local t0=$(date +%s)
-      echo "   拆分调试符号: $(basename "$b") ($(du -h "$b" | cut -f1))，几分钟，请稍候…"
+      local t0=$(date +%s) why="本次重新链接"
+      # 本次没重链却要拆，说明它是历史遗留：链接它的那次构建后来失败了，收尾的拆分根本没跑到。
+      # 这种补拆是一次性的，拆完带上 .gnu_debuglink 就再也不会进来——不说清楚的话，
+      # 一次 10 秒的空构建突然静默几分钟，看着像卡死（2026-09-17 用户反馈）。
+      [ "$(stat -c %Y "$b" 2>/dev/null || echo 0)" -ge "$S" ] || why="此前没拆过（链接它的那次构建多半失败了），补拆一次，之后不再拆"
+      echo "   拆分调试符号: $(basename "$b") ($(du -h "$b" | cut -f1)) —— $why"
+      echo "   需要几分钟，请稍候…"
       if objcopy --only-keep-debug "$b" "$d" && strip --strip-debug "$b" && objcopy --add-gnu-debuglink="$d" "$b"; then
         echo "   已拆分 -> $(basename "$d")（用时 $(( ($(date +%s) - t0) / 60 ))m$(( ($(date +%s) - t0) % 60 ))s）"
       else echo "   !! 拆分 $(basename "$b") 的调试符号失败，二进制保持原样（带完整符号，只是加载慢些）"; rm -f "$d"; fi; }
