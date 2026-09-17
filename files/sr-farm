@@ -322,11 +322,17 @@ usage)
       | awk -v me="$HOSTIP" -v total="$total" '{tag=($2==me)?"(本机)":""; starving=($2!=me && $5+0==0 && total>200); if(starving) tag="<- 从未接到任务(speed=0)"; printf "   %-26s %-15s %-9s %5.1f%% %s %s\n", substr($1,1,26), $2, $3, $4/10, $5, tag; split($3,a,"/"); if($2!=me){cur+=a[1]; cap+=a[2]}; if(starving) idle++} END{printf "   远端合计 %d/%d 槽在用\n", cur, cap; if(idle>0) printf "   !! %d 台 worker 在 scheduler 已派发 %d 个任务后仍 speed=0：它一直没接到任务（多半是 env 缓存空，而 scheduler 有了其它主机的统计就不再试新主机）。\n      修复：sr farm rebalance（重启 scheduler，统计清零后随机分派、顺带给它装 env；进行中的任务会短暂回退本地）\n", idle, total}'
     jobs=$(sched_q listjobs 2>/dev/null | grep -vE '^200|^$'); [ -n "$jobs" ] && { echo "== 正在派发的任务（前 10）"; printf '%s\n' "$jobs" | head -10 | cut -c1-150 | sed 's/^/   /'; }
     echo "== 节点实际负载（ssh 一跳：loadavg 1m/5m · 内存 · 编译进程数）"
+    # 并行 ssh 但按 IP 排序输出：直接在子进程里打印的话，谁先返回谁先出现，每次刷新顺序都不一样，
+    # 盯 --watch 时很难比对。各自写进以 IP 命名的临时文件，全部结束后按 IP 的四段数值排序再打。
+    NLD=$(mktemp -d /tmp/sr-nodeload.XXXXXX)
     for ip in $NODES; do
       ( r=$(timeout 8 ssh -n -i $KEY $SSHO $NUSER@$ip 'printf "%s %s|%s|%s|%s\n" $(cut -d" " -f1,2 /proc/loadavg) "$(free -m | awk "/^Mem:/{print \$3\"/\"\$2\"M\"}")" "$(pgrep -c cc1plus)" "$(nproc)"' 2>/dev/null)
-        [ -n "$r" ] && printf '   %-15s load %-12s mem %-14s cc1plus %-3s /%s 核\n' "$ip" "$(echo "$r"|cut -d'|' -f1)" "$(echo "$r"|cut -d'|' -f2)" "$(echo "$r"|cut -d'|' -f3)" "$(echo "$r"|cut -d'|' -f4)" \
-                  || printf '   %-15s (ssh 不通)\n' "$ip" ) &
+        { [ -n "$r" ] && printf '   %-15s load %-12s mem %-14s cc1plus %-3s /%s 核\n' "$ip" "$(echo "$r"|cut -d'|' -f1)" "$(echo "$r"|cut -d'|' -f2)" "$(echo "$r"|cut -d'|' -f3)" "$(echo "$r"|cut -d'|' -f4)" \
+                    || printf '   %-15s (ssh 不通)\n' "$ip"; } > "$NLD/$ip" ) &
     done; wait
+    # -t. -kN,Nn 四段各按数值排：纯字典序会把 .10 排在 .9 前面
+    for ip in $(printf '%s\n' $NODES | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n); do cat "$NLD/$ip" 2>/dev/null; done
+    rm -rf "$NLD"
     echo "== 本容器"
     u0=$(awk '/^usage_usec/{print $2}' $CG/cpu.stat 2>/dev/null); sleep 1; u1=$(awk '/^usage_usec/{print $2}' $CG/cpu.stat 2>/dev/null)
     cores=$(awk -v a="${u0:-0}" -v b="${u1:-0}" 'BEGIN{printf "%.1f", (b-a)/1000000}')
