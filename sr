@@ -100,6 +100,44 @@ sync_conf(){
   fi
   local tmp; tmp=$(mktemp "$BASE/farm/.srdev.conf.XXXXXX" 2>/dev/null) || return 1
   cp -f "$CONF_FILE" "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$BASE/farm/srdev.conf" || { rm -f "$tmp" 2>/dev/null; return 1; }; }
+# "64g" -> 字节。只认 docker 那几种后缀；给不出数就返回空，调用方跳过比较。
+mem_bytes(){ local v=${1:-} n u; n=${v%[a-zA-Z]}; u=${v#"$n"}
+  case "$n" in ''|*[!0-9]*) return 1;; esac
+  case "$(printf %s "$u" | tr A-Z a-z)" in
+    g) echo $(( n * 1073741824 ));; m) echo $(( n * 1048576 ));; k) echo $(( n * 1024 ));; b|'') echo "$n";; *) return 1;; esac; }
+
+# 改了 srdev.conf 里的 CPUS / MEM 之后不必重建容器：docker update 能热改配额，
+# 实测这一天里从 8c24G 一路改到 16c64G，容器里正在跑的构建和 sr deploy 起的集群都没中断。
+# 所以这里发现"运行中的配额 != 配置"就直接热改，用户只要 sr up（或直接下一次 sr build）。
+# 不走 sr down && sr up 是有原因的：那会连带杀掉 sr deploy 部署的 FE/BE 和别人正在跑的构建。
+# 例外是 iceccd 的 -m：它是启动参数，改不了，只能重启 daemon；空闲时顺手停掉让下次编译重新拉起，
+# 有构建在跑就只提示（sr-build 复用已有 daemon 时也会再提醒一次 -m 不符）。
+resize_if_needed(){
+  local wc wm cc cm
+  case "$CPUS" in ''|*[!0-9]*) return 0;; esac          # 非整数核数（如 1.5）不参与比较，交给重建路径
+  wm=$(mem_bytes "$MEM") || return 0
+  wc=$(( CPUS * 1000000000 ))
+  read -r cc cm < <(docker inspect $NAME --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' 2>/dev/null)
+  [ -n "${cc:-}" ] && [ -n "${cm:-}" ] || return 0
+  [ "$cc" = "$wc" ] && [ "$cm" = "$wm" ] && return 0
+  echo "== 容器配额与 srdev.conf 不符，热更新（不重建容器，不影响在跑的构建和已部署的集群）"
+  [ "$cc" != "$wc" ] && echo "   CPU  $(( cc / 1000000000 )) 核 -> $CPUS 核"
+  [ "$cm" != "$wm" ] && echo "   内存 $(( cm / 1073741824 ))G -> $MEM"
+  if [ -n "$SLICE" ] && command -v systemctl >/dev/null; then
+    sudo -n systemctl set-property --runtime "$SLICE" "CPUQuota=$((CPUS*100))%" \
+      "MemoryMax=$(echo "$MEM" | tr 'gmk' 'GMK')" >/dev/null 2>&1
+  fi
+  docker update --cpus="$CPUS" --memory="$MEM" --memory-swap="$(( wm * 2 ))" $NAME >/dev/null 2>&1 || {
+    echo "   !! docker update 失败，配额未变。空闲时 sr down && sr up 重建容器。"; return 0; }
+  echo "   已生效"
+  [ "$cc" = "$wc" ] && return 0                          # 只改了内存，daemon 不用动
+  if docker exec $NAME sh -c 'pgrep -x ninja >/dev/null 2>&1 || pgrep -x cc1plus >/dev/null 2>&1' 2>/dev/null; then
+    echo "   (有构建在跑，本机 iceccd 仍按旧核数限并发；空闲时 sr down && sr up，或手动重启它)"
+  else
+    docker exec $NAME sh -c 'pkill -x iceccd' >/dev/null 2>&1
+    echo "   本机 iceccd 已停，下次编译按新核数重新拉起"
+  fi; }
+
 ensure_container(){
   # 顺序要紧：先把 farm 目录收紧到 0700 再往里写配置——目录还开放时写固定路径会被预置的符号链接劫持（codex r8#3）。
   # 0700 迁移也必须在 running 短路之前，否则已在跑的老部署永远不会被修；改不动就拒绝，这是提权向量，不能带着跑。
@@ -109,7 +147,7 @@ ensure_container(){
     echo "   (已把 $BASE/farm 收紧为 0700)"
   fi
   sync_conf || { echo "!! 同步站点配置到 $BASE/farm/srdev.conf 失败（磁盘满/不可写？）。继续下去容器会按上一次的旧配置干活，已中止。"; return 1; }
-  running && return 0
+  running && { resize_if_needed; return 0; }
   ensure_image || { echo "!! 镜像构建失败"; return 1; }
   mkdir -p $BASE/ccache $BASE/m2 $BASE/farm $BASE/.tsp $BASE/iceccrun $TPDIR
   # review r7#3(P1)：原来 farm 是 0777 且无 sticky，本机任何用户都能删掉再放一个 state.env，容器 root 会读它 → 提权。
@@ -233,7 +271,8 @@ versions)
 用法: sr [-v <版本>] <子命令>
   首次: cp srdev.conf.example srdev.conf; cp registries.conf.example registries.conf; 然后直接 sr -v main build
 
-  up                 起容器（没镜像会先自动构建；单个容器编所有版本）
+  up                 起容器（没镜像会先自动构建；单个容器编所有版本）。
+                     改完 srdev.conf 里的 CPUS/MEM 后跑一次 sr up 即可热更新配额，不用重建容器
   image              强制重建镜像（改了 Dockerfile 之后用）
   build [目录] [选项] 编译（默认 BE+FE；--be / --fe 单选；--ut 编 BE 单测）。首次会询问依赖版本（或用 -v 指定），之后记住；换版本再 -v
   ut [选项]           编 BE 单测（默认 ASAN，走农场+ccache）并接着跑；sr 不认识的参数原样交给 run-be-ut.sh，
