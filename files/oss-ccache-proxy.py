@@ -88,8 +88,16 @@ def bump(method, ok, nbytes, ms):
         s["ms"] += ms
 
 
+# PUT body 上限。ccache 的对象最大是 PCH 结果，实测约 100MB 量级；256MB 留足余量又不至于让
+# 未授权/畸形请求把容器内存吃光（codex r13#4）。
+MAX_BODY = 256 * 1024 * 1024
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # ccache 默认 keep-alive；Python 会自动应答 Expect: 100-continue
+    # 读超时：没有它，声明了大 Content-Length 却不发数据的连接会把线程永久占住（codex r13#4）。
+    # StreamRequestHandler.setup() 会把它设到 socket 上。
+    timeout = 120
     oss = None
     prefix = ""
     logf = None
@@ -168,9 +176,23 @@ class Handler(BaseHTTPRequestHandler):
         self._forward("HEAD")
 
     def do_PUT(self):
-        n = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(n) if n else b""   # 先读完 body 再鉴权，否则 keep-alive 连接会错位
+        # 先鉴权再读 body：原来为了 keep-alive 不错位而先读完 body，等于让未授权的人按自报 Content-Length
+        # 把任意大小读进内存、或声明大长度后不发数据占住线程（codex r13#4）。
+        # 现在未授权一律 401 并关闭连接——连接关了就不存在"残留 body 被当成下一条请求"的问题。
         if not self._authed():
+            self.close_connection = True
+            return
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            n = -1
+        if n < 0 or n > MAX_BODY:
+            self._reply(413 if n > MAX_BODY else 400, b"bad content-length\n")
+            self.close_connection = True
+            return
+        body = self.rfile.read(n) if n else b""
+        if len(body) != n:                      # 读不满说明连接中断，别把半截对象写进 OSS
+            self.close_connection = True
             return
         self._forward("PUT", body, "application/octet-stream")
 

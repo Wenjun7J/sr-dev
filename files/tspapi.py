@@ -83,8 +83,10 @@ def spec(name):
 def row(name):
     """网页表格里才有到期时间和 22 点清扫开关（API 不返回）"""
     t = _req("/cluster/list/", raw=True)
+    # 只认单元格边界的精确匹配。原来找不到就退回子串 t.find(name)，会命中别的集群名里的子串——
+    # 实测：查询不存在的 alice_farm 会返回 other_alice_farm_backup 那一行的 Running 与到期时间，
+    # 于是 status 显示别人的状态、resume 的平台状态判断也被误导。找不到就当不存在。
     i = t.find(">" + name + "<")
-    if i < 0: i = t.find(name)
     if i < 0: return {}
     s = t.rfind("<tr", 0, i); e = t.find("</tr>", i)
     cells = re.findall(r"<td[^>]*>(.*?)</td>", t[s:e], re.S)
@@ -121,7 +123,12 @@ def create(name, workers, duration=2, itype="8c32g", disk="20"):
          "release_version": "4.1.0", "sr_conf": "daily-release",
          "data_import": "false", "wide_table": "false",
          "replication_num": "3", "data_sets": ""}
-    return _req("/cluster/quick/apply/", d)
+    r = _req("/cluster/quick/apply/", d)
+    # 业务失败必须非零退出（比照 op）：原来只 return，调用方也不看退出码，于是"重名创建失败"会被当成成功，
+    # 随后按名字找 CID 就把已存在的同名集群认领过来，并对它跑 node-setup（会停掉那批机器上的服务）。
+    if not isinstance(r, dict) or r.get("success") is False or r.get("code") not in (None, 0, "0", 200, "200"):
+        sys.exit("TSP 创建集群未成功: %s" % str(r)[:200])
+    return r
 
 def _main():
     a = sys.argv[1:]

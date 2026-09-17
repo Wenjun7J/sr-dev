@@ -98,12 +98,18 @@ dcount(){ local n=0 ip
     [ -n "$(ss -tnH state established "( sport = :$SPORT and dst = $ip )" 2>/dev/null)" ] && n=$((n+1))
   done; echo $n; }
 # 下发节点配置（幂等）。$1=1 表示首次要先铺密钥。node-setup.sh 内部回读文件比对，报"写入OK/不符"
-provision_nodes(){ local first=${1:-0} ip
+# 逐个收集每台的退出码：裸 wait 汇总不了失败，部署全挂也看不出来（codex r13#6）。
+# 仍保留调用方的 worker 连接检查作为第二道——两者互相独立，一个查"部署脚本怎么说"，一个查"实际连上没有"。
+provision_nodes(){ local first=${1:-0} ip p bad="" pids=() ips=()
   for ip in $NODES; do
     ( [ "$first" = 1 ] && sshpass -p "$NODEPW" ssh-copy-id -i $KEY.pub $SSHO $NUSER@$ip >/dev/null 2>&1
-      scp -q -i $KEY $SSHO /usr/local/bin/node-setup.sh $NUSER@$ip:/tmp/ 2>/dev/null
-      ssh -n -i $KEY $SSHO $NUSER@$ip "bash /tmp/node-setup.sh $SCHED worker ${SR_NODE_JOBS:-auto} $NETNAME $SPORT ${SR_APT_MIRROR:-}" 2>/dev/null ) &
-  done; wait; }
+      scp -q -i $KEY $SSHO /usr/local/bin/node-setup.sh $NUSER@$ip:/tmp/ 2>/dev/null || exit 1
+      ssh -n -i $KEY $SSHO $NUSER@$ip "bash /tmp/node-setup.sh $SCHED worker ${SR_NODE_JOBS:-auto} $NETNAME $SPORT ${SR_APT_MIRROR:-}" ) &
+    pids+=($!); ips+=("$ip")
+  done
+  for i in "${!pids[@]}"; do wait "${pids[$i]}" || bad="$bad ${ips[$i]}"; done
+  [ -n "$bad" ] && echo "   !! 这些节点部署未成功：$bad（上面每行的 iceccd= 字段能看出卡在哪）"
+  [ -z "$bad" ]; }
 wait_workers(){ local i; for i in $(seq 1 "$1"); do sleep 2; [ "$(dcount)" -ge "$WORKERS" ] && return 0; done; return 1; }
 # scheduler 的文本管理口（端口 = SPORT+1，icecream 自带）。原来只在 usage 分支里定义，预热也要用，提到全局。
 sched_q(){ exec 3<>/dev/tcp/127.0.0.1/$((SPORT+1)) 2>/dev/null || return 1; printf '%s\nquit\n' "$1" >&3; timeout 2 cat <&3; exec 3>&-; }
@@ -214,11 +220,21 @@ init)
   sched_ensure
   # review extra2#3：WORKERS 就是要申请的机器总数（用户按它估费用）。平台每个集群必带 1 台 FE，全部当 worker，
   # 所以 BE 台数 = WORKERS-1，总数正好 = WORKERS（原来传 WORKERS 台 BE 再加 1 台 FE，写 5 实际开 6 台）。
+  # 绝不认领同名集群：创建前先查平台上有没有同名的。有就停下——本地没有 state.env 时 sr farm down 也释放不了它，
+  # 只能人工到平台核对（codex r13#2：原来 create 业务失败不报错、随后按名字找 CID，会把已存在的同名集群当成本次创建结果，
+  # 并对它跑 node-setup 停掉那批机器上的服务）。
+  PRE=$($API cid "$NAME" 2>/dev/null)
+  [ -n "$PRE" ] && { echo "!! 平台上已存在同名集群 $NAME (id=$PRE)，不会认领它。"
+                     echo "   若它是你的旧农场：先 sr farm down 释放；若本地已无记录，请到平台上核对后手工释放再重试。"; exit 1; }
   echo "== 申请集群 $NAME（$WORKERS × $ITYPE，磁盘 ${DISK}G，全部当 worker；scheduler 跑在本容器）…"
-  $API create "$NAME" "$(( WORKERS - 1 ))" 2 "$ITYPE" "$DISK"
+  $API create "$NAME" "$(( WORKERS - 1 ))" 2 "$ITYPE" "$DISK" || { echo "!! 创建集群失败，已中止（未产生任何云资源）"; exit 1; }
   echo "== 等待 RUNNING（约 5-6 分钟）…"
   for i in $(seq 1 45); do sleep 20; S=$($API row "$NAME"|cut -d'|' -f1); [ "$S" = Running ] && break; done
-  ID=$($API cid "$NAME"); [ -n "$ID" ] || { echo "创建失败"; exit 1; }
+  # 走到这里才按名字取 CID 是安全的：创建前已确认无同名集群、且创建确实成功。取不到就停，不猜、不部署
+  # （codex r14：并发/重名场景下按名字回退可能认领到别人那一套，让另一套资源悬空）。
+  ID=$($API cid "$NAME")
+  [ -n "$ID" ] || { echo "!! 创建后仍取不到集群 $NAME 的 id。可能创建未真正生效，也可能平台延迟。"
+                    echo "   已中止，不做任何部署。请到平台核对是否有新建出来的 $NAME，有就手工释放后重试。"; exit 1; }
   # review#3：拿到 CID 立刻落一份最小 state.env（initializing）。之后取节点/部署/连接检查任一步失败或被 Ctrl+C，
   # sr farm down 都能凭这份 CID 回收集群；成功后下面再覆盖成完整记录。
   printf 'CLUSTER=%s\nCID=%s\nSCHED=%s\nNETNAME=%s\nSPORT=%s\nDPORT=%s\nFARM_STATUS=initializing\n' \

@@ -81,3 +81,16 @@ printf "%-15s role=%-6s 回读sched=%-21s 回读net=%-11s -m%-3s %s iceccd=%-8s 
   "$(hostname -I|awk '{print $1}')" "$ROLE" "${RB_HOST:-空}" "${RB_NET:-空}" "${RB_JOBS:-?}" "$OK" \
   "$ICE_STATE" "$(systemctl is-active icecc-scheduler)" \
   "$SR" "$(free -g|awk '/Mem:/{print $7}')"
+
+# 退出码要反映真实结果：原来无论装没装上、配置写没写对、服务起没起来，最后一条 printf 成功就返回 0，
+# 调用方只能靠事后的 worker 连接检查兜底（codex r13#6）。这里把三件事都并进退出码。
+RC=0
+[ "$APT_OK" = 1 ] || { echo "   !! icecc 未安装成功（见 /tmp/apt.log）" >&2; RC=1; }
+[ "$OK" = "写入OK" ] || { echo "   !! /etc/icecc/icecc.conf 回读与期望不符" >&2; RC=1; }
+[ -n "$RB_JOBS" ] || { echo "   !! 回读不到 ICECC_MAX_JOBS" >&2; RC=1; }
+if [ "$ROLE" = sched ]; then
+  [ "$(systemctl is-active icecc-scheduler)" = active ] || { echo "   !! icecc-scheduler 未处于 active" >&2; RC=1; }
+else
+  [ "$(systemctl is-active iceccd)" = active ] || { echo "   !! iceccd 未处于 active" >&2; RC=1; }
+fi
+exit $RC

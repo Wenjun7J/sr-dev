@@ -321,7 +321,14 @@ U
       ensure_tp "$REF" "$DG" "$PBASE" >/dev/null || exit 1
       GMAJ=$(cat "$TPDIR/$DG/.gccmajor" 2>/dev/null | cut -d. -f1); GMAJ=${GMAJ:-14}
       GHOME=/opt/gcc$GMAJ
-      [ "$GMAJ" = 14 ] && GHOME=$(docker exec $NAME bash -c 'ls -d /opt/gcc-toolset-14 2>/dev/null || echo /opt/gcc13')
+      # gcc14 在镜像里叫 /opt/gcc-toolset-14。找不到就报错，绝不静默退回 gcc13：
+      # 依赖要 14 却拿 13 去编，农场的工具链配对检查只会确认"13 和 13 的包配对"，发现不了已经偏离依赖要求（codex r13#3）。
+      [ "$GMAJ" = 14 ] && GHOME=$(docker exec $NAME sh -c 'ls -d /opt/gcc-toolset-14 2>/dev/null' || true)
+      [ -n "$GHOME" ] || { echo "!! 镜像里找不到 gcc$GMAJ（依赖 $DGS 要求 gcc$GMAJ）。请 sr image 重建镜像后重试。"; exit 1; }
+      # 再核一遍实际版本：目录名对不代表里面的 gcc 就是那个大版本
+      GREAL=$(docker exec $NAME sh -c "$GHOME/bin/gcc -dumpversion 2>/dev/null" | cut -d. -f1)
+      [ "$GREAL" = "$GMAJ" ] || { echo "!! $GHOME 里的 gcc 实际是 ${GREAL:-未知} 版，依赖 $DGS 要求 $GMAJ 版。"
+                                  echo "   用错编译器的产物 ABI 不一致且不会报错，已中止。请 sr image 重建镜像。"; exit 1; }
       [ -n "$KEY" ] && { mkdir -p "$PDIR" 2>/dev/null; echo "$SPEC $DG" > "$PDIR/$KEY"; }
       # 每次编译进自己的私有 mount namespace，把该版本的依赖 bind 到规范路径 /var/local/thirdparty。
       # 不能改路径挂成 /tp/<digest> 直接用：CMakeCache 会把首次 configure 找到的 FILEPATH 缓存成
