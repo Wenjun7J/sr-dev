@@ -146,6 +146,30 @@ tree_root(){ local d
   d=$(pwd -P); while [ "$d" != / ]; do
     [ -f "$d/build.sh" ] && [ -d "$d/be/src" ] && { echo "$d"; return 0; }; d=$(dirname "$d"); done; return 1; }
 
+# bind mount 钉的是目录本身（dentry），不是路径字符串。宿主机上把 ~/ccache 改名成 ~/ccache-old，
+# 容器里的 /ccache 还是同一个目录——inode 不变，缓存照常命中，人以为"清空了缓存"其实一点没清
+# （目录改名后，容器仍指向原目录，docker inspect 中记录的路径也不会随之更新）。
+# 和当初 srdev.conf 单文件挂载被 inode 钉住是同一类坑，只是这次是目录。
+# 换挂载点只能重建容器，所以这里只做检测：比对容器里各挂载点的 inode 与宿主机上"现在"该路径的 inode。
+check_mounts(){
+  local out hi ci p hp
+  out=$(docker exec $NAME sh -c 'for d in /ccache /farm /tp; do printf "%s %s\n" "$d" "$(stat -c %i "$d" 2>/dev/null || echo -)"; done' 2>/dev/null) || return 0
+  while read -r p ci; do
+    case "$p" in /ccache) hp=$BASE/ccache;; /farm) hp=$BASE/farm;; /tp) hp=$TPDIR;; *) continue;; esac
+    [ "$ci" = - ] && continue
+    hi=$(stat -c %i "$hp" 2>/dev/null)
+    if [ -z "$hi" ]; then
+      echo "!! 容器里的 $p 挂的目录，在宿主机上已经不在 $hp 了（被改名或删了？）。"
+      echo "   bind mount 钉的是目录本身，容器仍在用原来那个目录；要换请 sr down && sr up 重建容器。"
+    elif [ "$hi" != "$ci" ]; then
+      echo "!! 容器里的 $p 不是现在的 $hp（inode $ci vs $hi）——多半是把原目录改名后又新建了一个同名的。"
+      echo "   容器还在用创建时那个目录；要让新目录生效，空闲时 sr down && sr up 重建容器。"
+    fi
+  done <<EOF
+$out
+EOF
+}
+
 ensure_container(){
   # 顺序要紧：先把 farm 目录收紧到 0700 再往里写配置——目录还开放时写固定路径会被预置的符号链接劫持（codex r8#3）。
   # 0700 迁移也必须在 running 短路之前，否则已在跑的老部署永远不会被修；改不动就拒绝，这是提权向量，不能带着跑。
@@ -155,7 +179,7 @@ ensure_container(){
     echo "   (已把 $BASE/farm 收紧为 0700)"
   fi
   sync_conf || { echo "!! 同步站点配置到 $BASE/farm/srdev.conf 失败（磁盘满/不可写？）。继续下去容器会按上一次的旧配置干活，已中止。"; return 1; }
-  running && { resize_if_needed; return 0; }
+  running && { resize_if_needed; check_mounts; return 0; }
   ensure_image || { echo "!! 镜像构建失败"; return 1; }
   mkdir -p $BASE/ccache $BASE/m2 $BASE/farm $BASE/.tsp $BASE/iceccrun $TPDIR
   # review r7#3(P1)：原来 farm 是 0777 且无 sticky，本机任何用户都能删掉再放一个 state.env，容器 root 会读它 → 提权。
