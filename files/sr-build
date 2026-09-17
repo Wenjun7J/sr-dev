@@ -33,7 +33,9 @@ usage(){ cat <<'U'
   不给源码目录就从当前目录上溯找 StarRocks 根
   --be | --fe | --all            编译目标（默认 all=BE+FE；FE 走原生 maven，不经农场/ccache）
   --ut                           编 BE 单测（run-be-ut.sh，产物在 ut_build_<类型>/test/），同样走农场+ccache；默认只编不跑
-  --run                          与 --ut 搭配：编完接着跑单测；-- 后面的参数透传给 run-be-ut.sh（--test X / --gtest_filter / --module）
+  --run                          与 --ut 搭配：编完接着跑单测
+                                 有 --ut 时，sr 不认识的参数会原样交给 run-be-ut.sh，不用写 --：
+                                   sr ut --test CompactionUtilsTest / --gtest_filter 'A*:B*' / --module storage
   --debug | --release | --asan   构建类型（默认 release，单测默认 asan；仅对 be/ut 生效）
   --dist auto|on|off             是否用编译农场（默认 auto）
   --no-java-ext                  跳过 java-extensions（默认构建；跳过则产物缺 jni-packages 等 jar）
@@ -65,6 +67,11 @@ why(){ cat <<'W'
 W
 }
 PASS=(); SRARG=""
+# 单测模式（sr ut / sr build --ut）下，sr 不认识的参数一律原样交给 run-be-ut.sh，不用再写 --。
+# 先扫一遍再进解析循环：--ut 不一定出现在最前面，而 `--test CompactionUtilsTest` 这种带值参数，
+# 值本身是个裸词，必须在看到它之前就知道该透传（否则会被当成"源码目录"或报未知参数）。
+# 遇到显式的 -- 就停止扫描：-- 后面的东西本来就会整体透传。
+UTMODE=0; for a in "$@"; do [ "$a" = -- ] && break; [ "$a" = --ut ] && { UTMODE=1; break; }; done
 while [ $# -gt 0 ]; do case "$1" in
   --be) TARGET=be; shift;; --fe) TARGET=fe; shift;; --all) TARGET=all; shift;; --ut) TARGET=ut; shift;; --run) RUN=1; shift;;
   --debug) BT=Debug; BTSET=1; shift;; --release) BT=Release; BTSET=1; shift;; --asan) BT=ASAN; BTSET=1; shift;;
@@ -74,7 +81,10 @@ while [ $# -gt 0 ]; do case "$1" in
   -v) VERBOSE=1; shift;;
   --) shift; PASS+=("$@"); break;;
   # 目录型位置参数 = 指定源码树，放前放后都行
-  *) if [ -d "$1" ] && [ -z "$SRARG" ]; then SRARG=$(cd "$1" && pwd -P); shift   # pwd -P：软链接与真路径同一把锁（review latest#1）
+  # 单测模式下要更严（必须真的是源码根），否则 `--module storage` 的值恰好和某个子目录同名时会被当成源码树
+  *) if [ -z "$SRARG" ] && [ -d "$1" ] && { [ "$UTMODE" = 0 ] || [ -f "$1/build.sh" ]; }; then
+       SRARG=$(cd "$1" && pwd -P); shift   # pwd -P：软链接与真路径同一把锁（review latest#1）
+     elif [ "$UTMODE" = 1 ]; then PASS+=("$1"); shift
      else echo "未知参数: $1"; usage; exit 1; fi;;
 esac; done
 
@@ -743,10 +753,10 @@ if [ $RC -eq 0 ]; then
     [ "$NT" -gt 0 ] && echo "   另有 $NT 个模块独立测试二进制"
     if [ $RUN = 0 ]; then
       echo ""
-      echo " 跑单测: sr ut                         全部"
-      echo "         sr ut -- --test CompactionUtilsTest      某个测试（前缀匹配）"
-      echo "         sr ut -- --gtest_filter 'A*:B*'          gtest 过滤表达式"
-      echo "         sr ut -- --module storage                某个模块的独立二进制"
+      echo " 跑单测: sr ut                                    全部"
+      echo "         sr ut --test CompactionUtilsTest         某个测试（前缀匹配）"
+      echo "         sr ut --gtest_filter 'A*:B*'             gtest 过滤表达式"
+      echo "         sr ut --module storage                   某个模块的独立二进制"
       echo "   (测试二进制不能直接执行：它动态依赖 libjvm.so 和 thirdparty 下的一堆 .so，还要 CLASSPATH、"
       echo "    UDF_RUNTIME_DIR、ASAN_OPTIONS、conf/be_test.conf 里导出的变量——这些都由 run-be-ut.sh 现场准备。"
       echo "    直接跑会报 error while loading shared libraries: libjvm.so。也别直接跑 ./run-be-ut.sh：它会用"
