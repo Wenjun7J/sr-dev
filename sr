@@ -236,6 +236,8 @@ versions)
   build [目录] [选项] 编译（默认 BE+FE；--be / --fe 单选）。首次会询问依赖版本（或用 -v 指定），之后记住；换版本再 -v
   farm {init|status|usage [--watch [秒]]|rebalance|resume|suspend|down}
   tp                 列出已拉下来的各版本依赖（全机共享目录）
+  deploy [选项]      在项目下执行：用该项目的产物部署/替换唯一一套单节点集群（FE+BE，跑在容器里）
+                     已有集群在跑就先停再换。--status 看状态，--stop 停，--clean-data 连数据一起重建
   history [N]        最近 N 次编译概况（默认 20）
   versions           列出 registry 里可用的版本
   shell / down
@@ -343,6 +345,8 @@ U
         "${XENV[@]}" "${TTY[@]}" $NAME unshare -m --propagation private sh -c \
           'mount --bind "/tp/$0/installed" /var/local/thirdparty/installed && exec sr-build "$@"' "$DG" "$@" ;;
     farm) docker exec "${TTY[@]}" $NAME sr-farm "$@" ;;
+    # deploy 必须带 -w "$PWD"：它要从当前目录上溯找源码树，用这棵树的产物部署（通用转发分支不带工作目录）
+    deploy) docker exec -w "$PWD" -e SR_UID="$(id -u)" "${TTY[@]}" $NAME sr-deploy "$@" ;;
     *) if docker exec $NAME sh -c "command -v \"\$1\"" _ "$sub" >/dev/null 2>&1; then
          docker exec "${TTY[@]}" $NAME "$sub" "$@"
        else echo "未知子命令: $sub"; exec "$0" --help; fi ;;

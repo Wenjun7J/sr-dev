@@ -18,6 +18,8 @@ RUN if [ -n "$APT_MIRROR" ]; then \
     apt-get update -qq \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
       ninja-build ccache icecc libiberty-dev binutils-dev procps bc util-linux sshpass iproute2 \
+      mariadb-client \
+
       gcc-11 g++-11 gcc-12 g++-12 gcc-13 g++-13 \
  && rm -rf /var/lib/apt/lists/*
 
@@ -42,6 +44,7 @@ COPY files/ccache-pch  /usr/local/bin/ccache-pch
 COPY files/oss-ccache-proxy.py /usr/local/bin/oss-ccache-proxy.py
 COPY files/sr-build    /usr/local/bin/sr-build
 COPY files/sr-farm     /usr/local/bin/sr-farm
+COPY files/sr-deploy   /usr/local/bin/sr-deploy
 COPY files/tspapi.py   /usr/local/bin/tspapi.py
 COPY files/node-setup.sh /usr/local/bin/node-setup.sh
 
@@ -62,5 +65,5 @@ RUN set -e; TS=$(ls -d /opt/gcc-toolset-* 2>/dev/null); [ -n "$TS" ] || { echo "
 RUN mkdir -p /var/local/thirdparty/installed
 RUN mkdir -p /opt/noninja && printf '#!/bin/sh\nexit 1\n' > /opt/noninja/ninja && chmod +x /opt/noninja/ninja
 RUN git config --global --add safe.directory '*'
-RUN chmod +x /usr/local/bin/cxxlaunch /usr/local/bin/ccache-pch /usr/local/bin/oss-ccache-proxy.py /usr/local/bin/sr-build /usr/local/bin/sr-farm \
+RUN chmod +x /usr/local/bin/cxxlaunch /usr/local/bin/ccache-pch /usr/local/bin/oss-ccache-proxy.py /usr/local/bin/sr-build /usr/local/bin/sr-farm /usr/local/bin/sr-deploy \
              /usr/local/bin/tspapi.py /usr/local/bin/node-setup.sh

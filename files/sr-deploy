@@ -1,0 +1,230 @@
+#!/bin/bash
+# sr-deploy —— 把当前源码树的编译产物部署成一套可跑的单节点集群（跑在容器内）。
+#
+# 设计约束（用户定的）：
+#   1) 全机只允许一套集群，部署目录固定（不按源码树分），换棵树部署就是把这一套换成那棵树的产物；
+#   2) 必须在源码树里执行，用的就是这棵树 output/ 下的产物；
+#   3) 已经有集群在跑，就停掉、换成当前产物、再起来。
+#
+# 为什么不需要 docker cp：容器是 -v $HOME:$HOME 起的，部署目录在 $HOME 之下，宿主机和容器看到的是同一份。
+# 所以"部署到容器里"= 写进这个共享目录 + 在容器内起进程，进程的 cgroup/限额都归容器管。
+set -uo pipefail
+
+SRCONF=/farm/srdev.conf; [ -f "$SRCONF" ] || SRCONF=/etc/srdev.conf
+[ -f "$SRCONF" ] && { set -a; . "$SRCONF"; set +a; }
+
+DEPLOY=${SR_DEPLOY_DIR:-/farm/deploy}
+UIDN=${SR_UID:-$(id -u 2>/dev/null || echo 0)}
+HOSTIP=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+# 端口：按 uid 取一段连续 8 个，避开已用的几段——农场 scheduler 187xx、本机 iceccd 197xx、ccache 代理 207xx，
+# 以及用户自己手搭测试环境常用的 188xx。共享机上每人一段，互不串台。
+PBASE=$(( 21000 + (UIDN % 300) * 10 ))
+FE_HTTP=$PBASE FE_RPC=$((PBASE+1)) FE_QUERY=$((PBASE+2)) FE_EDIT=$((PBASE+3))
+BE_PORT=$((PBASE+4)) BE_HTTP=$((PBASE+5)) BE_HB=$((PBASE+6)) BE_BRPC=$((PBASE+7))
+
+usage(){ cat <<U
+用法: sr-deploy [选项]      （必须在 StarRocks 源码树里执行）
+  用当前源码树 output/ 下的产物，部署/替换唯一的一套单节点集群（FE+BE）。
+  已有集群在跑时：先停、换产物、再起。数据（meta/storage）默认保留。
+
+  --be-only | --fe-only   只部署一侧（默认两侧都部署；哪侧没产物就跳过并提示）
+  --stop                  只停集群，不部署
+  --status                看部署来源、进程与端口
+  --clean-data            连 meta 与 storage 一起重建（清空数据！首次部署或元数据坏了才用）
+  --no-start              只换产物，不启动
+U
+}
+
+log(){ printf '%s\n' "$*"; }
+die(){ printf '!! %s\n' "$*" >&2; exit 1; }
+
+MODE=deploy; WANT_BE=1; WANT_FE=1; CLEAN_DATA=0; NO_START=0
+while [ $# -gt 0 ]; do case "$1" in
+  --be-only) WANT_FE=0; shift;;
+  --fe-only) WANT_BE=0; shift;;
+  --stop) MODE=stop; shift;;
+  --status) MODE=status; shift;;
+  --clean-data) CLEAN_DATA=1; shift;;
+  --no-start) NO_START=1; shift;;
+  -h|--help) usage; exit 0;;
+  *) echo "未知参数: $1"; usage; exit 1;;
+esac; done
+
+# ---- 进程发现 ----
+# 只认部署目录下的进程：同机其他人（甚至你自己在 ~/example-deploy 手搭的那套）也在跑 starrocks_be，
+# 按名字杀会误伤别人。用 /proc/<pid>/exe 的真实路径前缀判断，精确到本部署。
+#
+# 先说清楚不需要担心什么：sr-deploy 只在容器里跑，而容器是独立 PID 命名空间（实测：宿主机 37 个 starrocks_be，
+# 容器内可见 0 个）。所以宿主机上别人的、以及你自己 ~/example-deploy 那套，压根不在可见范围内，不存在被误杀的问题。
+#
+# exe 路径判据防的是另一件事：**你自己在这个容器里手工起的另一套 BE**（sr shell 进来从某棵树的 output 直接跑，
+# 或跑 $HOME 下别的部署——它们在容器里都可见）。那时容器内 pgrep -x starrocks_be 会匹配到它，按名字停就误伤了。
+#
+# FE 侧跳过自己和父进程则与命名空间无关，是必需的：`pgrep -f` 匹配整条命令行，会匹配到命令行里恰好带主类名的
+# shell（同类坑踩过：pkill -f 把自己的会话杀了）。所以逐个读 /proc/<pid>/cmdline 复核。
+pids_of(){ local which=$1 p exe cl
+  case "$which" in
+    be) for p in $(pgrep -x starrocks_be 2>/dev/null); do
+          exe=$(readlink -f /proc/$p/exe 2>/dev/null)          # 僵尸进程读不到 exe，自然不会匹配
+          [ "$exe" = "$DEPLOY/be/lib/starrocks_be" ] && echo "$p"
+        done;;
+    fe) for p in $(pgrep -f 'com\.starrocks\.StarRocksFE' 2>/dev/null); do
+          [ "$p" = "$$" ] && continue; [ "$p" = "${PPID:-0}" ] && continue
+          cl=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)
+          case "$cl" in *com.starrocks.StarRocksFE*) ;; *) continue;; esac   # 必须真是 FE 主类
+          case "$cl" in *"$DEPLOY/fe"*) echo "$p";; esac                     # 且属于本部署
+        done;;
+  esac; }
+
+stop_one(){ local which=$1 name=$2 p i
+  local ps; ps=$(pids_of "$which"); [ -n "$ps" ] || { log "   $name: 未在运行"; return 0; }
+  log "   停 $name (pid $(echo $ps | tr '\n' ' '))…"
+  kill $ps 2>/dev/null
+  for i in $(seq 1 60); do sleep 1; [ -z "$(pids_of "$which")" ] && { log "   $name 已停"; return 0; }; done
+  log "   $name 60s 未退出，强制 KILL"; kill -9 $(pids_of "$which") 2>/dev/null; sleep 1
+  [ -z "$(pids_of "$which")" ] || die "$name 停不掉，请手工处理后重试"; }
+
+stop_all(){ log "== 停止现有集群"; stop_one fe FE; stop_one be BE; }
+
+# ---- 源码树 ----
+find_root(){ local d; d=$(pwd -P)
+  while [ "$d" != / ]; do
+    [ -f "$d/build.sh" ] && [ -d "$d/be/src" ] && { echo "$d"; return 0; }
+    d=$(dirname "$d")
+  done; return 1; }
+
+if [ "$MODE" = status ]; then
+  log "== 部署目录 $DEPLOY"
+  [ -f "$DEPLOY/.source" ] && sed 's/^/   /' "$DEPLOY/.source" || log "   （还没部署过）"
+  log "== 进程"
+  bp=$(pids_of be); fp=$(pids_of fe)
+  log "   BE: ${bp:-未运行}"
+  log "   FE: ${fp:-未运行}"
+  log "== 端口（按 uid $UIDN 派生）"
+  log "   FE  http=$FE_HTTP  rpc=$FE_RPC  query=$FE_QUERY  edit_log=$FE_EDIT"
+  log "   BE  be=$BE_PORT  http=$BE_HTTP  heartbeat=$BE_HB  brpc=$BE_BRPC"
+  [ -n "$fp" ] && log "== 连接: mysql -h $HOSTIP -P $FE_QUERY -u root"
+  exit 0
+fi
+
+if [ "$MODE" = stop ]; then stop_all; exit 0; fi
+
+SR=$(find_root) || die "当前目录 $(pwd -P) 不在任何 StarRocks 源码树里。sr deploy 必须在项目下执行（用该项目的产物部署）。"
+[ -d "$SR/output" ] || die "$SR/output 不存在——先 sr build 编出产物再部署。"
+
+BE_SRC=$SR/output/be; FE_SRC=$SR/output/fe
+[ "$WANT_BE" = 1 ] && [ ! -x "$BE_SRC/lib/starrocks_be" ] && { log "   （跳过 BE：$BE_SRC/lib/starrocks_be 不存在，这棵树还没编出 BE）"; WANT_BE=0; }
+[ "$WANT_FE" = 1 ] && [ -z "$(ls "$FE_SRC/lib" 2>/dev/null)" ] && { log "   （跳过 FE：$FE_SRC/lib 是空的，这棵树还没编出 FE）"; WANT_FE=0; }
+[ "$WANT_BE" = 0 ] && [ "$WANT_FE" = 0 ] && die "BE 和 FE 都没有可部署的产物。"
+
+log "=========================================================="
+log " 源码树: $SR"
+log " 提交:   $(git -C "$SR" rev-parse --short HEAD 2>/dev/null || echo ?)@$(git -C "$SR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo ?)"
+log " 部署到: $DEPLOY   (宿主机同路径可见)"
+log " 内容:   $([ "$WANT_BE" = 1 ] && echo -n BE\ )$([ "$WANT_FE" = 1 ] && echo -n FE)"
+log "=========================================================="
+
+stop_all
+
+# ---- 同步产物 ----
+# 容器里没有 rsync。服务已停，直接换目录最省事也最干净：先拷到 .new，成功了再原子换掉，
+# 半路失败不会留下一个拼凑出来的 lib（踩过太多次"半成品被当成成品"）。
+sync_dir(){ local src=$1 dst=$2
+  [ -d "$src" ] || return 0
+  rm -rf "$dst.new" 2>/dev/null
+  cp -a "$src" "$dst.new" || { rm -rf "$dst.new"; die "拷贝 $src 失败"; }
+  rm -rf "$dst" 2>/dev/null; mv "$dst.new" "$dst" || die "发布 $dst 失败"; }
+
+# conf 只在首次铺模板，之后保留你的改动；端口/路径这些由下面的 managed 块每次重写
+seed_conf(){ local src=$1 dst=$2
+  [ -d "$dst" ] && return 0
+  cp -a "$src" "$dst" 2>/dev/null || die "初始化 $dst 失败"; }
+
+# 每次部署重写 managed 块：块外是你的手改，块内归 sr-deploy 管。没有 include 机制，只能这样划界。
+write_managed(){ local conf=$1; shift
+  local tmp; tmp=$(mktemp "$conf.XXXXXX") || die "写 $conf 失败"
+  awk '/^# >>> sr-deploy managed/{s=1} !s{print} /^# <<< sr-deploy managed/{s=0}' "$conf" > "$tmp"
+  { echo "# >>> sr-deploy managed（每次 sr deploy 重写，勿在块内手改；块外的改动会保留）"
+    printf '%s\n' "$@"
+    echo "# <<< sr-deploy managed"; } >> "$tmp"
+  mv -f "$tmp" "$conf" || die "发布 $conf 失败"; }
+
+if [ "$WANT_BE" = 1 ]; then
+  log "== 部署 BE"
+  mkdir -p "$DEPLOY/be"
+  for d in lib bin www; do sync_dir "$BE_SRC/$d" "$DEPLOY/be/$d"; done
+  seed_conf "$BE_SRC/conf" "$DEPLOY/be/conf"
+  [ "$CLEAN_DATA" = 1 ] && rm -rf "$DEPLOY/be/storage"
+  mkdir -p "$DEPLOY/be/storage" "$DEPLOY/be/log"
+  write_managed "$DEPLOY/be/conf/be.conf" \
+    "be_port = $BE_PORT" "be_http_port = $BE_HTTP" "heartbeat_service_port = $BE_HB" "brpc_port = $BE_BRPC" \
+    "priority_networks = $HOSTIP/32" \
+    "storage_root_path = $DEPLOY/be/storage" "sys_log_dir = $DEPLOY/be/log"
+  log "   产物已换 · 数据目录保留$([ "$CLEAN_DATA" = 1 ] && echo '（--clean-data：已清空）')"
+fi
+
+if [ "$WANT_FE" = 1 ]; then
+  log "== 部署 FE"
+  mkdir -p "$DEPLOY/fe"
+  for d in lib bin webroot spark-dpp hive-udf; do sync_dir "$FE_SRC/$d" "$DEPLOY/fe/$d"; done
+  seed_conf "$FE_SRC/conf" "$DEPLOY/fe/conf"
+  [ "$CLEAN_DATA" = 1 ] && rm -rf "$DEPLOY/fe/meta"
+  mkdir -p "$DEPLOY/fe/meta" "$DEPLOY/fe/log"
+  write_managed "$DEPLOY/fe/conf/fe.conf" \
+    "http_port = $FE_HTTP" "rpc_port = $FE_RPC" "query_port = $FE_QUERY" "edit_log_port = $FE_EDIT" \
+    "priority_networks = $HOSTIP/32" "meta_dir = $DEPLOY/fe/meta"
+  log "   产物已换 · 元数据保留$([ "$CLEAN_DATA" = 1 ] && echo '（--clean-data：已清空）')"
+fi
+
+printf '来源: %s\n提交: %s@%s\n时间: %s\n内容: %s\n' \
+  "$SR" "$(git -C "$SR" rev-parse --short HEAD 2>/dev/null || echo ?)" \
+  "$(git -C "$SR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo ?)" "$(date '+%F %T')" \
+  "$([ "$WANT_BE" = 1 ] && echo -n 'BE ')$([ "$WANT_FE" = 1 ] && echo -n FE)" > "$DEPLOY/.source"
+
+[ "$NO_START" = 1 ] && { log "== --no-start：产物已就位，未启动"; exit 0; }
+
+# ---- 启动 ----
+# start_be.sh / start_fe.sh 自己从脚本位置推导 STARROCKS_HOME，所以拷到部署目录后直接跑即可。
+log "== 启动"
+if [ "$WANT_BE" = 1 ]; then
+  ( cd "$DEPLOY/be" && ./bin/start_be.sh --daemon ) >/dev/null 2>&1
+  for i in $(seq 1 30); do sleep 1; [ -n "$(pids_of be)" ] && break; done
+  [ -n "$(pids_of be)" ] && log "   BE 已起 (pid $(pids_of be | tr '\n' ' '))" \
+    || { log "   !! BE 没起来，看 $DEPLOY/be/log/be.out"; tail -5 "$DEPLOY/be/log/be.out" 2>/dev/null | sed 's/^/      /'; }
+fi
+if [ "$WANT_FE" = 1 ]; then
+  ( cd "$DEPLOY/fe" && ./bin/start_fe.sh --daemon ) >/dev/null 2>&1
+  for i in $(seq 1 60); do sleep 1; [ -n "$(pids_of fe)" ] && break; done
+  [ -n "$(pids_of fe)" ] && log "   FE 已起 (pid $(pids_of fe | tr '\n' ' '))" \
+    || { log "   !! FE 没起来，看 $DEPLOY/fe/log/fe.out"; tail -5 "$DEPLOY/fe/log/fe.out" 2>/dev/null | sed 's/^/      /'; }
+fi
+
+# ---- 首次：把 BE 注册进 FE ----
+# StarRocks 不会自动发现 BE，必须 ALTER SYSTEM ADD BACKEND 一次。已注册过就跳过（重复执行会报错但无害）。
+if [ "$WANT_FE" = 1 ] && [ "$WANT_BE" = 1 ] && [ -n "$(pids_of fe)" ]; then
+  if command -v mysql >/dev/null 2>&1; then
+    log "== 等 FE 可连接…"
+    ok=0; for i in $(seq 1 60); do
+      mysql -h "$HOSTIP" -P "$FE_QUERY" -u root -N -e "select 1" >/dev/null 2>&1 && { ok=1; break; }; sleep 2; done
+    if [ "$ok" = 1 ]; then
+      if mysql -h "$HOSTIP" -P "$FE_QUERY" -u root -N -e "show backends" 2>/dev/null | grep -q "$HOSTIP"; then
+        log "   BE 已在集群里，无需注册"
+      else
+        log "   注册 BE 到 FE…"
+        mysql -h "$HOSTIP" -P "$FE_QUERY" -u root -e "ALTER SYSTEM ADD BACKEND \"$HOSTIP:$BE_HB\"" 2>&1 | sed 's/^/      /'
+      fi
+    else
+      log "   !! 60s 内连不上 FE，跳过 BE 注册（看 $DEPLOY/fe/log/fe.log）"
+    fi
+  else
+    log "   （容器里没有 mysql 客户端，跳过 BE 注册。sr image 重建镜像后会自带；也可手工执行：）"
+    log "   mysql -h $HOSTIP -P $FE_QUERY -u root -e 'ALTER SYSTEM ADD BACKEND \"$HOSTIP:$BE_HB\"'"
+  fi
+fi
+
+log "=========================================================="
+log " 完成。连接: mysql -h $HOSTIP -P $FE_QUERY -u root"
+log " FE http $FE_HTTP · BE http $BE_HTTP · 日志 $DEPLOY/{fe,be}/log"
+log " 查看: sr deploy --status    停止: sr deploy --stop"
+log "=========================================================="
