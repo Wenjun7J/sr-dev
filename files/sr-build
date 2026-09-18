@@ -32,12 +32,13 @@ usage(){ cat <<'U'
 用法: sr-build [源码目录] [选项] [-- 透传给 build.sh 的参数]
   不给源码目录就从当前目录上溯找 StarRocks 根
   --be | --fe | --all            编译目标（默认 all=BE+FE；FE 走原生 maven，不经农场/ccache）
-  --ut                           编 BE 单测（run-be-ut.sh，产物在 ut_build_<类型>/test/），同样走农场+ccache；默认只编不跑
+  --be-ut                        编 BE 单测（run-be-ut.sh，产物在 ut_build_<类型>/test/），同样走农场+ccache；默认只编不跑
+                                 （--ut 是它的旧名，仍可用）
   --fe-ut                        跑 FE 单测（run-fe-ut.sh，纯 maven，农场和 ccache 都不参与）
                                  不认识的参数同样原样透传：sr fe-ut --test com.starrocks.utframe.Demo
-  --run                          与 --ut 搭配：编完接着跑单测
-                                 有 --ut 时，sr 不认识的参数会原样交给 run-be-ut.sh，不用写 --：
-                                   sr ut --test CompactionUtilsTest / --gtest_filter 'A*:B*' / --module storage
+  --run                          与 --be-ut 搭配：编完接着跑单测
+                                 带 --be-ut / --fe-ut 时，sr 不认识的参数会原样交给上游脚本，不用写 --：
+                                   sr be-ut --test CompactionUtilsTest / --gtest_filter 'A*:B*' / --module storage
   --debug | --release | --asan   构建类型（默认 release，单测默认 asan；仅对 be/ut 生效）
   --dist auto|on|off             是否用编译农场（默认 auto）
   --no-java-ext                  跳过 java-extensions（默认构建；跳过则产物缺 jni-packages 等 jar）
@@ -74,9 +75,11 @@ PASS=(); SRARG=""
 # 值本身是个裸词，必须在看到它之前就知道该透传（否则会被当成"源码目录"或报未知参数）。
 # 遇到显式的 -- 就停止扫描：-- 后面的东西本来就会整体透传。
 UTMODE=0; for a in "$@"; do [ "$a" = -- ] && break
-  { [ "$a" = --ut ] || [ "$a" = --fe-ut ]; } && { UTMODE=1; break; }; done
+  case "$a" in --ut|--be-ut|--fe-ut) UTMODE=1; break;; esac; done
 while [ $# -gt 0 ]; do case "$1" in
-  --be) TARGET=be; shift;; --fe) TARGET=fe; shift;; --all) TARGET=all; shift;; --ut) TARGET=ut; shift;; --run) RUN=1; shift;;
+  --be) TARGET=be; shift;; --fe) TARGET=fe; shift;; --all) TARGET=all; shift;;
+  --be-ut|--ut) TARGET=ut; shift;;   # --ut 是旧名，留着不破坏已有用法
+  --run) RUN=1; shift;;
   # FE 单测：TARGET 保持 fe，好让下面所有"跳过 BE 相关"的分支原样生效（农场、ccache、PCH、构建树、依赖戳全不碰）；
   # 只把驱动的脚本换成 run-fe-ut.sh，并按 FEUT 走自己的参数与收尾。
   --fe-ut) TARGET=fe; FEUT=1; shift;;
@@ -109,12 +112,12 @@ fi
 if [ "$FEUT" = 1 ]; then
   BSCRIPT=run-fe-ut.sh
   [ -f "$SR/$BSCRIPT" ] || { echo "!! $SR 里没有 run-fe-ut.sh，跑不了 FE 单测"; exit 1; }
-  [ "$RUN" = 1 ] && { echo "!! --run 只对 --ut 有意义（BE 单测编完接着跑）；FE 单测本来就是直接跑"; exit 1; }
+  [ "$RUN" = 1 ] && { echo "!! --run 只对 --be-ut 有意义（BE 单测编完接着跑）；FE 单测本来就是直接跑"; exit 1; }
 elif [ "$TARGET" = ut ]; then
   BSCRIPT=run-be-ut.sh
   [ -f "$SR/$BSCRIPT" ] || { echo "!! $SR 里没有 run-be-ut.sh，编不了 BE 单测"; exit 1; }
   [ $BTSET = 1 ] || BT=ASAN     # 跟上游 run-be-ut.sh 的默认（ASAN）；BE 主程序默认仍是 Release
-elif [ $RUN = 1 ]; then echo "!! --run 只能和 --ut 搭配（编完单测接着跑）"; exit 1; fi
+elif [ $RUN = 1 ]; then echo "!! --run 只能和 --be-ut 搭配（编完单测接着跑）"; exit 1; fi
 LOCK=/farm/sr-build.$(printf %s "$SR" | md5sum | cut -c1-12).lock
 command -v flock >/dev/null && exec 9>$LOCK && flock -n 9 || {
   echo "!! 这棵源码树已有构建在进行：$SR"
@@ -503,7 +506,7 @@ esac
 [ ${#PASS[@]} -gt 0 ] && ARGS+=("${PASS[@]}")
 
 echo "=========================================================="
-echo " 目标: $([ $FEUT = 1 ] && echo "fe-ut   (FE 单测，run-fe-ut.sh；纯 maven，农场/ccache 不参与)" || echo "$TARGET$([ "$TARGET" = fe ] && echo "   (maven，农场/ccache 不参与)")$([ "$TARGET" = ut ] && echo "   (BE 单测，run-be-ut.sh；$([ $RUN = 1 ] && echo 编完接着跑 || echo 只编不跑))")")"
+echo " 目标: $([ $FEUT = 1 ] && echo "fe-ut   (FE 单测，run-fe-ut.sh；纯 maven，农场/ccache 不参与)" || echo "$([ "$TARGET" = ut ] && echo be || echo "$TARGET")$([ "$TARGET" = fe ] && echo "   (maven，农场/ccache 不参与)")$([ "$TARGET" = ut ] && echo "-ut   (BE 单测，run-be-ut.sh；$([ $RUN = 1 ] && echo 编完接着跑 || echo 只编不跑))")")"
 [ $FEUT = 1 ] && echo " 并发: maven -T $([ "$JSET" = 1 ] && echo "$JLOCAL（-j 指定）" || echo "4（run-fe-ut.sh 默认；-j N 可改）")"
 [ "$TARGET" = ut ] && [ $CLEAN = 1 ] && echo " 注意: run-be-ut.sh --clean 除了删 $TREE，还会删 $SR/be/output/（上游行为，BE 主程序产物也没了）"
 [ "$TARGET" != fe ] && echo " 类型: $BT      生成器: $GEN      并发: -j$J      链接池: $LINKJ 个 ld 同时跑（按 ${MEMGB}G 内存 / 每个链接约 ${LKMEM}G 估算；SR_LINK_JOBS 可改）"
@@ -784,10 +787,10 @@ if [ $RC -eq 0 ]; then
     [ "$NT" -gt 0 ] && echo "   另有 $NT 个模块独立测试二进制"
     if [ $RUN = 0 ]; then
       echo ""
-      echo " 跑单测: sr ut                                    全部"
-      echo "         sr ut --test CompactionUtilsTest         某个测试（前缀匹配）"
-      echo "         sr ut --gtest_filter 'A*:B*'             gtest 过滤表达式"
-      echo "         sr ut --module storage                   某个模块的独立二进制"
+      echo " 跑单测: sr be-ut                                 全部"
+      echo "         sr be-ut --test CompactionUtilsTest      某个测试（前缀匹配）"
+      echo "         sr be-ut --gtest_filter 'A*:B*'          gtest 过滤表达式"
+      echo "         sr be-ut --module storage                某个模块的独立二进制"
       echo "   (测试二进制不能直接执行：它动态依赖 libjvm.so 和 thirdparty 下的一堆 .so，还要 CLASSPATH、"
       echo "    UDF_RUNTIME_DIR、ASAN_OPTIONS、conf/be_test.conf 里导出的变量——这些都由 run-be-ut.sh 现场准备。"
       echo "    直接跑会报 error while loading shared libraries: libjvm.so。也别直接跑 ./run-be-ut.sh：它会用"

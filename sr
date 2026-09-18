@@ -373,9 +373,10 @@ versions)
   up                 起容器（没镜像会先自动构建；单个容器编所有版本）。
                      改完 srdev.conf 里的 CPUS/MEM 后跑一次 sr up 即可热更新配额，不用重建容器
   image              强制重建镜像（改了 Dockerfile 之后用）
-  build [目录] [选项] 编译（默认 BE+FE；--be / --fe 单选；--ut 编 BE 单测）。首次会询问依赖版本（或用 -v 指定），之后记住；换版本再 -v
-  ut [选项]           编 BE 单测（默认 ASAN，走农场+ccache）并接着跑；sr 不认识的参数原样交给 run-be-ut.sh，
-                     如 sr ut --test CompactionUtilsTest / sr ut --gtest_filter 'A*:B*' / sr ut --module storage
+  build [目录] [选项] 编译（默认 BE+FE；--be / --fe 单选）。首次会询问依赖版本（或用 -v 指定），之后记住；换版本再 -v
+  be-ut [选项]        编 BE 单测（默认 ASAN，走农场+ccache）并接着跑；sr 不认识的参数原样交给 run-be-ut.sh，
+                     如 sr be-ut --test CompactionUtilsTest / --gtest_filter 'A*:B*' / --module storage
+                     （只编不跑: sr build --be-ut；ut 是 be-ut 的旧名，仍可用）
   fe-ut [选项]        跑 FE 单测（run-fe-ut.sh，纯 maven，农场/ccache 不参与）；参数同样原样透传，
                      如 sr fe-ut --test com.starrocks.utframe.Demo / --filter X / --dry-run / -j 8
   farm {init|status|usage [--watch [秒]]|rebalance|resume|suspend|down}
@@ -396,7 +397,8 @@ U
   ensure_container || exit 1
   sub=$1; shift
   # sr ut [选项] [-- run-be-ut.sh 参数] = sr build --ut --run …：编 BE 单测（走农场）然后接着跑。只编不跑用 sr build --ut
-  [ "$sub" = ut ] && { sub=build; set -- --ut --run "$@"; }
+  # sr be-ut [选项] = sr build --be-ut --run …；ut 是 be-ut 的旧名，留着不破坏已有用法
+  case "$sub" in be-ut|ut) sub=build; set -- --be-ut --run "$@";; esac
   # sr fe-ut [选项] = sr build --fe-ut …：跑 FE 单测（纯 maven，不碰农场/ccache）
   [ "$sub" = fe-ut ] && { sub=build; set -- --fe-ut "$@"; }
   case "$sub" in

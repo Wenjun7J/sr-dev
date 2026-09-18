@@ -48,7 +48,7 @@ cp registries.conf.example registries.conf # 填版本号 -> dev-env 镜像的�
 ln -s ~/srdev/sr ~/bin/sr
 cd /path/to/starrocks && sr build          # 默认 BE+FE（--be / --fe 单选）；首次会问你依赖版本，输 main 或 4.0 这样即可（或 -v 直接指定）；没镜像会先自动构建（~5 分钟）
 sr farm init                               # 可选：建农场。没有农场时 sr build 会询问是否先本机编
-sr build --ut                              # BE 单测只编不跑（默认 ASAN，同样走农场+ccache）；sr ut -- --test Foo 编完接着跑
+sr build --be-ut                           # BE 单测只编不跑（默认 ASAN，同样走农场+ccache）；sr be-ut 编完接着跑
 ```
 
 `sr farm usage`（可 `--watch 5`）看农场资源：scheduler 的各 worker 槽位与负载、每台机器的 loadavg/内存/编译进程、本容器 CPU/内存。`sr help` 列出全部子命令；`sr build --help` / `sr build --why` 看编译选项与默认值依据。
@@ -74,13 +74,14 @@ maven-compiler-plugin 3.1 据此判定「Changes detected」整模块重编 4670
 
 ## BE 单测
 
-`sr build --ut` 驱动上游 `run-be-ut.sh`：它和 build.sh 一样认 `$CCACHE`、`CMAKE_BUILD_PREFIX`、`BUILD_TYPE`、`STARROCKS_GCC_HOME` 和 `-j`，
+`sr build --be-ut` 驱动上游 `run-be-ut.sh`：它和 build.sh 一样认 `$CCACHE`、`CMAKE_BUILD_PREFIX`、`BUILD_TYPE`、`STARROCKS_GCC_HOME` 和 `-j`，
 所以农场、ccache、按 digest 挂依赖整套机制原样适用；构建树是 `be/nj/ut_build_<类型>`，边数约为主程序的两倍（src+test 都编）。
 类型默认跟上游一样是 ASAN（`--debug` / `--release` 可改），与 `sr build` 的 Release 树互不干扰，ccache 条目也互不覆盖。
 
-上游脚本没有"只编不跑"的开关，`--dry-run` 正好是"全部编完、只打印要跑的测试"，就拿它当只编。`sr ut`（即 `sr build --ut --run`）
-分两阶段：先按上面的方式编完，再调一次 `run-be-ut.sh` 跑测试。带 `--ut` 时 sr 不认识的参数会原样交给 `run-be-ut.sh`，
-不用写 `--`：`sr ut --test CompactionUtilsTest`、`sr ut --gtest_filter 'A*:B*'`、`sr ut --module storage`。
+上游脚本没有"只编不跑"的开关，`--dry-run` 正好是"全部编完、只打印要跑的测试"，就拿它当只编。`sr be-ut`（即 `sr build --be-ut --run`）
+分两阶段：先按上面的方式编完，再调一次 `run-be-ut.sh` 跑测试。带 `--be-ut` 时 sr 不认识的参数会原样交给 `run-be-ut.sh`，
+不用写 `--`：`sr be-ut --test CompactionUtilsTest`、`sr be-ut --gtest_filter 'A*:B*'`、`sr be-ut --module storage`。
+（`ut` / `--ut` 是 `be-ut` / `--be-ut` 的旧名，仍然可用。）
 第二阶段会再过一遍 maven/gensrc/cmake（约 1 分钟），ninja 应无事可做；跑测试期间不再打农场心跳，农场按空闲正常休眠。
 
 两点上游行为要知道：`--clean` 除了删单测树还会删 `be/output/`（BE 主程序产物）；上游每次调用都无条件对 `test/starrocks_test` 做 objcopy
