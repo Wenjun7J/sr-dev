@@ -319,6 +319,18 @@ PU
     P_NAME="$(basename "$PSR")-${PSHA}${PDIRTY}"
   fi
   case "$P_NAME" in */*|"") echo "!! 包名不能为空或含 /：$P_NAME"; exit 1;; esac
+  # 上传的前置条件必须在压缩之前查完：压一个包要几分钟，压完才说"没配桶"是在浪费时间（自测踩到）
+  PURL=""
+  if [ $P_UP = 1 ]; then
+    [ -n "${SR_PKG_BUCKET:-}" ] || { echo "!! 没配 SR_PKG_BUCKET，不知道往哪个桶传。在 srdev.conf 里配上桶名与前缀再试。"; exit 1; }
+    command -v ossutil >/dev/null || { echo "!! 宿主机上没有 ossutil，装好并 ossutil config 之后再试"; exit 1; }
+    case "${SR_PKG_PREFIX:-}" in ''|*/) ;; *) echo "!! SR_PKG_PREFIX 要以 / 结尾：${SR_PKG_PREFIX}"; exit 1;; esac
+    PURL="oss://$SR_PKG_BUCKET/${SR_PKG_PREFIX:-}$P_NAME.tar.gz"
+    if ossutil stat "$PURL" >/dev/null 2>&1; then
+      [ $P_FORCE = 1 ] || { echo "!! 远端已有同名对象 $PURL（--force 覆盖）"; exit 1; }
+      echo "   远端已有同名对象，--force 覆盖"
+    fi
+  fi
   mkdir -p "$P_OUT" 2>/dev/null || { echo "!! 建不了输出目录 $P_OUT"; exit 1; }
   PTGZ=$P_OUT/$P_NAME.tar.gz
   [ -e "$PTGZ" ] && [ $P_FORCE = 0 ] && { echo "!! $PTGZ 已存在（--force 覆盖）"; exit 1; }
@@ -326,6 +338,7 @@ PU
   [ "${PFREE:-0}" -lt "${PNEED:-0}" ] && { echo "!! $P_OUT 所在盘剩余 $((PFREE/1048576))G，产物 $((PNEED/1048576))G，空间可能不够，已中止（--out 换个盘）"; exit 1; }
   echo "== 打包 $PSR/output -> $PTGZ"
   echo "   包内顶层目录: $P_NAME/    内容: $(ls "$POUTD" | tr '\n' ' ')"
+  [ -n "$PURL" ] && echo "   上传目标: $PURL"
   echo "   压缩: pigz -$P_LEVEL -p$P_JOBS（产物 $(du -sh "$POUTD" | cut -f1)，需要几分钟）"
   PS0=$(date +%s)
   # flags=r：改写只作用于成员名，不碰符号链接的目标（否则指向 output/... 的链接会被改坏）
@@ -335,13 +348,6 @@ PU
   mv -f "$PTGZ.part" "$PTGZ" || { echo "!! 发布 $PTGZ 失败"; rm -f "$PTGZ.part"; exit 1; }
   echo "   完成: $(du -h "$PTGZ" | cut -f1)  用时 $(( ($(date +%s)-PS0)/60 ))m$(( ($(date +%s)-PS0)%60 ))s"
   [ $P_UP = 0 ] && { echo "   （只打包。要上传加 --upload）"; exit 0; }
-  [ -n "${SR_PKG_BUCKET:-}" ] || { echo "!! 没配 SR_PKG_BUCKET，不知道往哪个桶传。在 srdev.conf 里配上桶名与前缀再试。"; exit 1; }
-  command -v ossutil >/dev/null || { echo "!! 宿主机上没有 ossutil，装好并 ossutil config 之后再试"; exit 1; }
-  PURL="oss://$SR_PKG_BUCKET/${SR_PKG_PREFIX:-}$P_NAME.tar.gz"
-  if ossutil stat "$PURL" >/dev/null 2>&1; then
-    [ $P_FORCE = 1 ] || { echo "!! 远端已有同名对象 $PURL（--force 覆盖）"; exit 1; }
-    echo "   远端已有同名对象，--force 覆盖"
-  fi
   echo "== 上传 -> $PURL"
   ossutil cp "$PTGZ" "$PURL" 2>&1 | tail -3
   ossutil stat "$PURL" 2>/dev/null | grep -Ei "Content-Length|Last-Modified" | sed 's/^/   /'
