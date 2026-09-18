@@ -91,6 +91,23 @@ maven-compiler-plugin 3.1 据此判定「Changes detected」整模块重编 4670
 上游没有任何 JOB_POOL，链接并发等于编译并发，而链接不经 icecc：ASAN 单测上百个 ld.lld 各 2~4G，实测 `-j80` 时 35 个同时跑撞上限被杀，
 `-j8` 时 8 个也把 24G 容器顶在 memory.max 上反复回收、进度停在 thrift 检查之后不动。池大小按容器内存算（(内存-4G)/8G，钳 1~4），`SR_LINK_JOBS` 可改。
 
+## FE 单测
+
+`sr fe-ut` 驱动上游 `run-fe-ut.sh`，纯 maven，农场和 ccache 都不参与（所以头部也不再打 ccache 那几行，
+也不会为它启动 OSS 代理）。仍然走容器，为的是同一套 JDK 21 / maven 3.8.7 / 共享 `~/.m2`，
+以及和编译共用同一把源码树锁——同一棵树不会一边编一边跑测试。日志和 `sr history` 一并记，模式列写 `FEUT`。
+
+```bash
+sr fe-ut                                       # 全部
+sr fe-ut --test com.starrocks.utframe.Demo     # 单个类
+sr fe-ut --filter com.starrocks.X#Test0        # 跳过某些
+sr fe-ut --dry-run                             # 只准备环境不跑
+sr fe-ut -j 8                                  # maven -T 8
+```
+
+并发默认沿用上游的 4，只有显式给 `-j` 才透传。这里的并发是 maven 的 `-T`，每个线程还会 fork surefire JVM，
+拿容器核数当 `-T` 会同时起十几个 JVM 把内存吃光，所以不自动按核数放大。
+
 ## 打包产物
 
 `sr pack` 把当前源码树的 `output/` 打成与官方日构建同构的 tar.gz：包名与包内顶层目录同名，都是 `<树名>-<短sha>[-dirty]`，

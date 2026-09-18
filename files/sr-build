@@ -24,7 +24,7 @@ quota_cores(){ local q p; read -r q p < /sys/fs/cgroup/cpu.max 2>/dev/null || { 
   [ "$q" = max ] && { nproc 2>/dev/null; return; }; echo $(( (q + p - 1) / p )); }
 JDEF=$(quota_cores); case "$JDEF" in ''|*[!0-9]*|0) JDEF=16;; esac
 BT=Release ; DIST=auto ; JAVAEXT=1 ; CLEAN=0 ; GEN=ninja ; JLOCAL=$JDEF ; JSET=0 ; VERBOSE=0 ; CACHE=1
-BTSET=0 ; RUN=0 ; BSCRIPT=build.sh   # BTSET：类型是否显式指定（单测默认 ASAN）；BSCRIPT：驱动上游哪个脚本
+BTSET=0 ; RUN=0 ; FEUT=0 ; BSCRIPT=build.sh   # BTSET：类型是否显式指定（单测默认 ASAN）；BSCRIPT：驱动上游哪个脚本
 # LOCALCAP（常驻 iceccd 的本机并发上限）挪到读完站点配置之后再算，见下面的 SRCONF 处：
 # 在这里算的话，srdev.conf 里的 SR_LOCAL_JOBS 永远不生效，配置模板里那个旋钮等于死的（codex r8#5）。
 TARGET=all  # be | fe | all | ut（默认 all：BE+FE；只编一个用 --be / --fe；--ut 编 BE 单测，走上游 run-be-ut.sh）
@@ -33,6 +33,8 @@ usage(){ cat <<'U'
   不给源码目录就从当前目录上溯找 StarRocks 根
   --be | --fe | --all            编译目标（默认 all=BE+FE；FE 走原生 maven，不经农场/ccache）
   --ut                           编 BE 单测（run-be-ut.sh，产物在 ut_build_<类型>/test/），同样走农场+ccache；默认只编不跑
+  --fe-ut                        跑 FE 单测（run-fe-ut.sh，纯 maven，农场和 ccache 都不参与）
+                                 不认识的参数同样原样透传：sr fe-ut --test com.starrocks.utframe.Demo
   --run                          与 --ut 搭配：编完接着跑单测
                                  有 --ut 时，sr 不认识的参数会原样交给 run-be-ut.sh，不用写 --：
                                    sr ut --test CompactionUtilsTest / --gtest_filter 'A*:B*' / --module storage
@@ -71,9 +73,13 @@ PASS=(); SRARG=""
 # 先扫一遍再进解析循环：--ut 不一定出现在最前面，而 `--test CompactionUtilsTest` 这种带值参数，
 # 值本身是个裸词，必须在看到它之前就知道该透传（否则会被当成"源码目录"或报未知参数）。
 # 遇到显式的 -- 就停止扫描：-- 后面的东西本来就会整体透传。
-UTMODE=0; for a in "$@"; do [ "$a" = -- ] && break; [ "$a" = --ut ] && { UTMODE=1; break; }; done
+UTMODE=0; for a in "$@"; do [ "$a" = -- ] && break
+  { [ "$a" = --ut ] || [ "$a" = --fe-ut ]; } && { UTMODE=1; break; }; done
 while [ $# -gt 0 ]; do case "$1" in
   --be) TARGET=be; shift;; --fe) TARGET=fe; shift;; --all) TARGET=all; shift;; --ut) TARGET=ut; shift;; --run) RUN=1; shift;;
+  # FE 单测：TARGET 保持 fe，好让下面所有"跳过 BE 相关"的分支原样生效（农场、ccache、PCH、构建树、依赖戳全不碰）；
+  # 只把驱动的脚本换成 run-fe-ut.sh，并按 FEUT 走自己的参数与收尾。
+  --fe-ut) TARGET=fe; FEUT=1; shift;;
   --debug) BT=Debug; BTSET=1; shift;; --release) BT=Release; BTSET=1; shift;; --asan) BT=ASAN; BTSET=1; shift;;
   --dist) DIST=$2; shift 2;; --no-java-ext) JAVAEXT=0; shift;;
   --clean) CLEAN=1; shift;; --make) GEN=make; shift;; --no-ccache) CACHE=0; shift;;
@@ -100,7 +106,11 @@ fi
 # BE 单测走上游 run-be-ut.sh：它和 build.sh 一样认 $CCACHE（当 CMAKE_CXX_COMPILER_LAUNCHER）、CMAKE_BUILD_PREFIX、BUILD_TYPE、
 # STARROCKS_GCC_HOME、-j，所以下面整套农场/ccache/依赖挂载机制原样适用，只是构建树叫 ut_build_<类型>、边数翻倍（src+test）。
 # 它没有"只编不跑"的开关，但 --dry-run 正好是"全部编完、把要跑的测试打印出来但不执行"——我们拿它当只编。
-if [ "$TARGET" = ut ]; then
+if [ "$FEUT" = 1 ]; then
+  BSCRIPT=run-fe-ut.sh
+  [ -f "$SR/$BSCRIPT" ] || { echo "!! $SR 里没有 run-fe-ut.sh，跑不了 FE 单测"; exit 1; }
+  [ "$RUN" = 1 ] && { echo "!! --run 只对 --ut 有意义（BE 单测编完接着跑）；FE 单测本来就是直接跑"; exit 1; }
+elif [ "$TARGET" = ut ]; then
   BSCRIPT=run-be-ut.sh
   [ -f "$SR/$BSCRIPT" ] || { echo "!! $SR 里没有 run-be-ut.sh，编不了 BE 单测"; exit 1; }
   [ $BTSET = 1 ] || BT=ASAN     # 跟上游 run-be-ut.sh 的默认（ASAN）；BE 主程序默认仍是 Release
@@ -164,7 +174,8 @@ LINKJ=${SR_LINK_JOBS:-$(( (${MEMGB:-24} - 5) / LKMEM ))}
 case "$LINKJ" in ''|*[!0-9]*) LINKJ=1;; *) LINKJ=$((10#$LINKJ));; esac; [ "$LINKJ" -lt 1 ] && LINKJ=1; [ "$LINKJ" -gt 4 ] && LINKJ=4
 export SR_LINK_JOBS=$LINKJ SR_REAL_CMAKE=${CUSTOM_CMAKE:-cmake} CUSTOM_CMAKE=/usr/local/bin/cmake-linkpool
 REMOTE_NOTE=""
-if [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] && [ -n "${SR_CCACHE_REMOTE_BUCKET:-}" ]; then
+# TARGET=fe（含 --fe-ut）是纯 maven，一次 ccache 都不会调用：不必为它起 OSS 代理，也不必打 ccache 那两行
+if [ "$TARGET" != fe ] && [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] && [ -n "${SR_CCACHE_REMOTE_BUCKET:-}" ]; then
   PPORT=$(( 20700 + ${SR_UID:-0} % 500 )); RPFX=${SR_CCACHE_REMOTE_PREFIX:-ccache/}
   proxy_up(){ [ -n "$(ss -ltnH "sport = :$PPORT" 2>/dev/null)" ]; }   # 不能 `ss | grep -q`：pipefail 下 SIGPIPE 返回 141（踩过）
   # review r7#4(P1)：容器 --network host，127.0.0.1 挡不住本机其他用户；代理无鉴权时任何人都能用所有者凭据 PUT 污染 / DELETE 共享缓存。
@@ -255,7 +266,7 @@ edges(){ [ -f "$TREE/build.ninja" ] || { echo "99999 0"; return; }
 # 没有农场：不能分布式，但可以本机编。交互时问一句（y 继续 / 其它退出），非交互保持拒绝——脚本里静默退化成本地
 # 只会让人以为"就这么慢"，要放行请显式 SR_LOCAL_OK=1
 # FE 是 maven/Java，农场和 ccache 都帮不上：先定死本地，下面的农场检查只约束需要农场的构建（review：原来 --fe 也会被"无农场"拦住）
-[ "$TARGET" = fe ] && { DIST=off; FARM_NOTE="本地（FE 是 maven/Java，农场和 ccache 都帮不上）"; }
+[ "$TARGET" = fe ] && { DIST=off; FARM_NOTE="本地（FE$([ $FEUT = 1 ] && echo 单测)是 maven/Java，农场和 ccache 都帮不上）"; }
 NOFARM=""
 if [ ! -f "$FARM_STATE" ] && [ "$DIST" != off ]; then
   echo "!! 还没有编译农场：无法分布式编译（全量约慢 1.9 倍），只能本机 -j$JLOCAL。"
@@ -472,7 +483,10 @@ fi
 
 case $TARGET in
   be)  ARGS=(--be -j "$J") ;;
-  fe)  ARGS=(--fe -j "$J") ;;
+  # FE 单测的并发是 maven 的 -T（每个线程还会 fork surefire JVM），和编译并发不是一回事：
+  # 只有用户显式给了 -j 才透传，否则用上游默认（4）。拿容器核数当 -T 会同时起十几个 JVM 把内存吃光。
+  fe)  if [ $FEUT = 1 ]; then ARGS=(); [ "$JSET" = 1 ] && ARGS=(-j "$JLOCAL")
+       else ARGS=(--fe -j "$J"); fi ;;
   all) ARGS=(--be --fe -j "$J") ;;
   # 单测：--dry-run = 全部编完但不执行测试（上游没有单独的只编开关）。--run 时第二阶段再调一次不带 --dry-run 去跑。
   # --without-debug-symbol-split：上游每次调用都无条件对 test/starrocks_test 做 objcopy 拆分调试符号，二进制没重新链接时
@@ -481,6 +495,7 @@ case $TARGET in
   ut)  ARGS=(-j "$J" --dry-run --without-debug-symbol-split) ;;
 esac
 [ "$TARGET" != fe ] && [ $JAVAEXT = 0 ] && ARGS+=(--without-java-ext)
+[ $FEUT = 1 ] && CLEAN=0      # run-fe-ut.sh 不认 --clean，透传过去会被它的 usage 直接拒掉
 # --clean 只传给 build.sh，由它删自己真正在用的目录。此处不再 rm 我们猜的 $TREE：
 # 透传 --with-gcov 时 build.sh 用 build_Debug_gcov，猜 build_Debug 会把普通 Debug 产物误删（review latest#2）；
 # 同时 SR_DRYRUN 也就不会再动任何产物（review latest#3）。
@@ -488,15 +503,17 @@ esac
 [ ${#PASS[@]} -gt 0 ] && ARGS+=("${PASS[@]}")
 
 echo "=========================================================="
-echo " 目标: $TARGET$([ "$TARGET" = fe ] && echo "   (maven，农场/ccache 不参与)")$([ "$TARGET" = ut ] && echo "   (BE 单测，run-be-ut.sh；$([ $RUN = 1 ] && echo 编完接着跑 || echo 只编不跑))")"
+echo " 目标: $([ $FEUT = 1 ] && echo "fe-ut   (FE 单测，run-fe-ut.sh；纯 maven，农场/ccache 不参与)" || echo "$TARGET$([ "$TARGET" = fe ] && echo "   (maven，农场/ccache 不参与)")$([ "$TARGET" = ut ] && echo "   (BE 单测，run-be-ut.sh；$([ $RUN = 1 ] && echo 编完接着跑 || echo 只编不跑))")")"
+[ $FEUT = 1 ] && echo " 并发: maven -T $([ "$JSET" = 1 ] && echo "$JLOCAL（-j 指定）" || echo "4（run-fe-ut.sh 默认；-j N 可改）")"
 [ "$TARGET" = ut ] && [ $CLEAN = 1 ] && echo " 注意: run-be-ut.sh --clean 除了删 $TREE，还会删 $SR/be/output/（上游行为，BE 主程序产物也没了）"
 [ "$TARGET" != fe ] && echo " 类型: $BT      生成器: $GEN      并发: -j$J      链接池: $LINKJ 个 ld 同时跑（按 ${MEMGB}G 内存 / 每个链接约 ${LKMEM}G 估算；SR_LINK_JOBS 可改）"
 echo " 模式: $FARM_NOTE"
 [ -n "${SR_DRYRUN:-}" ] && { echo " (SR_DRYRUN=1：决策已打印，到此为止不编译)"; exit 0; }   # 测试钩子：验证农场/交互决策
 echo " 版本: ${SR_VER:-未指定}   编译器: $(${STARROCKS_GCC_HOME:-/usr}/bin/gcc -dumpfullversion 2>/dev/null || echo ?)   依赖: ${STARROCKS_THIRDPARTY:-默认}"
 echo " 源码树: $SR"
-echo " 构建树: $TREE${TREE_NOTE:-}"
-if [ $CACHE = 1 ]; then
+[ "$TARGET" != fe ] && echo " 构建树: $TREE${TREE_NOTE:-}"   # FE / FE 单测不产出 BE 构建树，打出来只会误导
+if [ "$TARGET" = fe ]; then :          # 纯 maven，ccache 与 java-extensions 都不参与，不打这几行
+elif [ $CACHE = 1 ]; then
   CS=$(ccache -s 2>/dev/null | sed -n 's/^Cache size (\{0,1\}[^)]*)\{0,1\}:[[:space:]]*//p' | head -1)
   [ -n "$CS" ] || CS=$(ccache -s 2>/dev/null | awk -F': *' '/Cache size/{print $2; exit}')
   echo " ccache: ${CS:-0} / 上限 $(ccache -k max_size 2>/dev/null || echo 75G)"
@@ -504,7 +521,7 @@ if [ $CACHE = 1 ]; then
 else
   echo " ccache: 已禁用 (--no-ccache)"
 fi
-echo " java-extensions: $([ $JAVAEXT = 1 ] && echo 构建 || echo 跳过'(产物将缺 jni-packages 等 jar)')"
+[ "$TARGET" != fe ] && echo " java-extensions: $([ $JAVAEXT = 1 ] && echo 构建 || echo 跳过'(产物将缺 jni-packages 等 jar)')"
 echo "=========================================================="
 # 心跳：容器是 root，宿主看门狗是普通用户，必须放宽权限双方才都能更新
 mkdir -p /farm 2>/dev/null; : > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null
@@ -678,8 +695,9 @@ HIT1=$(ccache -s 2>/dev/null | awk -F'[ /]+' '/^ *Hits:/{print $3; exit}'); HIT1
 CALL1=$(ccache -s 2>/dev/null | awk -F'[ /]+' '/^Cacheable calls:/{print $3; exit}'); CALL1=${CALL1:-0}
 MODE_SHORT=本地; case "$FARM_NOTE" in 分布式*) MODE_SHORT=分布式;; esac
 [ "$TARGET" = ut ] && MODE_SHORT="UT$MODE_SHORT"   # history 里能一眼分出单测构建
+[ $FEUT = 1 ] && MODE_SHORT=FEUT
 mkdir -p /farm/logs 2>/dev/null
-LOGF=/farm/logs/$(date +%Y%m%d-%H%M%S)-$(basename "$SR")-$([ "$TARGET" = ut ] && echo ut_)${BT}.log
+LOGF=/farm/logs/$(date +%Y%m%d-%H%M%S)-$(basename "$SR")-$([ $FEUT = 1 ] && echo feut || { [ "$TARGET" = ut ] && echo ut_; echo "$BT"; }).log
 cp "$OUTF" "$LOGF" 2>/dev/null; chmod 666 "$LOGF" 2>/dev/null; ln -sfn "$LOGF" /tmp/sr-build-last.out; rm -f "$OUTF"
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
   "$(date '+%m-%d %H:%M:%S')" "${SR_USER:-?}" "$(basename "$SR")@${SR_BRANCH:-?}" "${SR_VER:-?}/${SR_TPDIGEST:-?}" \
@@ -695,6 +713,8 @@ fi
 [ $CACHE = 1 ] && [ "$TARGET" != fe ] && ccache -s 2>/dev/null | grep -E 'Cacheable calls|Hits:|Uncacheable' | head -3   # 全局累计值，FE 不走 ccache 就不打
 
 # 产物落点。build.sh 只会闷头打一句 OUTPUT DIR=，既不说二进制在哪也不说是不是这次新出的
+# FE 单测没有"产物"可报（mvn verify 的结论看 surefire 摘要），到此为止
+[ $FEUT = 1 ] && exit $RC
 if [ $RC -eq 0 ]; then
   echo ""
   if [ "$TARGET" = fe ] || [ "$TARGET" = all ]; then
