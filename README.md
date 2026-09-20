@@ -133,6 +133,8 @@ sr pack --name my-build-1    # 自定义包名（同时决定包内顶层目录�
 
 - scheduler 跑在客户端容器里（实测 3.2MB / 0.5% CPU，纯中介，源码和产物 client↔worker 直连），申请到的机器全部当 worker。
 - 端口与 netname 按 uid 推导，共享机上每个用户一套互不串台；容器 `--network host --init --privileged`，cgroup slice 限额。
+  取模不是绝对隔离：`SPORT=18700+2*(uid%250)`、`DPORT=19700+uid%500`、代理 `20700+uid%500`，uid 相差 250/500 的两个人会撞。
+  `sr farm init` 会在申请机器之前检出撞车并要求在 `srdev.conf` 里显式设 `SPORT`/`DPORT`/`SR_CCACHE_PROXY_PORT` 错开。
 - 续约是**死人开关**：看门狗每 15 分钟把到期时间重置为 3 小时后；容器一死，续约停止，农场自我了断。闲置 15 分钟休眠，`resume` 约 29 秒。
 - 编译不等唤醒：按满并发直接开工，后台轮询累计 ccache miss，攒够 8 次才叫醒农场（全命中的编译不吵醒它）。
 - `resume` 后实测 worker 连接数，不够就重新下发配置，仍不够标 `degraded`，`sr build` 拒绝开工而不是静默全落本地把容器 OOM 掉。
@@ -167,8 +169,13 @@ SR_CCACHE_REMOTE_PREFIX=ccache/
 
 ## 换掉云平台
 
-`files/tspapi.py` 是唯一和平台耦合的地方，`sr-farm` 只用它的 `create / cid / nodes / spec / row / op` 六个子命令（申请、查 id、查节点 IP、查规格、查到期时间、续约/启停/释放）。
-按同样的输出格式重写即可接别的平台。
+`files/tspapi.py` 是唯一和平台耦合的地方。`sr-farm` 用它的 **七个**子命令：`create / cid / nodes / spec / row / op / exists`
+（申请、查 id、查节点 IP、查规格、查到期时间、续约启停释放、判存在）。按同样的输出格式重写即可接别的平台。
+
+`exists` 最容易被漏掉，而漏掉的后果是真金白银：`sr farm down` 先用它判断集群还在不在，**退出码有三态**——
+`0`=存在（同时把状态打到 stdout）、`1`=确认不存在、`2`=查询失败。只实现前六个的话，新客户端遇到 `exists` 会按
+"未知命令"返回 1，`down` 就把它当成"平台上已经没有了"，直接删本地记录、停看门狗，**根本不发释放请求**，
+而用户看到的是"已释放"——集群还在平台上继续计费。所以：未知命令必须返回 2（查询失败），不能返回 1。
 
 ## 不要提交的东西
 

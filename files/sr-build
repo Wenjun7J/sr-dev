@@ -182,7 +182,10 @@ export SR_LINK_JOBS=$LINKJ SR_REAL_CMAKE=${CUSTOM_CMAKE:-cmake} CUSTOM_CMAKE=/us
 REMOTE_NOTE=""
 # TARGET=fe（含 --fe-ut）是纯 maven，一次 ccache 都不会调用：不必为它起 OSS 代理，也不必打 ccache 那两行
 if [ "$TARGET" != fe ] && [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] && [ -n "${SR_CCACHE_REMOTE_BUCKET:-}" ]; then
-  PPORT=$(( 20700 + ${SR_UID:-0} % 500 )); RPFX=${SR_CCACHE_REMOTE_PREFIX:-ccache/}
+  # 端口同样按 uid 取模，uid 相差 500 的两人会撞（codex r15#9）。撞上时上面的归因判据会拒绝发令牌
+  # 并说明原因，但要真正错开得能显式指定，所以留一个覆盖项。
+  PPORT=${SR_CCACHE_PROXY_PORT:-$(( 20700 + ${SR_UID:-0} % 500 ))}; RPFX=${SR_CCACHE_REMOTE_PREFIX:-ccache/}
+  case "$PPORT" in ''|*[!0-9]*) echo "!! SR_CCACHE_PROXY_PORT=$PPORT 不是端口号"; exit 1;; esac
   # codex r15#1（P1）：原来只看"端口在监听"就把令牌发过去。端口是 20700+uid%500 算出来的，同机别人能算；
   # 他只要抢在我们之前 bind 住它，ccache 就会把 Bearer 令牌连同全部缓存请求发给他，他还能伪造缓存响应。
   # Bearer 只认证了客户端，没认证服务端。ccache 的 http 后端不支持 unix socket 和 https，改不了协议，

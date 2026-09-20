@@ -22,6 +22,12 @@ WORKERS=5                          # 申请的机器总数（全部当 worker；
 #SR_FE_HEAP=2g                     # sr deploy 起的 FE 堆上限（默认 2g；上游模板 8g 会和编译抢容器内存）
 #SR_LINK_JOBS=2                    # 同时跑几个链接器（默认按容器内存与构建类型估算；ASAN 单测单个 ld.lld 峰值可达 11G）
 
+## 端口：默认按 uid 取模推导，共享机上 uid 相差 250(SPORT)/500(DPORT、代理) 的两个人会撞在一起。
+## 撞车时 sr farm init 会明确报出来；这三项用于手工错开。
+#SPORT=18740                        # icecc scheduler（同时占用 SPORT+1 作文本管理口）
+#DPORT=19740                        # 本机 iceccd
+#SR_CCACHE_PROXY_PORT=20740         # ccache 的 OSS 代理
+
 ## sr pack：把 output/ 打成与官方日构建同构的 tar.gz，可选上传 OSS（凭据同样只从各人自己的 ~/.ossutilconfig 读）
 #SR_PKG_BUCKET=<桶名>                # 不配就只能本地打包，sr pack --upload 会直接拒绝
 #SR_PKG_PREFIX=packages/main/Release/  # 对象前缀，要以 / 结尾
