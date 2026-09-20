@@ -566,10 +566,14 @@ SAMPLER=$!
 # review r7#7：EXIT 只清理；INT/TERM 要真正取消本次构建——杀构建自己的进程组、10s 宽限后仍有成员则 KILL、回收，再以 130/143 退出。
 # 原来一个 trap 兼任两职且不 exit：只 kill 驱动时，bash 等前台管道结束才跑 trap，采样器停了、构建照跑还可能报成功。
 HS=""   # 当前 run_build 的握手文件前缀；取消路径 on_signal 直接 exit，不会走到 run_build 末尾的清理，所以由 cleanup 兜底删
-SPLIT_TMP=""; SPLIT_DBG=""   # 拆调试符号时的临时大文件，登记在这里好让取消路径也能清掉（codex 复查#13）
+# 拆调试符号时那个几 G 的临时二进制副本，登记在这里好让取消路径也能清掉（codex 复查#13）。
+# 只登记副本，**不登记 .debuginfo**（codex 第三轮#1）：mv 成功之后、清空登记之前若收到信号，
+# cleanup 会把唯一那份符号文件删掉，而二进制已经是剥离版且带着指向它的 debuglink，无法自愈。
+# .debuginfo 一旦由 objcopy 完整写出就不该被 trap 删：要么接着被用上，要么构建失败而原二进制仍完整，
+# 它只是个会被下次覆盖的多余文件。半路被打断留下的半截文件同样会被下次覆盖，无害。
+SPLIT_TMP=""
 cleanup(){ kill $SAMPLER ${WAKER:-} 2>/dev/null; rm -f "$ANONF" "${RUNFLAG:-/nonexistent}" "${PROBE:-/nonexistent}" 2>/dev/null
   [ -n "$SPLIT_TMP" ] && rm -f "$SPLIT_TMP" 2>/dev/null
-  [ -n "$SPLIT_DBG" ] && rm -f "$SPLIT_DBG" 2>/dev/null
   [ -n "$HS" ] && rm -f "$HS" "$HS.pgid" "$HS.ack" 2>/dev/null; }
 on_signal(){ local sig=$1 i
   echo ""; echo "!! 收到 $sig，取消本次构建…"
@@ -800,14 +804,14 @@ if [ $RC -eq 0 ]; then
       # 现在的顺序：先用最终名生成 .debuginfo（只读原文件，不改它），再在副本上 strip 并写 debuglink，
       # 最后才用副本顶替原文件。中途任何一步失败，原二进制仍是完整的，删掉半成品不丢任何东西。
       local bt=$b.split.$$
-      SPLIT_TMP="$bt"; SPLIT_DBG="$d"        # 登记给 trap，取消时也能清掉这两个几 G 的临时文件（codex 复查#13）
+      SPLIT_TMP="$bt"        # 只登记副本；.debuginfo 不登记，理由见 cleanup 处注释
       if objcopy --only-keep-debug "$b" "$d" \
          && cp -p "$b" "$bt" && strip --strip-debug "$bt" && objcopy --add-gnu-debuglink="$d" "$bt" \
          && mv -f "$bt" "$b"; then
-        SPLIT_TMP=""; SPLIT_DBG=""
+        SPLIT_TMP=""          # mv 之后 $bt 已不存在，这里就算被信号打断，cleanup 的 rm -f 也只是空操作
         echo "   已拆分 -> $(basename "$d")（用时 $(( ($(date +%s) - t0) / 60 ))m$(( ($(date +%s) - t0) % 60 ))s）"
       else
-        rm -f "$bt" "$d" 2>/dev/null; SPLIT_TMP=""; SPLIT_DBG=""
+        rm -f "$bt" "$d" 2>/dev/null; SPLIT_TMP=""   # 这条路径上原二进制没动过，删掉半成品不丢任何东西
         echo "   !! 拆分 $(basename "$b") 的调试符号失败（盘满？），原二进制未改动，仍带完整符号，只是加载慢些"
       fi; }
     for tb in starrocks_test starrocks_dw_test; do

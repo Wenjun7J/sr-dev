@@ -116,56 +116,74 @@ mem_bytes(){ local v=${1:-} n u; n=${v%[a-zA-Z]}; u=${v#"$n"}
 cpu_nanos(){ case "${1:-}" in ''|*[!0-9.]*|.*|*.) return 1;; *.*.*) return 1;; esac
   awk -v c="$1" 'BEGIN{ n=c*1000000000; if (n<1) exit 1; printf "%d", n }' 2>/dev/null; }
 
+# cgroup 上限的三种取值：具体字节数/纳核数、inf（无限制）、?（读不到）。
+# codex 第三轮#3：原来把 memory.max 的 "max" 当普通字符串比，于是"无限制 -> 64G"被判成放大照做了，
+# 而那其实是缩容；CPU 的 "max" 则被归成空值，单独改 CPU 时静默漏判、跟着内存改时又会被一起收紧。
+# 必须把"无限制"和"读不到"分开，无限制按正无穷参与比较。
+norm_mem(){ case "${1:-}" in max) echo inf;; ''|*[!0-9]*) echo '?';; *) echo "$1";; esac; }
+norm_cpu(){ case "${1:-}" in max) echo inf; return;; ''|*[!0-9]*) echo '?'; return;; esac
+  case "${2:-}" in ''|*[!0-9]*) echo '?'; return;; esac
+  awk -v q="$1" -v p="$2" 'BEGIN{printf "%d", q*1000000000/p}'; }
+min_lim(){ { [ "$1" = '?' ] || [ "$2" = '?' ]; } && { echo '?'; return; }
+  [ "$1" = inf ] && { echo "$2"; return; }; [ "$2" = inf ] && { echo "$1"; return; }
+  [ "$1" -lt "$2" ] && echo "$1" || echo "$2"; }
+is_shrink(){ [ "$1" = '?' ] && return 1; [ "$1" = inf ] && return 0; [ "$1" -gt "$2" ]; }
+show_g(){ case "$1" in inf) echo 无限制;; '?') echo 读不到;; *) awk -v n="$1" 'BEGIN{printf "%.4g", n/1073741824}';; esac; }
+show_c(){ case "$1" in inf) echo 无限制;; '?') echo 读不到;; *) awk -v n="$1" 'BEGIN{printf "%g", n/1000000000}';; esac; }
+
+# 有效上限 = 容器自己的 cgroup 与父 slice 取小。两边都直接读 cgroup 文件，不经 docker 的记账——
+# 父 slice 没改成时 docker 的 HostConfig 早已等于期望值，只看它就会永远早退（codex r14#5 / 复查#6）。
+# codex 第三轮#2：CPU 原来只读了容器侧，父 slice 限制更紧时会谎称"已生效"。现在两边都读。
+eff_limits(){ local cm cq cp sm sq sp
+  read -r cm cq cp < <(docker exec $NAME sh -c 'printf "%s %s\n" "$(cat /sys/fs/cgroup/memory.max 2>/dev/null)" "$(cat /sys/fs/cgroup/cpu.max 2>/dev/null)"' 2>/dev/null)
+  sm=inf; sq=max; sp=""
+  if [ -n "${SLICE:-}" ] && [ -d "/sys/fs/cgroup/$SLICE" ]; then
+    sm=$(norm_mem "$(cat "/sys/fs/cgroup/$SLICE/memory.max" 2>/dev/null)")
+    read -r sq sp < "/sys/fs/cgroup/$SLICE/cpu.max" 2>/dev/null
+    sq=$(norm_cpu "${sq:-}" "${sp:-}")
+  else sm=inf; sq=inf; fi
+  printf '%s %s\n' "$(min_lim "$(norm_mem "${cm:-}")" "$sm")" "$(min_lim "$(norm_cpu "${cq:-}" "${cp:-}")" "$sq")"; }
+
 resize_if_needed(){
-  local wm wc em ecq ecp slice_m ec
+  local wm wc em ec need_m=0 need_c=0
   wm=$(mem_bytes "$MEM") || { echo "!! srdev.conf 里的 MEM=$MEM 认不出来（要像 64g / 4096m），配额未改"; return 0; }
   wc=$(cpu_nanos "$CPUS") || { echo "!! srdev.conf 里的 CPUS=$CPUS 认不出来（要像 16 或 1.5），本次只看内存"; wc=""; }
-  # codex 复查#6：判据必须是"实际有效上限"，不能是 docker 的 HostConfig。
-  # 父 slice 没改成时 docker 配置早已等于期望值，下一次就直接早退，既不修也不再告警。
-  # 有效值 = 容器自己的 cgroup 与父 slice 取小；cpu.max 的周期不能假定是 100000，要连周期一起读。
-  read -r em ecq ecp < <(docker exec $NAME sh -c 'printf "%s %s\n" "$(cat /sys/fs/cgroup/memory.max 2>/dev/null)" "$(cat /sys/fs/cgroup/cpu.max 2>/dev/null)"' 2>/dev/null)
-  [ -n "${em:-}" ] || return 0
-  slice_m=$(systemctl show -p MemoryMax --value "$SLICE" 2>/dev/null)
-  case "${slice_m:-}" in ''|infinity|*[!0-9]*) slice_m="";; esac
-  [ -n "$slice_m" ] && [ "$em" != max ] && [ "$slice_m" -lt "$em" ] && em=$slice_m
-  ec=""; case "${ecq:-}" in ''|max|*[!0-9]*) ;; *) case "${ecp:-}" in ''|*[!0-9]*) ;; *) ec=$(awk -v q="$ecq" -v p="$ecp" 'BEGIN{printf "%d", q*1000000000/p}');; esac;; esac
-  local need_m=0 need_c=0
+  read -r em ec < <(eff_limits)
+  [ "$em" = '?' ] && { echo "   (读不到容器的有效内存上限，本次不动配额)"; return 0; }
   [ "$em" != "$wm" ] && need_m=1
-  [ -n "$wc" ] && [ -n "$ec" ] && [ "$ec" != "$wc" ] && need_c=1
+  [ -n "$wc" ] && [ "$ec" != '?' ] && [ "$ec" != "$wc" ] && need_c=1
   [ $need_m = 0 ] && [ $need_c = 0 ] && return 0
-  # codex 复查#3/#4：自动路径只放大。缩小会立刻压到正在跑的构建、也会压到容器里常驻的 FE/BE，
-  # 而"先探测忙不忙再动手"这种做法本身与构建启动存在竞态——探测完锁就放了。所以干脆不自动缩。
-  if { [ "$em" != max ] && [ "$wm" -lt "$em" ]; } || { [ -n "$wc" ] && [ -n "$ec" ] && [ "$wc" -lt "$ec" ]; }; then
-    echo "!! srdev.conf 里的配额比容器当前有效值小（内存 $(awk -v n=$em 'BEGIN{printf "%.4g", n/1073741824}')G -> $MEM$([ -n "$ec" ] && echo "，CPU $(awk -v n=$ec 'BEGIN{printf "%g", n/1000000000}') -> $CPUS 核")）。"
+  # 自动路径只放大。缩小会立刻作用到正在跑的构建和容器里常驻的 FE/BE，可能直接把它们压到 OOM；
+  # 而"先探测忙不忙再动手"本身与构建启动存在竞态（探测完锁就放了），所以干脆不自动缩（codex r14#2/#3/#4）。
+  if is_shrink "$em" "$wm" || { [ -n "$wc" ] && [ "$ec" != '?' ] && is_shrink "$ec" "$wc"; }; then
+    echo "!! srdev.conf 里的配额比容器当前有效值小（内存 $(show_g "$em")G -> $MEM，CPU $(show_c "$ec") -> ${CPUS} 核）。"
     echo "   调小不会自动执行：它会立刻作用到正在跑的构建和容器里常驻的 FE/BE，可能直接把它们压到 OOM。"
     echo "   确认空闲后用 sr down && sr up 重建容器，那条路径是干净的。"
     return 0
   fi
+  # CPU 有效值读不到时不碰 CPU：盲目带上 --cpus 可能在不知情的情况下把它收紧
+  local cpu_arg=""; [ -n "$wc" ] && [ "$ec" != '?' ] && cpu_arg=1
+  [ -n "$wc" ] && [ "$ec" = '?' ] && echo "   (读不到 CPU 的有效上限，本次只改内存，不动 CPU)"
   echo "== 容器配额比 srdev.conf 小，放大（docker update，不重建容器）"
-  [ $need_m = 1 ] && echo "   内存 $(awk -v n=$em 'BEGIN{printf "%.4g", n/1073741824}')G -> $MEM"
-  [ $need_c = 1 ] && echo "   CPU  $(awk -v n=$ec 'BEGIN{printf "%g", n/1000000000}') 核 -> $CPUS 核"
+  [ $need_m = 1 ] && echo "   内存 $(show_g "$em")G -> $MEM"
+  [ $need_c = 1 ] && echo "   CPU  $(show_c "$ec") 核 -> $CPUS 核"
   if [ -n "$SLICE" ] && command -v systemctl >/dev/null; then
     sudo -n systemctl set-property --runtime "$SLICE" \
-      ${wc:+"CPUQuota=$(awk -v c="$CPUS" 'BEGIN{printf "%d", c*100}')%"} \
+      ${cpu_arg:+"CPUQuota=$(awk -v c="$CPUS" 'BEGIN{printf "%d", c*100}')%"} \
       "MemoryMax=$(echo "$MEM" | tr 'gmk' 'GMK')" >/dev/null 2>&1 \
       || echo "   (提示：sudo -n systemctl set-property 没成功；父 slice 上限可能还是旧值，下面回读会看出来)"
   fi
-  docker update ${wc:+--cpus="$CPUS"} --memory="$MEM" --memory-swap="$(( wm * 2 ))" $NAME 2>&1 | sed 's/^/   docker: /'
-  # 回读：同样取"容器 cgroup 与父 slice 的小者"，这条读数不经过 docker 的记账
-  read -r em ecq ecp < <(docker exec $NAME sh -c 'printf "%s %s\n" "$(cat /sys/fs/cgroup/memory.max 2>/dev/null)" "$(cat /sys/fs/cgroup/cpu.max 2>/dev/null)"' 2>/dev/null)
-  slice_m=$(systemctl show -p MemoryMax --value "$SLICE" 2>/dev/null)
-  case "${slice_m:-}" in ''|infinity|*[!0-9]*) slice_m="";; esac
-  [ -n "$slice_m" ] && [ -n "${em:-}" ] && [ "$em" != max ] && [ "$slice_m" -lt "$em" ] && em=$slice_m
-  ec=""; case "${ecq:-}" in ''|max|*[!0-9]*) ;; *) case "${ecp:-}" in ''|*[!0-9]*) ;; *) ec=$(awk -v q="$ecq" -v p="$ecp" 'BEGIN{printf "%d", q*1000000000/p}');; esac;; esac
-  if [ "${em:-}" = "$wm" ]; then echo "   内存已生效（回读有效上限 $(awk -v n=$wm 'BEGIN{printf "%.4g", n/1073741824}')G）"
-  else echo "   !! 内存没改成：期望 $wm 字节，实际有效 ${em:-读不到}。下次 sr up 还会再试；要彻底解决请 sr down && sr up。"; fi
-  if [ -n "$wc" ]; then
-    if [ "${ec:-}" = "$wc" ]; then echo "   CPU 已生效（回读有效 $CPUS 核）"
-    else echo "   !! CPU 没改成：期望 $CPUS 核，实际有效 $([ -n "${ec:-}" ] && awk -v n=$ec 'BEGIN{printf "%g", n/1000000000}' || echo 读不到) 核。下次 sr up 还会再试。"; fi
+  docker update ${cpu_arg:+--cpus="$CPUS"} --memory="$MEM" --memory-swap="$(( wm * 2 ))" $NAME 2>&1 | sed 's/^/   docker: /'
+  # 回读用同一套"父子取小"的读数，不经 docker 的记账
+  read -r em ec < <(eff_limits)
+  if [ "$em" = "$wm" ]; then echo "   内存已生效（回读有效上限 $(show_g "$wm")G）"
+  else echo "   !! 内存没改成：期望 $(show_g "$wm")G，实际有效 $(show_g "$em")G。下次 sr up 还会再试；要彻底解决请 sr down && sr up。"; fi
+  if [ -n "$cpu_arg" ]; then
+    if [ "$ec" = "$wc" ]; then echo "   CPU 已生效（回读有效 $CPUS 核）"
+    else echo "   !! CPU 没改成：期望 $CPUS 核，实际有效 $(show_c "$ec") 核。下次 sr up 还会再试。"; fi
   fi
-  # codex 复查#3：不再自动 pkill iceccd——探测忙闲与动手之间必然有竞态，而误杀的后果是
-  # icecc 客户端失去并发闸门、无限制本地编译直到 OOM。daemon 的 -m 由 sr-build 在复用时核对并提示，
-  # 真要刷新就 sr down && sr up，那条路径不会杀到别人正在用的 daemon。
+  # 不自动 pkill iceccd：探测忙闲与动手之间必然有竞态，误杀的后果是 icecc 失去并发闸门、
+  # 无限制本地编译直到 OOM。-m 过期由 sr-build 复用 daemon 时提示，真要刷新就 sr down && sr up。
   [ $need_c = 1 ] && echo "   (本机 iceccd 的 -m 是启动参数，仍是旧核数；下次构建会提示，空闲时 sr down && sr up 刷新)"
   return 0; }
 
