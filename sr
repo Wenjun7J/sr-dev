@@ -134,15 +134,24 @@ show_c(){ case "$1" in inf) echo 无限制;; '?') echo 读不到;; *) awk -v n="
 # 有效上限 = 容器自己的 cgroup 与父 slice 取小。两边都直接读 cgroup 文件，不经 docker 的记账——
 # 父 slice 没改成时 docker 的 HostConfig 早已等于期望值，只看它就会永远早退（codex r14#5 / 复查#6）。
 # codex 第三轮#2：CPU 原来只读了容器侧，父 slice 限制更紧时会谎称"已生效"。现在两边都读。
-eff_limits(){ local cm cq cp sm sq sp
-  read -r cm cq cp < <(docker exec $NAME sh -c 'printf "%s %s\n" "$(cat /sys/fs/cgroup/memory.max 2>/dev/null)" "$(cat /sys/fs/cgroup/cpu.max 2>/dev/null)"' 2>/dev/null)
-  sm=inf; sq=max; sp=""
+eff_limits(){ local out cm cc cq cp sm sc sq sp
+  # codex 第四轮#2：原来把两个文件拼成一行空白分隔再 read 三个变量——memory.max 读不到时字段会左移，
+  # cm 拿到的其实是 CPU 的 quota，"内存读不到就不动配额"那条保护直接失效。改成用 | 分隔并显式填 ?。
+  out=$(docker exec $NAME sh -c 'm=$(cat /sys/fs/cgroup/memory.max 2>/dev/null); c=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null); printf "%s|%s\n" "${m:-?}" "${c:-?}"' 2>/dev/null)
+  case "$out" in *'|'*) cm=${out%%|*}; cc=${out#*|};; *) cm='?'; cc='?';; esac
+  cq=${cc%% *}; cp=${cc#* }
+  # codex 第四轮#1：sq 原来预置成 max，read 因文件不可读而根本没执行时它仍是 max -> 被当成"无限制"，
+  # 于是"CPU 读不到就不碰 CPU"的退路被绕过。改成先取内容、取不到就是 ?，不让初值冒充读数。
   if [ -n "${SLICE:-}" ] && [ -d "/sys/fs/cgroup/$SLICE" ]; then
-    sm=$(norm_mem "$(cat "/sys/fs/cgroup/$SLICE/memory.max" 2>/dev/null)")
-    read -r sq sp < "/sys/fs/cgroup/$SLICE/cpu.max" 2>/dev/null
-    sq=$(norm_cpu "${sq:-}" "${sp:-}")
-  else sm=inf; sq=inf; fi
-  printf '%s %s\n' "$(min_lim "$(norm_mem "${cm:-}")" "$sm")" "$(min_lim "$(norm_cpu "${cq:-}" "${cp:-}")" "$sq")"; }
+    sm=$(cat "/sys/fs/cgroup/$SLICE/memory.max" 2>/dev/null); sm=${sm:-?}
+    sc=$(cat "/sys/fs/cgroup/$SLICE/cpu.max" 2>/dev/null); sc=${sc:-?}
+    sq=${sc%% *}; sp=${sc#* }
+  else
+    # slice 目录不存在 = 没有这一层限制（当前就是顶层 slice 的部署方式），按无限制算
+    sm=max; sq=max; sp=""
+  fi
+  printf '%s %s\n' "$(min_lim "$(norm_mem "$cm")" "$(norm_mem "$sm")")" \
+                    "$(min_lim "$(norm_cpu "$cq" "$cp")" "$(norm_cpu "$sq" "$sp")")"; }
 
 resize_if_needed(){
   local wm wc em ec need_m=0 need_c=0
@@ -152,7 +161,11 @@ resize_if_needed(){
   [ "$em" = '?' ] && { echo "   (读不到容器的有效内存上限，本次不动配额)"; return 0; }
   [ "$em" != "$wm" ] && need_m=1
   [ -n "$wc" ] && [ "$ec" != '?' ] && [ "$ec" != "$wc" ] && need_c=1
-  [ $need_m = 0 ] && [ $need_c = 0 ] && return 0
+  if [ $need_m = 0 ] && [ $need_c = 0 ]; then
+    # CPU 读不到时它永远算不出 need_c，静默跳过会让人以为核对过了（codex 第四轮"提示不完整"）
+    [ -n "$wc" ] && [ "$ec" = '?' ] && echo "   (读不到 CPU 的有效上限，本次没有核对 CPU 配额)"
+    return 0
+  fi
   # 自动路径只放大。缩小会立刻作用到正在跑的构建和容器里常驻的 FE/BE，可能直接把它们压到 OOM；
   # 而"先探测忙不忙再动手"本身与构建启动存在竞态（探测完锁就放了），所以干脆不自动缩（codex r14#2/#3/#4）。
   if is_shrink "$em" "$wm" || { [ -n "$wc" ] && [ "$ec" != '?' ] && is_shrink "$ec" "$wc"; }; then
