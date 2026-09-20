@@ -97,7 +97,8 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"  # ccache 默认 keep-alive；Python 会自动应答 Expect: 100-continue
     # 读超时：没有它，声明了大 Content-Length 却不发数据的连接会把线程永久占住（codex r13#4）。
     # StreamRequestHandler.setup() 会把它设到 socket 上。
-    timeout = 120
+    timeout = 30       # codex r15#10：每次 socket 读的上限。原来 120 秒，慢发送能长期占住线程；
+                       # 回环上 100MB 的 PUT 也远用不到 30 秒。
     oss = None
     prefix = ""
     logf = None
@@ -108,14 +109,24 @@ class Handler(BaseHTTPRequestHandler):
         # PUT 污染 / DELETE 清空共享缓存前缀。所有方法（含 GET、/_stats）都校验 Authorization: Bearer <token>。
         if self.token is None:
             return True
-        if self.headers.get("Authorization", "") == f"Bearer {self.token}":
+        # 自查：== 是内容相关的短路比较，同机任何用户都能对着它反复打，理论上可按字节试探令牌。
+        # hmac.compare_digest 是常量时间的，代价为零，没有理由不用。
+        if hmac.compare_digest(self.headers.get("Authorization", ""), f"Bearer {self.token}"):
             return True
         self._reply(401, b"unauthorized\n")
         self._log(401, 0, 0.0)
         return False
 
+    # 自查：ccache 只会请求形如 /<两位>/<哈希> 的键，但这个端口同机谁都连得上。
+    # unquote 之后若含 ".." 或以 "/" 开头，拼出来的对象名就可能指向配置前缀之外——
+    # 这是拿所有者的 OSS 凭据去访问共享桶，护栏不该省。返回 None 表示拒绝。
     def _key(self):
-        return self.prefix + unquote(self.path.split("?", 1)[0].lstrip("/"))
+        raw = unquote(self.path.split("?", 1)[0]).lstrip("/")
+        if not raw or raw.startswith("/") or "\\" in raw:
+            return None
+        if any(seg in ("", ".", "..") for seg in raw.split("/")):
+            return None
+        return self.prefix + raw
 
     def _reply(self, status, body=b"", ctype=None):
         self.send_response(status)
@@ -133,12 +144,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def _forward(self, method, body=None, ctype=""):
         t0 = time.time()
+        key = self._key()
+        if key is None:
+            self._reply(400, b"bad key\n")
+            self._log(400, 0, 0.0)
+            return
         try:
-            st, data = self.oss.request(method, self._key(), body, ctype)
+            st, data = self.oss.request(method, key, body, ctype)
         except Exception as e:  # OSS 不可达：对 ccache 来说等同 miss，它会退回本地编译
-            self._reply(502, str(e).encode())
+            # 自查：原来把 str(e) 回给客户端，会把内部 endpoint 和主机名泄给同机其他用户。
+            # 详情只写自己的日志，回给客户端的是一句无信息的 502。
+            self._reply(502, b"upstream error\n")
             bump(method, False, 0, (time.time() - t0) * 1000)
             self._log(502, 0, (time.time() - t0) * 1000)
+            if self.logf:
+                self.logf.write(f"{time.strftime('%H:%M:%S')} upstream {type(e).__name__}: {e}\n"); self.logf.flush()
             return
         ms = (time.time() - t0) * 1000
         if method == "GET":
@@ -205,6 +225,34 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """codex r15#10：ThreadingHTTPServer 在跑到 _authed() 之前就为每个连接开线程，而且没有上限。
+    同机用户建一堆连接、慢慢发（甚至不发）请求头，就能在鉴权之前把线程和内存吃光——
+    在这台常年内存吃紧、跑着 earlyoom 的共享机上，足以把代理或同容器的构建拖死。
+    这里在**开线程之前**卡住并发数，超出的连接直接关掉。"""
+
+    max_conns = 64
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._slots = threading.BoundedSemaphore(self.max_conns)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.close_request(request)      # 没拿到槽就没开线程，也就不需要 release
+            return
+        super().process_request(request, client_address)
+
+    def shutdown_request(self, request):
+        try:
+            super().shutdown_request(request)
+        finally:
+            try:
+                self._slots.release()
+            except ValueError:
+                pass
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bucket", required=True)
@@ -213,6 +261,7 @@ def main():
     ap.add_argument("--config", default="~/.ossutilconfig")
     ap.add_argument("--log", default=None, help="逐请求日志文件（默认不记）")
     ap.add_argument("--token-file", default=None, help="Bearer 令牌文件（review r7#4）：所有请求必须携带；不给则不鉴权，仅供测试")
+    ap.add_argument("--max-conns", type=int, default=64, help="鉴权之前就生效的并发连接上限（codex r15#10）")
     a = ap.parse_args()
     ak, sk, ep, scheme = load_cfg(a.config)
     Handler.oss = OSS(ak, sk, ep, a.bucket, scheme)
@@ -226,8 +275,9 @@ def main():
     Handler.logf = open(a.log, "a") if a.log else None
     host, port = a.listen.rsplit(":", 1)
     # 默认 backlog 只有 5：-j56 的 ccache 同时连上来会丢 SYN，客户端 100ms connect-timeout 直接算 miss（实测 35/1640）
-    ThreadingHTTPServer.request_queue_size = 256
-    srv = ThreadingHTTPServer((host, int(port)), Handler)
+    BoundedHTTPServer.request_queue_size = 256
+    BoundedHTTPServer.max_conns = max(1, a.max_conns)
+    srv = BoundedHTTPServer((host, int(port)), Handler)
     srv.daemon_threads = True
     print(f"oss-ccache-proxy: {a.listen} -> oss://{a.bucket}/{a.prefix} via {ep}", flush=True)
     srv.serve_forever()

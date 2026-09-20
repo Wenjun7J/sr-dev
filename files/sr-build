@@ -183,7 +183,27 @@ REMOTE_NOTE=""
 # TARGET=fe（含 --fe-ut）是纯 maven，一次 ccache 都不会调用：不必为它起 OSS 代理，也不必打 ccache 那两行
 if [ "$TARGET" != fe ] && [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] && [ -n "${SR_CCACHE_REMOTE_BUCKET:-}" ]; then
   PPORT=$(( 20700 + ${SR_UID:-0} % 500 )); RPFX=${SR_CCACHE_REMOTE_PREFIX:-ccache/}
-  proxy_up(){ [ -n "$(ss -ltnH "sport = :$PPORT" 2>/dev/null)" ]; }   # 不能 `ss | grep -q`：pipefail 下 SIGPIPE 返回 141（踩过）
+  # codex r15#1（P1）：原来只看"端口在监听"就把令牌发过去。端口是 20700+uid%500 算出来的，同机别人能算；
+  # 他只要抢在我们之前 bind 住它，ccache 就会把 Bearer 令牌连同全部缓存请求发给他，他还能伪造缓存响应。
+  # Bearer 只认证了客户端，没认证服务端。ccache 的 http 后端不支持 unix socket 和 https，改不了协议，
+  # 那就改判据：这个监听必须归属于**本容器 PID 命名空间里**、跑着我们这个代理脚本的进程。
+  # 判据为什么成立：容器有独立 PID 命名空间，宿主机或别的容器占住的端口，在我们这里
+  # `ss -ltnpH` 给不出 users:(pid=...)（实测：自己的那行有 users:((...))，外面的那行这一栏是空的）。
+  port_busy(){ [ -n "$(ss -ltnH "sport = :$PPORT" 2>/dev/null)" ]; }   # 不能 `ss | grep -q`：pipefail 下 SIGPIPE 返回 141（踩过）
+  # 占着该端口、且能在本命名空间归因到我们这个脚本的 pid（可能有多个 fd 行，逐个看）
+  proxy_pids(){ local line pid out=""
+    line=$(ss -ltnpH "sport = :$PPORT" 2>/dev/null)
+    case "$line" in *users:*) ;; *) return 0;; esac
+    for pid in $(printf '%s\n' "$line" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+      case "$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)" in *oss-ccache-proxy.py*) out="$out $pid";; esac
+    done
+    printf '%s' "${out# }"; }
+  # 是我们的代理，而且用的就是我们这份令牌文件
+  proxy_mine(){ local pid cl
+    for pid in $(proxy_pids); do
+      cl=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
+      case "$cl" in *"--token-file $TOKF"*) return 0;; esac
+    done; return 1; }
   # review r7#4(P1)：容器 --network host，127.0.0.1 挡不住本机其他用户；代理无鉴权时任何人都能用所有者凭据 PUT 污染 / DELETE 共享缓存。
   # 每用户随机令牌存 /farm/ccache-token（0600，目录已是 0700），ccache 用 http 后端自带的 bearer-token 属性携带，代理对所有方法校验。
   TOKF=/farm/ccache-token
@@ -198,17 +218,54 @@ if [ "$TARGET" != fe ] && [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] 
     rm -f "$TOKF.tmp.$$" 2>/dev/null
   fi
   TOK=$(cat "$TOKF" 2>/dev/null)
-  # 旧版（无鉴权）代理还在跑时，不带令牌 GET /_stats 会得 200 → 杀掉重起，否则鉴权形同虚设（kill 只影响本用户端口的代理）
-  if proxy_up && command -v curl >/dev/null 2>&1 \
-     && [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PPORT/_stats" 2>/dev/null)" = 200 ]; then
-    echo "   (发现无鉴权的旧版 ccache 代理，重启以启用令牌校验)"; pkill -f "oss-ccache-proxy.py .*--listen 127.0.0.1:$PPORT " 2>/dev/null; sleep 0.5
+  # codex r15#8：代理只在启动时读配置。改了桶/前缀/endpoint/密钥之后，编译端看见端口在就直接复用，
+  # 却按新配置打印"ccache 远端: oss://新桶/新前缀"——实际请求仍发往旧目标，密钥轮换后则一直失败。
+  # 桶/前缀/配置路径都写在代理的命令行上，直接比对即可，不用发网络请求；密钥内容变化则比配置文件的
+  # mtime 与进程启动时间（/proc/<pid> 的 mtime）。
+  # 进程启动的绝对时刻。不能用 stat -c %Y /proc/<pid>：procfs 目录的 mtime 不是启动时间，
+  # 实测它跟着当前时间走（刚起 2 秒的进程也报"0 秒前"）。正解是 /proc/<pid>/stat 的 starttime
+  # （第 22 个字段，单位时钟滴答，自开机起算）加上 /proc/stat 里的 btime。
+  # comm 字段可能含空格和括号，所以先按最后一个 ")" 切掉前两个字段，剩下的第 20 个才是 starttime。
+  proc_start(){ local bt rest st tck
+    bt=$(awk '/^btime /{print $2}' /proc/stat 2>/dev/null)
+    rest=$(sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null)
+    st=$(printf '%s\n' "$rest" | awk '{print $20}')
+    tck=$(getconf CLK_TCK 2>/dev/null)
+    # 三个必须各自校验：拼成一串判数字时，空的 st 会被 bt 和 tck 掩盖掉，
+    # 于是查一个不存在的 pid 也会"成功"返回（自测抓到）。
+    for v in "${bt:-}" "${st:-}" "${tck:-}"; do case "$v" in ''|*[!0-9]*) return 1;; esac; done
+    [ "$tck" -gt 0 ] || return 1
+    echo $(( bt + st / tck )); }
+  proxy_stale(){ local pid cl st
+    pid=$(proxy_pids | awk '{print $1}'); [ -n "$pid" ] || return 1
+    cl=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
+    case "$cl" in *"--bucket $SR_CCACHE_REMOTE_BUCKET "*) ;; *) return 0;; esac
+    case "$cl" in *"--prefix $RPFX "*) ;; *) return 0;; esac
+    case "$cl" in *"--config ${SR_OSSCFG:-} "*) ;; *) return 0;; esac
+    st=$(proc_start "$pid") || return 1
+    # 留 5 秒宽限：proc_start 是 btime 加上时钟滴答整除算出来的，实测会比真实启动时刻早约 1 秒，
+    # 卡边界比较会把"刚起来的代理 + 刚写好的配置"误判成过期，然后每次构建都白重启一次代理（自测抓到）。
+    # 真实场景里改配置和起代理隔着几分钟以上，5 秒宽限不会漏判。
+    [ "$(stat -c %Y "${SR_OSSCFG:-/nonexistent}" 2>/dev/null || echo 0)" -gt "$(( st + 5 ))" ]; }
+  # 我们自己的旧代理需要重起的两种情形；只杀归因得到的本命名空间进程，不再用 pkill -f 模糊匹配。
+  # 注意不能拿"不带令牌 GET /_stats 得 200"当无鉴权的判据——冒充者也可以这么应答。
+  if [ -n "$(proxy_pids)" ]; then
+    if ! proxy_mine; then
+      echo "   (发现无鉴权的旧版 ccache 代理，重启以启用令牌校验)"
+      kill $(proxy_pids) 2>/dev/null; sleep 0.5
+    elif proxy_stale; then
+      echo "   (ccache 代理还在用旧的桶/前缀/凭据，重启它以加载新配置)"
+      kill $(proxy_pids) 2>/dev/null; sleep 0.5
+    fi
   fi
-  if ! proxy_up && [ -f "${SR_OSSCFG:-/nonexistent}" ] && [ -n "$TOK" ]; then
+  if ! port_busy && [ -f "${SR_OSSCFG:-/nonexistent}" ] && [ -n "$TOK" ]; then
     setsid nohup python3 /usr/local/bin/oss-ccache-proxy.py --bucket "$SR_CCACHE_REMOTE_BUCKET" --prefix "$RPFX" --token-file "$TOKF" \
       --listen 127.0.0.1:$PPORT --config "$SR_OSSCFG" --log /farm/ccache-proxy.log </dev/null >>/farm/ccache-proxy.out 2>&1 8>&- 9>&- &
-    for i in 1 2 3 4 5 6; do proxy_up && break; sleep 0.5; done
+    for i in 1 2 3 4 5 6; do proxy_mine && break; sleep 0.5; done
   fi
-  if proxy_up && [ -n "$TOK" ]; then
+  if ! proxy_mine && port_busy; then
+    REMOTE_NOTE="未启用：端口 $PPORT 被本机其他进程占着，且归不到我们的代理进程上——不把令牌发出去（同机其他用户可能在冒充）"
+  elif proxy_mine && [ -n "$TOK" ]; then
     # connect-timeout 默认 100ms，-j56 并发下会误判；operation-timeout 要容得下 100MB 级的 PCH 结果
     export CCACHE_REMOTE_STORAGE="http://127.0.0.1:$PPORT/|bearer-token=$TOK|connect-timeout=3000|operation-timeout=60000"
     REMOTE_NOTE="oss://$SR_CCACHE_REMOTE_BUCKET/$RPFX (经本容器 :$PPORT)"
