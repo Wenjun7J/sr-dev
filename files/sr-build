@@ -228,8 +228,10 @@ if [ "$TARGET" != fe ] && [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] 
   # codex r15 复查#4：上一版靠"配置文件 mtime 晚于进程启动时刻 + 5 秒宽限"判过期。宽限是为了抵消
   # proc_start 的取整误差，但它同时制造了一个永久盲区：在代理启动后 5 秒内改凭据，mtime 落在宽限里，
   # 之后无论过多久这个比较都不会变，配置更新永远检不出来。改成记录真实指纹，不再依赖时间关系。
-  PFPF=/farm/.ccache-proxy.fp
-  cfg_fp(){ stat -c '%Y %s' "${SR_OSSCFG:-/nonexistent}" 2>/dev/null || echo "none"; }
+  # codex r15 终轮：指纹要能识别"同一秒内、长度不变"的改动，所以用内容哈希而不是 mtime+size；
+  # 文件只有几行，代价可以忽略。文件名按端口分，多 profile 容器共享 /farm 且各用各的端口时不会互相覆盖。
+  PFPF=/farm/.ccache-proxy.$PPORT.fp
+  cfg_fp(){ sha256sum "${SR_OSSCFG:-/nonexistent}" 2>/dev/null | cut -d' ' -f1 || true; }
   proxy_stale(){ local pid cl fpid fp
     pid=$(proxy_pids | awk '{print $1}'); [ -n "$pid" ] || return 1
     cl=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
@@ -251,12 +253,15 @@ if [ "$TARGET" != fe ] && [ $CACHE = 1 ] && [ -z "${CCACHE_REMOTE_STORAGE:-}" ] 
     fi
   fi
   if ! port_busy && [ -f "${SR_OSSCFG:-/nonexistent}" ] && [ -n "$TOK" ]; then
+    # 指纹必须在**启动之前**取。启动之后再取的话，若配置在这中间被改过，就会把新指纹记到一个
+    # 加载了旧配置的进程上，此后永远判不出过期（codex r15 终轮）。反过来记早了最多多重启一次代理，
+    # 这个方向的误差是安全的。
+    FP0=$(cfg_fp)
     setsid nohup python3 /usr/local/bin/oss-ccache-proxy.py --bucket "$SR_CCACHE_REMOTE_BUCKET" --prefix "$RPFX" --token-file "$TOKF" \
       --listen 127.0.0.1:$PPORT --config "$SR_OSSCFG" --log /farm/ccache-proxy.log </dev/null >>/farm/ccache-proxy.out 2>&1 8>&- 9>&- &
     for i in 1 2 3 4 5 6; do proxy_mine && break; sleep 0.5; done
-    # 记下这个代理进程加载配置时的指纹，供下次判断配置有没有变过
     PP=$(proxy_pids | awk '{print $1}')
-    [ -n "$PP" ] && { printf '%s %s\n' "$PP" "$(cfg_fp)" > "$PFPF" 2>/dev/null; chmod 600 "$PFPF" 2>/dev/null; }
+    [ -n "$PP" ] && { printf '%s %s\n' "$PP" "$FP0" > "$PFPF" 2>/dev/null; chmod 600 "$PFPF" 2>/dev/null; }
   fi
   if ! proxy_mine && port_busy; then
     REMOTE_NOTE="未启用：端口 $PPORT 被本机其他进程占着，且归不到我们的代理进程上——不把令牌发出去（同机其他用户可能在冒充）"

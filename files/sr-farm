@@ -341,17 +341,18 @@ EOF
   # 后面又拿实际台数覆盖申请台数，于是"申请 5 台只回来 3 台"也会被报成就绪。
   RUNOK=0
   for i in $(seq 1 45); do sleep 20; S=$($API row "$NAME"|cut -d'|' -f1); [ "$S" = Running ] && { RUNOK=1; break; }; done
+  # codex r15 终轮：超时（RUNOK!=1）时平台还在 APPLYING，这一步本来就静默失效，没必要发；
+  # 把就绪判定提到它前面，超时就直接停，不做无用调用。
+  if [ "$RUNOK" != 1 ]; then
+    echo "!! 等了 15 分钟平台仍不是 Running（最后一次读到 '${S:-读不到}'）。已中止部署，状态留在 initializing。"
+    echo "   集群 $ID 仍在——稍后**再跑一次 sr farm init** 会从断点继续，不会重新申请机器；确定不要了就 sr farm down 回收。"
+    exit 1
+  fi
   # 必须在 RUNNING 之后调：APPLYING 阶段调用会静默失效（实测）
   $API op "$ID" disable_auto_release >/dev/null
   NODES=$($API nodes "$NAME")
   [ -n "$NODES" ] || { echo "取不到节点 IP，中止（集群 $ID 仍在，可 sr-farm down 清理）"; exit 1; }
   SCHED=$HOSTIP; NW=$(echo $NODES | wc -w)
-  if [ "$RUNOK" != 1 ]; then
-    echo "!! 等了 15 分钟平台仍不是 Running（最后一次读到 '${S:-读不到}'），此刻拿到的 $NW 个节点可能只是一部分。"
-    echo "   已中止部署，状态留在 initializing。集群 $ID 仍在——稍后**再跑一次 sr farm init** 会从断点继续，"
-    echo "   不会重新申请机器；确定不要了就 sr farm down 回收。"
-    exit 1
-  fi
   if [ "$NW" -ne "$WANTW" ]; then
     echo "!! 申请了 $WANTW 台，平台只给出 $NW 台节点。已中止部署，状态留在 initializing。"
     echo "   集群 $ID 仍在——节点补齐后再跑一次 sr farm init 会从断点继续；确定不要了就 sr farm down 回收。"
@@ -583,10 +584,16 @@ _watchdog)
   # fd 6 专供此用：8 是生命周期锁、9 是 sr-build 的构建锁（wd_ensure 已经关掉了）。
   { exec 6>"$FARM/watchdog.lock"; } 2>/dev/null || { echo "$(date '+%F %T') 打不开看门狗单例锁，退出" >>"$LOGF"; exit 1; }
   # 拿不到锁通常就是已经有一个在跑；但也可能是某个继承了 fd 6 的子进程还攥着（上面各处 6>&- 就是为了
-  # 杜绝这种情况）。所以拿不到时确认一下真有看门狗在，没有就把原因写进日志，别静默消失（codex r15 复查#1）。
-  if ! flock -n 6; then
-    pgrep -f "[s]r-farm _watchdog" >/dev/null \
-      || echo "$(date '+%F %T') !! 拿不到看门狗单例锁，但没发现别的看门狗在跑——可能有子进程继承了锁 fd，稍后 sr build 会再拉一次" >>"$LOGF"
+  # 杜绝这种情况，但预热等路径仍可能短暂继承）。所以先重试几次再放弃（codex r15 复查#1 / 终轮）。
+  WDGOT=0
+  for _i in 1 2 3 4 5; do flock -n 6 && { WDGOT=1; break; }; sleep 3; done
+  if [ $WDGOT = 0 ]; then
+    # 这里不再试图判断"是不是真有另一个看门狗在跑"。codex r15 终轮指出 pgrep 会匹配到自己；
+    # 而排掉自己之后仍会匹配到 timeout / setsid 之类带着同样命令行的包装进程（自测抓到），
+    # 判不准。告警的意义是让卡住的情形可见，宁可多记一行：真有另一个看门狗时这行只是噪音，
+    # 而 wd_ensure 已经用 pgrep 做过快速路径，正常情况下根本不会走到这里。
+    echo "$(date '+%F %T') 拿不到看门狗单例锁（重试 15 秒）。若确有另一个看门狗在跑，这行可忽略；" >>"$LOGF"
+    echo "$(date '+%F %T')   否则可能有子进程继承了锁 fd，续约会停摆——下次 sr build 会再拉一次，或手动 sr farm resume" >>"$LOGF"
     exit 0
   fi
   RENEW_FAILS=0
