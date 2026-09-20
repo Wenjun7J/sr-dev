@@ -63,6 +63,9 @@ beat(){ : > $FARM/last-build 2>/dev/null; chmod 666 $FARM/last-build 2>/dev/null
 # 8>&-：别把生命周期锁带进常驻进程。SR_WD_BASE_*：把「source 配置之前」的纯环境基线显式传给看门狗——
 # 父进程是 set -a 导出配置后才 fork 的，子进程若自己从环境里取基线，取到的是被配置污染的值，
 # 于是从配置里删掉某项后永远回不到默认（codex r10#5）。
+# codex r15#5：pgrep 不是互斥——两棵树同时 sr build 时，两个 _wd 可以都在对方起来之前通过检查，
+# 于是跑出两个看门狗各自续约、预热、判休眠，一个刚唤醒另一个就可能把它睡掉。
+# pgrep 保留为廉价快速路径，真正的单例由 _watchdog 入口那把 flock 保证（拿不到就直接退出）。
 wd_ensure(){ pgrep -f "[s]r-farm _watchdog" >/dev/null || {
   SR_WD_BASE_IDLE="$ENVBASE_IDLE_MIN" SR_WD_BASE_RENEW_MIN="$ENVBASE_RENEW_MIN" SR_WD_BASE_RENEW_H="$ENVBASE_RENEW_H" \
     setsid nohup "$0" _watchdog </dev/null >>"$LOGF" 2>&1 8>&- 9>&- & }; }
@@ -111,6 +114,15 @@ provision_nodes(){ local first=${1:-0} ip p bad="" pids=() ips=()
   for i in "${!pids[@]}"; do wait "${pids[$i]}" || bad="$bad ${ips[$i]}"; done
   [ -n "$bad" ] && echo "   !! 这些节点部署未成功：$bad（上面每行的 iceccd= 字段能看出卡在哪）"
   [ -z "$bad" ]; }
+# 全机有没有编译在跑：按源码树锁判断（pgrep 只看得见本容器，多 profile 下会把别人的编译当空闲）。
+# 任意一把锁被占住就算忙。没有 flock 就当"不忙"——这个判据只用来决定要不要自动休眠，
+# 判错的代价是白睡一次（构建会退回本地），不是数据损坏。
+busy(){ local f
+  command -v flock >/dev/null || return 1
+  for f in "$FARM"/sr-build.*.lock; do
+    [ -e "$f" ] || continue
+    ( exec 8>>"$f"; flock -n 8 ) >/dev/null 2>&1 || return 0
+  done; return 1; }
 wait_workers(){ local i; for i in $(seq 1 "$1"); do sleep 2; [ "$(dcount)" -ge "$WORKERS" ] && return 0; done; return 1; }
 # scheduler 的文本管理口（端口 = SPORT+1，icecream 自带）。原来只在 usage 分支里定义，预热也要用，提到全局。
 sched_q(){ exec 3<>/dev/tcp/127.0.0.1/$((SPORT+1)) 2>/dev/null || return 1; printf '%s\nquit\n' "$1" >&3; timeout 2 cat <&3; exec 3>&-; }
@@ -255,7 +267,10 @@ init)
     echo "   注意：这不代表平台上没建出来——响应超时或断连时集群可能已经创建并开始计费。"
     echo "   请按名字 $NAME 和创建时间到平台核对；若确实建出来了，手工释放后再重试 sr farm init。"; exit 1; }
   echo "== 等待 RUNNING（约 5-6 分钟）…"
-  for i in $(seq 1 45); do sleep 20; S=$($API row "$NAME"|cut -d'|' -f1); [ "$S" = Running ] && break; done
+  # codex r15#7：原来不看等没等到就往下走。超时后平台可能还在 APPLYING，此时取到的节点列表是不全的，
+  # 后面又拿实际台数覆盖申请台数，于是"申请 5 台只回来 3 台"也会被报成就绪。
+  RUNOK=0
+  for i in $(seq 1 45); do sleep 20; S=$($API row "$NAME"|cut -d'|' -f1); [ "$S" = Running ] && { RUNOK=1; break; }; done
   # 走到这里才按名字取 CID 是安全的：创建前已确认无同名集群、且创建确实成功。取不到就停，不猜、不部署
   # （codex r14：并发/重名场景下按名字回退可能认领到别人那一套，让另一套资源悬空）。
   ID=$($API cid "$NAME")
@@ -263,26 +278,48 @@ init)
                     echo "   已中止，不做任何部署。请到平台核对是否有新建出来的 $NAME，有就手工释放后重试。"; exit 1; }
   # review#3：拿到 CID 立刻落一份最小 state.env（initializing）。之后取节点/部署/连接检查任一步失败或被 Ctrl+C，
   # sr farm down 都能凭这份 CID 回收集群；成功后下面再覆盖成完整记录。
+  # codex r15#2：这一步失败（盘满/不可写/mv 失败）原来被完全忽略，于是集群已经建出来在计费，本地却没有任何 CID 记录，
+  # sr farm down 无从回收。落盘失败必须立刻中止，并把 CID 和回收办法打给人。
   printf 'CLUSTER=%s\nCID=%s\nSCHED=%s\nNETNAME=%s\nSPORT=%s\nDPORT=%s\nFARM_STATUS=initializing\n' \
-    "$NAME" "$ID" "$HOSTIP" "$NETNAME" "$SPORT" "$DPORT" > "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"   # 原子写：读方不会看到半行
+    "$NAME" "$ID" "$HOSTIP" "$NETNAME" "$SPORT" "$DPORT" > "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE" || {
+    rm -f "$STATE.tmp" 2>/dev/null
+    echo "!! 写不下农场状态 $STATE（盘满？$FARM 不可写？），但集群已经建出来并开始计费。"
+    echo "   集群名 $NAME，cluster_id=$ID。请到平台手工释放它，或腾出空间后用这个 id 重建记录。"
+    exit 1; }   # 原子写：读方不会看到半行
   # 必须在 RUNNING 之后调：APPLYING 阶段调用会静默失效（实测）
   $API op "$ID" disable_auto_release >/dev/null
   NODES=$($API nodes "$NAME")
   [ -n "$NODES" ] || { echo "取不到节点 IP，中止（集群 $ID 仍在，可 sr-farm down 清理）"; exit 1; }
   SCHED=$HOSTIP; NW=$(echo $NODES | wc -w)
+  if [ "$RUNOK" != 1 ]; then
+    echo "!! 等了 15 分钟平台仍不是 Running（最后一次读到 '${S:-读不到}'），此刻拿到的 $NW 个节点可能只是一部分。"
+    echo "   已中止部署，状态留在 initializing。集群 $ID 仍在，稍后 sr farm resume 续做，或 sr farm down 回收。"
+    exit 1
+  fi
+  if [ "$NW" -ne "$WORKERS" ]; then
+    echo "!! 申请了 $WORKERS 台，平台只给出 $NW 台节点。已中止部署，状态留在 initializing。"
+    echo "   集群 $ID 仍在：确认平台侧规格后 sr farm resume 续做，或 sr farm down 回收。"
+    exit 1
+  fi
   echo "   cluster_id=$ID  scheduler=$SCHED(本容器)  worker($NW): $NODES"
   echo "== 铺密钥 + 部署 icecc（顺便清掉 TSP 的 StarRocks：FE 的 -Xmx26g 会压垮 8c32g 节点）…"
-  provision_nodes 1
-  # 部署完必须实测有几台 worker 连上了；不够就标 degraded 而不是 running（踩过：3 台 apt 失败却当成功）
+  # codex r15#6：provision_nodes 已经逐台收集了退出码，这里却整个忽略，只靠"连上几台"判成败。
+  # TCP 连上不等于配置写对了——节点上可能跑着旧配置的 daemon。两个条件都必须满足才算 running。
+  PROV_OK=1; provision_nodes 1 || PROV_OK=0
   WORKERS=$NW
-  if wait_workers 30; then INIT_STATUS=running
+  if wait_workers 30 && [ "$PROV_OK" = 1 ]; then INIT_STATUS=running
   else INIT_STATUS=degraded
+       [ "$PROV_OK" = 1 ] || echo "!! 有节点的 node-setup.sh 返回失败，即使都连上了也标 degraded（配置可能没写对）。"
        echo "!! 只有 $(dcount)/$NW 台 worker 连上 scheduler，已标 degraded。上面每行的 iceccd= 字段能看出哪台没装上。"
        echo "   修复：sr farm resume（会重新下发并校验）"
   fi
   NCPU=$(node_jobs)   # 每台并发槽，供 sr-build 算总 J；nodes 已部署好，此处 ssh 能通
   printf 'CLUSTER=%s\nCID=%s\nSCHED=%s\nNODES="%s"\nWORKERS=%s\nNCPU=%s\nNETNAME=%s\nSPORT=%s\nDPORT=%s\nFARM_STATUS=%s\n' \
-         "$NAME" "$ID" "$SCHED" "$NODES" "$NW" "$NCPU" "$NETNAME" "$SPORT" "$DPORT" "$INIT_STATUS" > "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
+         "$NAME" "$ID" "$SCHED" "$NODES" "$NW" "$NCPU" "$NETNAME" "$SPORT" "$DPORT" "$INIT_STATUS" > "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE" || {
+    rm -f "$STATE.tmp" 2>/dev/null
+    echo "!! 写不下最终农场状态 $STATE（盘满？）。集群 $ID 已部署好但记录仍停在 initializing，"
+    echo "   看门狗不会续约，它会在租期到点后被释放。腾出空间后重跑 sr farm resume 修复记录。"
+    exit 1; }
   beat; wd_ensure
   # 预热前先放生命周期锁：预热会编译几分钟，不该把 suspend/down 一直挡在外面（codex r9）
   { exec 8>&-; } 2>/dev/null; warm_workers
@@ -345,8 +382,17 @@ usage)
   if [ "${2:-}" = --watch ]; then while true; do clear; date '+%F %T'; once; sleep "${3:-5}"; done; else once; fi ;;
 status)
   [ -f "$STATE" ] || { echo "当前无农场"; exit 1; }
-  { load_state || exit 1; }; IFS='|' read -r S T N <<<"$($API row "$CLUSTER")"
-  # 平台上查不到 = 集群已不在（到期释放/被清扫），本地记录只是残影，别把空状态当正常打出来
+  { load_state || exit 1; }
+  # codex r15#11：原来 read <<< "$(...)" 把 API 的退出码丢了，于是"查询失败"和"集群真的没了"都表现为空状态，
+  # 一律建议清记录重建——凭据过期或网络抖一下就可能让人误删还活着的农场记录。先分开拿输出和退出码。
+  ROW=$($API row "$CLUSTER"); RROW=$?
+  if [ $RROW -ne 0 ]; then
+    echo "!! 查询平台失败（$API row 退出码 $RROW），无法确认集群 $CLUSTER (id=$CID) 现在的状态。"
+    echo "   这不代表农场没了。检查 ~/.tsp 凭据与网络后重试；确认没了再 sr farm down。"
+    exit 1
+  fi
+  IFS='|' read -r S T N <<<"$ROW"
+  # 查得到但这一行是空的 = 集群已不在（到期释放/被清扫），本地记录只是残影
   if [ -z "$S" ]; then
     echo "!! 集群 $CLUSTER (id=$CID) 在平台上已不存在——很可能到期被释放（看门狗停过 3 小时以上？）。"
     echo "   本地记录状态=$FARM_STATUS 已失效。处理：sr farm down 清记录，再 sr farm init 重建。"
@@ -354,9 +400,18 @@ status)
   fi
   LB=$(stat -c %Y $FARM/last-build 2>/dev/null || echo 0)
   sched_ensure; D=$(dcount)
-  printf "集群 %s (id=%s)\n平台状态 %s / 本地记录 %s\n到期 %s   22点清扫 %s\nscheduler %s:%s(本容器)   worker 已连 %s/%s\n距上次编译 %d 分钟\n看门狗 %s\n" \
+  # 看门狗"进程还在"不等于"续约还成着"：凭据过期时它会一直在跑却一次也续不上（codex r15#3）。
+  # 所以把最近一次成功续约的时刻一起报出来，超过两个续约周期就明说不正常。
+  LR=$(cat "$FARM/.last-renew" 2>/dev/null); LR=${LR//[!0-9]/}
+  if [ -n "$LR" ]; then
+    RAGE=$(( ($(date +%s)-LR)/60 ))
+    if [ "$RAGE" -gt $(( RENEW_MIN * 2 )) ]; then RENEWMSG="$RAGE 分钟前（!! 超过两个周期，续约可能已失败，看 $LOGF）"
+    else RENEWMSG="$RAGE 分钟前"; fi
+  elif pgrep -f '[s]r-farm _watchdog' >/dev/null; then RENEWMSG="还没有成功记录（看门狗刚起？超过 $RENEW_MIN 分钟仍如此就看 $LOGF）"
+  else RENEWMSG="无记录（看门狗没在跑）"; fi
+  printf "集群 %s (id=%s)\n平台状态 %s / 本地记录 %s\n到期 %s   22点清扫 %s\nscheduler %s:%s(本容器)   worker 已连 %s/%s\n距上次编译 %d 分钟\n看门狗 %s   上次成功续约 %s\n" \
     "$CLUSTER" "$CID" "$S" "$FARM_STATUS" "$T" "$N" "$SCHED" "$SPORT" "$D" "$WORKERS" $(( ($(date +%s)-LB)/60 )) \
-    "$(pgrep -f '[s]r-farm _watchdog' >/dev/null && echo 运行中 || echo 已停)"
+    "$(pgrep -f '[s]r-farm _watchdog' >/dev/null && echo 运行中 || echo 已停)" "$RENEWMSG"
   ;;
 resume|up)
   lifecycle_lock
@@ -378,10 +433,12 @@ resume|up)
     echo "农场就绪：$WORKERS 台 worker 已连"
   else
     echo "== 120 秒内 worker 未全部连上（$(dcount)/$WORKERS），重新下发节点配置修复…"
-    provision_nodes 0
-    if wait_workers 45; then echo "修复后就绪：$WORKERS 台 worker 已连"
+    # codex r15#6：部署脚本报失败时，即使随后都连上了也不能算修好——连上的可能是带着旧配置的 daemon。
+    PROV_OK=1; provision_nodes 0 || PROV_OK=0
+    if wait_workers 45 && [ "$PROV_OK" = 1 ]; then echo "修复后就绪：$WORKERS 台 worker 已连"
     else
       sed -i 's/^FARM_STATUS=.*/FARM_STATUS=degraded/' "$STATE"; wd_ensure
+      [ "${PROV_OK:-1}" = 1 ] || echo "!! 有节点的 node-setup.sh 返回失败，配置可能没写对。"
       echo "!! 农场不健康：仅 $(dcount)/$WORKERS 连上，已标记 degraded，sr build 会拒绝开工。"
       echo "   排查：sr farm status / 节点上 systemctl status iceccd / scheduler 端口 $SPORT"
       exit 1
@@ -393,6 +450,16 @@ resume|up)
 suspend)
   lifecycle_lock
   { load_state || exit 1; }
+  # codex r15#4：看门狗那边"判空闲"和"真正动手"之间有窗口，构建可能刚好在这中间开工。
+  # 自动路径带 --if-idle，在拿到生命周期锁之后再复核一次；人手动 sr farm suspend 不带这个标志，照做不误。
+  # 复核之后到平台调用之间仍有毫秒级窗口，这是刻意接受的：判错的代价是白睡一次（构建退回本地），不是数据损坏。
+  if [ "${2:-}" = --if-idle ]; then
+    LBN=$(stat -c %Y "$FARM/last-build" 2>/dev/null || echo 0)
+    IDLEN=$(( ($(date +%s)-LBN)/60 ))
+    if busy || [ "$IDLEN" -lt "${SR_IDLE_MIN_AT_DECIDE:-$IDLE_MIN}" ]; then
+      echo "$(date '+%F %T') 复核时发现有构建在跑（或刚开工 ${IDLEN} 分钟），取消这次自动休眠"; exit 0
+    fi
+  fi
   # review#4：原来不看返回码就写 suspended——机器其实还在跑，看门狗却以为睡了、不再尝试休眠还继续续约。失败就保持原状态并返回非零，
   # 下个空闲周期会再试（tspapi op 业务失败/HTTP 失败都以非零退出）
   if $API op "$CID" stop >/dev/null; then
@@ -441,6 +508,11 @@ rebalance)
   echo "完成。sr farm usage 里各台 speed 应都 > 0" ;;
 _wd) wd_ensure; exit 0 ;;
 _watchdog)
+  # 单例锁，持有整个进程生命周期；拿不到说明已经有一个在跑，直接退出。
+  # fd 6 专供此用：8 是生命周期锁、9 是 sr-build 的构建锁（wd_ensure 已经关掉了）。
+  { exec 6>"$FARM/watchdog.lock"; } 2>/dev/null || { echo "$(date '+%F %T') 打不开看门狗单例锁，退出" >>"$LOGF"; exit 1; }
+  flock -n 6 || exit 0
+  RENEW_FAILS=0
   while true; do
     [ -f "$STATE" ] || exit 0
     # 热加载站点配置：看门狗是常驻进程，只在启动时读一次的话，改了 IDLE_MIN/RENEW_MIN/RENEW_H 同步进来也不生效
@@ -453,30 +525,37 @@ _watchdog)
     # 正在释放的集群不能再续约/唤醒：看门狗自己识别状态退出，不依赖 down 那一次 pkill
     [ "${FARM_STATUS:-}" = releasing ] && { echo "$(date '+%F %T') 农场正在释放，看门狗停止续约并退出" >>"$LOGF"; exit 0; }
     [ "${FARM_STATUS:-}" = running ] && sched_ensure
-    $API op "$CID" renew $RENEW_H >/dev/null 2>&1   # 重置为 now+RENEW_H 小时
+    # codex r15#3：原来续约的退出码和输出全丢掉，凭据过期或平台不可达时看门狗照样"在跑"，
+    # 而节点会在租期到点后被平台释放——正编到一半农场没了，还找不到任何线索。
+    # 现在：记成功时间、连续失败计数，失败就写日志并缩短下一轮间隔；status 会把这些读出来。
+    RWAIT=$RENEW_MIN
+    if RENEW_ERR=$($API op "$CID" renew $RENEW_H 2>&1 >/dev/null); then   # 重置为 now+RENEW_H 小时
+      RENEW_FAILS=0; date +%s > "$FARM/.last-renew" 2>/dev/null; chmod 666 "$FARM/.last-renew" 2>/dev/null
+    else
+      RENEW_FAILS=$((RENEW_FAILS+1)); RWAIT=1        # 失败后一分钟就重试，别等满一个周期
+      echo "$(date '+%F %T') !! 续约失败（连续第 $RENEW_FAILS 次）：${RENEW_ERR:0:200}" >>"$LOGF"
+      [ "$RENEW_FAILS" = 3 ] && echo "$(date '+%F %T') !! 已连续 3 次续约失败，农场会在租期到点后被平台释放。请检查 ~/.tsp 凭据与平台可达性。" >>"$LOGF"
+    fi
     # 平台每天 0 点把 auto-release 重置为 true，不重发的话农场会在某天 22 点被清掉。
     # 幂等且便宜，索性每轮都发一次。
-    $API op "$CID" disable_auto_release >/dev/null 2>&1
+    $API op "$CID" disable_auto_release >/dev/null 2>&1 \
+      || echo "$(date '+%F %T') !! disable_auto_release 失败，农场可能在 22 点被平台清扫" >>"$LOGF"
     if [ -f "$FARM/resume-request" ]; then
       rm -f "$FARM/resume-request"; "$0" resume >>"$LOGF" 2>&1
     else
       LB=$(stat -c %Y $FARM/last-build 2>/dev/null || echo 0)
       IDLE=$(( ($(date +%s)-LB)/60 ))
-      # pgrep 只能看见本容器的进程，多 profile 场景下会把别的容器正在跑的编译当成空闲
-      # 而把农场睡掉。改查共享锁：拿得到锁 = 全机确实没有编译在跑。
-      # 锁是按源码树分的，任意一把被占住就算忙
-      busy(){ command -v flock >/dev/null || return 1
-              for f in /farm/sr-build.*.lock; do
-                [ -e "$f" ] || continue
-                ( exec 8>"$f"; flock -n 8 ) >/dev/null 2>&1 || return 0
-              done; return 1; }
+      # codex r15#4：这里判完到 suspend 真正动手之间有个窗口，新构建可能刚好在这中间开工。
+      # 所以只在这里做粗筛，最终判据交给 suspend 在生命周期锁内复核一次（--if-idle）。
+      # 6>&-：别把看门狗的单例锁带进子进程，否则它活着的时候锁一直被占。
       if [ "$IDLE" -ge "$IDLE_MIN" ] && [ "${FARM_STATUS:-}" = running ] && ! busy; then
-        echo "$(date '+%F %T') 空闲 ${IDLE} 分钟 -> 休眠" >>"$LOGF"; "$0" suspend >>"$LOGF" 2>&1
+        echo "$(date '+%F %T') 空闲 ${IDLE} 分钟 -> 休眠" >>"$LOGF"
+        SR_IDLE_MIN_AT_DECIDE=$IDLE_MIN "$0" suspend --if-idle >>"$LOGF" 2>&1 6>&-
       fi
     fi
     # scheduler 探活要比续费勤得多：它一死，所有任务立刻退回本地（实测仍能编完、
     # 不会 OOM，因为本地 daemon 把并发卡在 -m 16），但全程降级。等 15 分钟才发现太亏了。
-    for _ in $(seq 1 $((RENEW_MIN))); do
+    for _ in $(seq 1 $((RWAIT))); do
       sleep 60
       [ -f "$STATE" ] || exit 0
       [ "${FARM_STATUS:-}" = running ] && { sched_ensure; warm_if_starving; }
