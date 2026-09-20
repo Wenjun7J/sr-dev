@@ -90,6 +90,8 @@ maven-compiler-plugin 3.1 据此判定「Changes detected」整模块重编 4670
 
 链接有两道并发闸门，都由 `files/cmake-linkpool` 在 configure 时经上游 `CUSTOM_CMAKE` 钩子注入：ninja 的 `CMAKE_JOB_POOL_LINK` 管住单次构建，
 `files/linkgate`（`CMAKE_CXX_LINKER_LAUNCHER`，flock 抢槽）管住整个容器。只有前者不够：容器里可以同时有几棵树在编，每棵都按整个容器的内存算槽数，加起来照样撞上限。
+闸门是共享的、槽位不带内存权重，所以槽数只能用一个数，且按最坏的那种链接（ASAN 约 16G）估——这样不管几棵树、什么类型混着跑，"同时在跑的链接器 × 最坏单个开销"都在预算内。
+闸门只是内存保护，任何一步不顺（没有 flock、槽目录建不了、槽文件打不开）都直接放行并在 stderr 说明，不让它成为构建失败的新原因。
 上游没有任何 JOB_POOL，链接并发等于编译并发，而链接不经 icecc：ASAN 单测上百个 ld.lld 各 2~4G，实测 `-j80` 时 35 个同时跑撞上限被杀，
 `-j8` 时 8 个也把 24G 容器顶在 memory.max 上反复回收、进度停在 thrift 检查之后不动。池大小按容器内存算（(内存-4G)/8G，钳 1~4），`SR_LINK_JOBS` 可改。
 

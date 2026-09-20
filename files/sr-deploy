@@ -120,12 +120,17 @@ SR=$(find_root) || die "当前目录 $(pwd -P) 不在任何 StarRocks 源码树�
 # 和 sr pack 同一个道理（codex r14#7 指的是 pack，deploy 读的是同一个 output/，问题一样）：
 # ninja install 是逐文件拷贝，构建收尾时部署会把半装好的产物拷进集群目录，且不会有任何报错。
 # 用 sr-build 的同一把源码树锁；拿不到就直接拒绝，不要"等一会儿"——部署是人主动发起的，不急这一次。
+# codex 复查#8：锁文件不存在就跳过加锁，等于"第一次用的时候没有互斥"——所以无条件建出来再锁；
+# 连 flock 都没有就直接拒绝，宁可不干也不要在没有互斥的情况下读正在变化的 output。
+# codex 复查#9：无命令的 `exec … 2>/dev/null` 会把重定向留在当前 shell，后面所有 stderr 都消失，
+# 必须用 { } 把重定向限定在这一句（这个坑项目里已经踩过两次）。
 DLOCK=/farm/sr-build.$(printf %s "$SR" | md5sum | cut -c1-12).lock
-if command -v flock >/dev/null && [ -e "$DLOCK" ]; then
-  exec 9>>"$DLOCK" 2>/dev/null && flock -n 9 \
-    || die "这棵源码树正在编译：$SR
+command -v flock >/dev/null || die "没有 flock，无法与构建互斥；这时候部署可能拿到半装好的产物，已拒绝。"
+: > "$DLOCK" 2>/dev/null || [ -e "$DLOCK" ] || die "建不了源码树锁 $DLOCK"
+chmod 666 "$DLOCK" 2>/dev/null
+{ exec 9>>"$DLOCK"; } 2>/dev/null || die "打不开源码树锁 $DLOCK"
+flock -n 9 || die "这棵源码树正在编译：$SR
    ninja install 是逐文件拷贝，这时候部署会拿到半装好的产物。等它编完再来。"
-fi
 
 BE_SRC=$SR/output/be; FE_SRC=$SR/output/fe
 [ "$WANT_BE" = 1 ] && [ ! -x "$BE_SRC/lib/starrocks_be" ] && { log "   （跳过 BE：$BE_SRC/lib/starrocks_be 不存在，这棵树还没编出 BE）"; WANT_BE=0; }
@@ -223,13 +228,15 @@ printf '来源: %s\n提交: %s@%s\n时间: %s\n内容: %s\n' \
 # start_be.sh / start_fe.sh 自己从脚本位置推导 STARROCKS_HOME，所以拷到部署目录后直接跑即可。
 log "== 启动"
 if [ "$WANT_BE" = 1 ]; then
-  ( cd "$DEPLOY/be" && ./bin/start_be.sh --daemon ) >/dev/null 2>&1
+  # 9>&- 必须加：BE 是常驻进程，继承了源码树锁的 fd 就会把锁永久占住，这棵树以后再也编不了、
+  # 打不了包、也部署不了（codex 复查#1；项目里 iceccd 踩过一模一样的坑）。
+  ( cd "$DEPLOY/be" && ./bin/start_be.sh --daemon ) >/dev/null 2>&1 9>&-
   for i in $(seq 1 30); do sleep 1; [ -n "$(pids_of be)" ] && break; done
   [ -n "$(pids_of be)" ] && log "   BE 已起 (pid $(pids_of be | tr '\n' ' '))" \
     || { log "   !! BE 没起来，看 $DEPLOY/be/log/be.out"; tail -5 "$DEPLOY/be/log/be.out" 2>/dev/null | sed 's/^/      /'; }
 fi
 if [ "$WANT_FE" = 1 ]; then
-  ( cd "$DEPLOY/fe" && ./bin/start_fe.sh --daemon ) >/dev/null 2>&1
+  ( cd "$DEPLOY/fe" && ./bin/start_fe.sh --daemon ) >/dev/null 2>&1 9>&-   # 同上，FE 也是常驻
   for i in $(seq 1 60); do sleep 1; [ -n "$(pids_of fe)" ] && break; done
   [ -n "$(pids_of fe)" ] && log "   FE 已起 (pid $(pids_of fe | tr '\n' ' '))" \
     || { log "   !! FE 没起来，看 $DEPLOY/fe/log/fe.out"; tail -5 "$DEPLOY/fe/log/fe.out" 2>/dev/null | sed 's/^/      /'; }

@@ -166,13 +166,16 @@ case "$LOCALCAP" in ''|*[!0-9]*) LOCALCAP=$JDEF;; *) LOCALCAP=$((10#$LOCALCAP));
 # 池大小按容器内存算：(内存 - 4G 给 FE/BE/代理) / 每个链接 8G 余量，钳在 1~4；SR_LINK_JOBS 可覆盖。也放在读完配置之后算。
 MEMGB=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
 case "$MEMGB" in ''|max|*[!0-9]*) MEMGB=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}');; *) MEMGB=$(( MEMGB / 1073741824 ));; esac
-# 单个链接进程的内存按构建类型估。2026-09-17 现场实测 ASAN 单测：三个 ld.lld 同时占 15.5G/13.2G/12.2G，
-# 把 48G 容器也填满（memory.peak 49151M/49152M）并被内核 OOM 杀掉一个。单个链接为什么这么贵：
+# 单个链接进程要多少内存：2026-09-17 现场实测 ASAN 单测三个 ld.lld 同时占 15.5G/13.2G/12.2G，
+# 把 48G 容器填满（memory.peak 49151M/49152M）并被内核 OOM 杀掉一个。为什么这么贵：
 #   每个测试可执行文件静态链入整个 BE（libExec 137M + libExpr 136M + libStorage 125M …，单次链接 393 个输入），
 #   ASAN 插桩让代码和元数据翻倍，-O0 不内联所以函数全量发射，-ggdb3 -gdwarf-5 是最啰嗦的调试信息（含宏定义），
 #   产出的单个测试二进制就有 2.8~3.2G；而 -fuse-ld=lld 的 lld 为了快会把全部输入读进内存再合并 DWARF。
-# 所以按 ASAN 16G / Debug 5G / Release 3G 估，再扣常驻大户：ccache 代理约 1.2G、sr deploy 起的 FE+BE 约 2G。
-case "$BT" in ASAN) LKMEM=16;; Debug) LKMEM=5;; *) LKMEM=3;; esac
+# codex 复查#5：原来按构建类型分别取 16/5/3G 估，但槽位是全容器共享的、不带内存权重——
+# ASAN 树算出 1 个槽、Debug 树算出 3 个，三者能同时持槽，加起来仍然超预算。
+# 共享的闸门只能用一个数，而且必须按最坏的那种链接（ASAN 16G）估，这样不管几棵树、什么类型混着跑，
+# "同时在跑的链接器数 × 最坏单个开销" 都在预算内。代价是 Release 少一两个槽，它的链接才 3G 左右，无所谓。
+LKMEM=16
 LINKJ=${SR_LINK_JOBS:-$(( (${MEMGB:-24} - 5) / LKMEM ))}
 case "$LINKJ" in ''|*[!0-9]*) LINKJ=1;; *) LINKJ=$((10#$LINKJ));; esac; [ "$LINKJ" -lt 1 ] && LINKJ=1; [ "$LINKJ" -gt 4 ] && LINKJ=4
 export SR_LINK_JOBS=$LINKJ SR_REAL_CMAKE=${CUSTOM_CMAKE:-cmake} CUSTOM_CMAKE=/usr/local/bin/cmake-linkpool
@@ -510,7 +513,7 @@ echo "=========================================================="
 echo " 目标: $([ $FEUT = 1 ] && echo "fe-ut   (FE 单测，run-fe-ut.sh；纯 maven，农场/ccache 不参与)" || echo "$([ "$TARGET" = ut ] && echo be || echo "$TARGET")$([ "$TARGET" = fe ] && echo "   (maven，农场/ccache 不参与)")$([ "$TARGET" = ut ] && echo "-ut   (BE 单测，run-be-ut.sh；$([ $RUN = 1 ] && echo 编完接着跑 || echo 只编不跑))")")"
 [ $FEUT = 1 ] && echo " 并发: maven -T $([ "$JSET" = 1 ] && echo "$JLOCAL（-j 指定）" || echo "4（run-fe-ut.sh 默认；-j N 可改）")"
 [ "$TARGET" = ut ] && [ $CLEAN = 1 ] && echo " 注意: run-be-ut.sh --clean 除了删 $TREE，还会删 $SR/be/output/（上游行为，BE 主程序产物也没了）"
-[ "$TARGET" != fe ] && echo " 类型: $BT      生成器: $GEN      并发: -j$J      链接池: $LINKJ 个 ld 同时跑（按 ${MEMGB}G 内存 / 每个链接约 ${LKMEM}G 估算；SR_LINK_JOBS 可改）"
+[ "$TARGET" != fe ] && echo " 类型: $BT      生成器: $GEN      并发: -j$J      链接闸门: 全容器同时 $LINKJ 个 ld（按 ${MEMGB}G 内存 / 最坏单个链接 ${LKMEM}G 估；SR_LINK_JOBS 可改）"
 echo " 模式: $FARM_NOTE"
 [ -n "${SR_DRYRUN:-}" ] && { echo " (SR_DRYRUN=1：决策已打印，到此为止不编译)"; exit 0; }   # 测试钩子：验证农场/交互决策
 echo " 版本: ${SR_VER:-未指定}   编译器: $(${STARROCKS_GCC_HOME:-/usr}/bin/gcc -dumpfullversion 2>/dev/null || echo ?)   依赖: ${STARROCKS_THIRDPARTY:-默认}"
@@ -563,7 +566,10 @@ SAMPLER=$!
 # review r7#7：EXIT 只清理；INT/TERM 要真正取消本次构建——杀构建自己的进程组、10s 宽限后仍有成员则 KILL、回收，再以 130/143 退出。
 # 原来一个 trap 兼任两职且不 exit：只 kill 驱动时，bash 等前台管道结束才跑 trap，采样器停了、构建照跑还可能报成功。
 HS=""   # 当前 run_build 的握手文件前缀；取消路径 on_signal 直接 exit，不会走到 run_build 末尾的清理，所以由 cleanup 兜底删
+SPLIT_TMP=""; SPLIT_DBG=""   # 拆调试符号时的临时大文件，登记在这里好让取消路径也能清掉（codex 复查#13）
 cleanup(){ kill $SAMPLER ${WAKER:-} 2>/dev/null; rm -f "$ANONF" "${RUNFLAG:-/nonexistent}" "${PROBE:-/nonexistent}" 2>/dev/null
+  [ -n "$SPLIT_TMP" ] && rm -f "$SPLIT_TMP" 2>/dev/null
+  [ -n "$SPLIT_DBG" ] && rm -f "$SPLIT_DBG" 2>/dev/null
   [ -n "$HS" ] && rm -f "$HS" "$HS.pgid" "$HS.ack" 2>/dev/null; }
 on_signal(){ local sig=$1 i
   echo ""; echo "!! 收到 $sig，取消本次构建…"
@@ -716,11 +722,16 @@ if [ "${MAXM:-0}" != 0 ] && [ "$MAXM" != max ] && [ "${PEAK:-0}" != 0 ]; then
 fi
 [ $CACHE = 1 ] && [ "$TARGET" != fe ] && ccache -s 2>/dev/null | grep -E 'Cacheable calls|Hits:|Uncacheable' | head -3   # 全局累计值，FE 不走 ccache 就不打
 
-# 回读校验链接闸门确实进了构建文件。上游分支的 env.sh 若不认 CUSTOM_CMAKE，注入会静默落空，
+# 回读校验两道闸门确实进了构建文件。上游分支的 env.sh 若不认 CUSTOM_CMAKE，注入会静默落空，
 # 而头部早就宣称过"链接池 N 个 ld 同时跑"——不验证就等于又造了一个"看着生效其实没有"的读数。
-if [ "$TARGET" != fe ] && [ -f "$TREE/build.ninja" ] && ! grep -q linkgate "$TREE/build.ninja" 2>/dev/null; then
-  echo "!! 链接闸门没进构建文件（$TREE/build.ninja 里找不到 linkgate），本次链接不受并发限制。"
-  echo "   多半是这个分支的 env.sh 不认 CUSTOM_CMAKE。大规模链接（尤其 ASAN 单测）可能撞内存上限。"
+# codex 复查#14：两者落在不同文件——CMake 的 Ninja 生成器把 pool 写进 build.ninja 的 build 语句，
+# 把 linker launcher 写进 CMakeFiles/rules.ninja 的规则命令里（实测确认）。分开查，别一处读全。
+if [ "$TARGET" != fe ] && [ -f "$TREE/build.ninja" ]; then
+  gate_ok=1
+  grep -q 'pool = link' "$TREE/build.ninja" 2>/dev/null || { gate_ok=0; echo "!! ninja 链接池没进 $TREE/build.ninja"; }
+  grep -q linkgate "$TREE/CMakeFiles/rules.ninja" 2>/dev/null || { gate_ok=0; echo "!! 容器级链接闸门没进 $TREE/CMakeFiles/rules.ninja"; }
+  [ $gate_ok = 1 ] || {
+    echo "   多半是这个分支的 env.sh 不认 CUSTOM_CMAKE，注入落空了。大规模链接（尤其 ASAN 单测）可能撞内存上限。"; }
 fi
 
 # 产物落点。build.sh 只会闷头打一句 OUTPUT DIR=，既不说二进制在哪也不说是不是这次新出的
@@ -782,14 +793,21 @@ if [ $RC -eq 0 ]; then
       echo "   需要几分钟，请稍候…"
       # codex r14#1：原来直接在原二进制上 strip，最后一步 add-gnu-debuglink 若失败（比如盘满），
       # 二进制已经被剥离，失败分支却又把唯一那份 .debuginfo 删了，还打印"保持原样、带完整符号"——
-      # 完整调试信息就此永久丢失。改成全程在副本上做，三步都成了才顶替原文件；任何失败原文件一个字节没动。
-      local bt=$b.split.$$ dt=$d.new.$$
-      if cp -p "$b" "$bt" 2>/dev/null \
-         && objcopy --only-keep-debug "$bt" "$dt" && strip --strip-debug "$bt" && objcopy --add-gnu-debuglink="$dt" "$bt" \
-         && mv -f "$dt" "$d" && mv -f "$bt" "$b"; then
+      # 完整调试信息就此永久丢失。所以原二进制在最后一步之前一个字节都不能动。
+      # codex 复查#2：但第一版改法把成功路径弄坏了——objcopy --add-gnu-debuglink 记进二进制的是
+      # 你传给它的那个路径的 **basename**，传临时名 x.debuginfo.new.$$ 就记了临时名，随后一改名
+      # 就指向不存在的文件，gdb 和 ASAN 符号器都找不到符号（实测二进制里写着 bin0.debuginfo.new.264661）。
+      # 现在的顺序：先用最终名生成 .debuginfo（只读原文件，不改它），再在副本上 strip 并写 debuglink，
+      # 最后才用副本顶替原文件。中途任何一步失败，原二进制仍是完整的，删掉半成品不丢任何东西。
+      local bt=$b.split.$$
+      SPLIT_TMP="$bt"; SPLIT_DBG="$d"        # 登记给 trap，取消时也能清掉这两个几 G 的临时文件（codex 复查#13）
+      if objcopy --only-keep-debug "$b" "$d" \
+         && cp -p "$b" "$bt" && strip --strip-debug "$bt" && objcopy --add-gnu-debuglink="$d" "$bt" \
+         && mv -f "$bt" "$b"; then
+        SPLIT_TMP=""; SPLIT_DBG=""
         echo "   已拆分 -> $(basename "$d")（用时 $(( ($(date +%s) - t0) / 60 ))m$(( ($(date +%s) - t0) % 60 ))s）"
       else
-        rm -f "$bt" "$dt" 2>/dev/null
+        rm -f "$bt" "$d" 2>/dev/null; SPLIT_TMP=""; SPLIT_DBG=""
         echo "   !! 拆分 $(basename "$b") 的调试符号失败（盘满？），原二进制未改动，仍带完整符号，只是加载慢些"
       fi; }
     for tb in starrocks_test starrocks_dw_test; do
@@ -822,8 +840,14 @@ if [ $RC -eq 0 ]; then
     # codex r14#11：原来从 ARGS 里"剔掉 --dry-run"，分不清那是驱动自己加的还是用户传的，
     # 于是 sr be-ut --dry-run 反而会真跑测试。改成直接用驱动参数 + 原样的用户参数重建，
     # 用户显式给的 --dry-run 会保留（run-be-ut.sh 看到它就只打印不执行，正是用户要的）。
+    # codex 复查#11：只写死两个驱动参数会丢掉 --without-java-ext（用户明确要求跳过的 java 扩展会被重建）；
+    # 而用户经 -- 透传的 --clean 必须滤掉，否则第二阶段又清一遍，变成完整重编，且此时采样和唤醒都已结束。
     RARGS=(-j "$JLOCAL" --without-debug-symbol-split)
-    [ ${#PASS[@]} -gt 0 ] && RARGS+=("${PASS[@]}")
+    [ $JAVAEXT = 0 ] && RARGS+=(--without-java-ext)
+    for a in ${PASS[@]+"${PASS[@]}"}; do
+      case "$a" in --clean) continue;; esac
+      RARGS+=("$a")
+    done
     # BE 打开 storage engine 前会检查 fd 上限，要求 >= 60000；容器默认软上限只有 1024（硬上限 524288），
     # 不抬就直接 "file descriptors limit is too small" 退出，一个用例都跑不了（2026-09-17 现场 rc=255，10 秒）。
     # 抬到 min(硬上限, 65536)；抬不动只提示不中止。ulimit 作用于本 shell 及其子进程，下面的 run-be-ut.sh 继承。

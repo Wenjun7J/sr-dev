@@ -117,54 +117,57 @@ cpu_nanos(){ case "${1:-}" in ''|*[!0-9.]*|.*|*.) return 1;; *.*.*) return 1;; e
   awk -v c="$1" 'BEGIN{ n=c*1000000000; if (n<1) exit 1; printf "%d", n }' 2>/dev/null; }
 
 resize_if_needed(){
-  local wc wm cc cm eff_m eff_c slice_m grow=0 shrink=0 rc=0
+  local wm wc em ecq ecp slice_m ec
   wm=$(mem_bytes "$MEM") || { echo "!! srdev.conf 里的 MEM=$MEM 认不出来（要像 64g / 4096m），配额未改"; return 0; }
-  # codex r14#14：原来 CPUS 非整数就整个函数返回，连内存改动也一起吞掉，注释里说的"交给重建路径"并不存在。
-  # 现在支持小数，认不出来只跳过 CPU 这一半并明说。
-  wc=$(cpu_nanos "$CPUS") || { echo "!! srdev.conf 里的 CPUS=$CPUS 认不出来（要像 16 或 1.5），本次只改内存"; wc=""; }
-  read -r cc cm < <(docker inspect $NAME --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' 2>/dev/null)
-  [ -n "${cc:-}" ] && [ -n "${cm:-}" ] || return 0
-  [ -n "$wc" ] && [ "$cc" != "$wc" ] && { [ "$wc" -gt "$cc" ] && grow=1 || shrink=1; }
-  [ "$cm" != "$wm" ] && { [ "$wm" -gt "$cm" ] && grow=1 || shrink=1; }
-  [ $grow = 0 ] && [ $shrink = 0 ] && return 0
-  # codex r14#2：调小配额可能把正在跑的构建或已部署的集群直接压到 OOM——先降 slice 的 MemoryMax 更是立刻生效。
-  # 所以自动路径只放大；缩小要等真的空闲（以源码树锁为准），否则只提示不动手。
-  if [ $shrink = 1 ] && builds_running; then
-    echo "!! 容器配额要调小，但有构建正在跑（按源码树锁判断）。调小可能把它直接压到 OOM，本次不改。"
-    echo "   等构建结束再跑一次 sr up；或者空闲时 sr down && sr up 重建容器。"
+  wc=$(cpu_nanos "$CPUS") || { echo "!! srdev.conf 里的 CPUS=$CPUS 认不出来（要像 16 或 1.5），本次只看内存"; wc=""; }
+  # codex 复查#6：判据必须是"实际有效上限"，不能是 docker 的 HostConfig。
+  # 父 slice 没改成时 docker 配置早已等于期望值，下一次就直接早退，既不修也不再告警。
+  # 有效值 = 容器自己的 cgroup 与父 slice 取小；cpu.max 的周期不能假定是 100000，要连周期一起读。
+  read -r em ecq ecp < <(docker exec $NAME sh -c 'printf "%s %s\n" "$(cat /sys/fs/cgroup/memory.max 2>/dev/null)" "$(cat /sys/fs/cgroup/cpu.max 2>/dev/null)"' 2>/dev/null)
+  [ -n "${em:-}" ] || return 0
+  slice_m=$(systemctl show -p MemoryMax --value "$SLICE" 2>/dev/null)
+  case "${slice_m:-}" in ''|infinity|*[!0-9]*) slice_m="";; esac
+  [ -n "$slice_m" ] && [ "$em" != max ] && [ "$slice_m" -lt "$em" ] && em=$slice_m
+  ec=""; case "${ecq:-}" in ''|max|*[!0-9]*) ;; *) case "${ecp:-}" in ''|*[!0-9]*) ;; *) ec=$(awk -v q="$ecq" -v p="$ecp" 'BEGIN{printf "%d", q*1000000000/p}');; esac;; esac
+  local need_m=0 need_c=0
+  [ "$em" != "$wm" ] && need_m=1
+  [ -n "$wc" ] && [ -n "$ec" ] && [ "$ec" != "$wc" ] && need_c=1
+  [ $need_m = 0 ] && [ $need_c = 0 ] && return 0
+  # codex 复查#3/#4：自动路径只放大。缩小会立刻压到正在跑的构建、也会压到容器里常驻的 FE/BE，
+  # 而"先探测忙不忙再动手"这种做法本身与构建启动存在竞态——探测完锁就放了。所以干脆不自动缩。
+  if { [ "$em" != max ] && [ "$wm" -lt "$em" ]; } || { [ -n "$wc" ] && [ -n "$ec" ] && [ "$wc" -lt "$ec" ]; }; then
+    echo "!! srdev.conf 里的配额比容器当前有效值小（内存 $(awk -v n=$em 'BEGIN{printf "%.4g", n/1073741824}')G -> $MEM$([ -n "$ec" ] && echo "，CPU $(awk -v n=$ec 'BEGIN{printf "%g", n/1000000000}') -> $CPUS 核")）。"
+    echo "   调小不会自动执行：它会立刻作用到正在跑的构建和容器里常驻的 FE/BE，可能直接把它们压到 OOM。"
+    echo "   确认空闲后用 sr down && sr up 重建容器，那条路径是干净的。"
     return 0
   fi
-  echo "== 容器配额与 srdev.conf 不符，热更新（docker update，不重建容器）"
-  [ -n "$wc" ] && [ "$cc" != "$wc" ] && echo "   CPU  $(awk -v n=$cc 'BEGIN{printf "%g", n/1000000000}') 核 -> $CPUS 核"
-  [ "$cm" != "$wm" ] && echo "   内存 $(awk -v n=$cm 'BEGIN{printf "%.4g", n/1073741824}')G -> $MEM"
+  echo "== 容器配额比 srdev.conf 小，放大（docker update，不重建容器）"
+  [ $need_m = 1 ] && echo "   内存 $(awk -v n=$em 'BEGIN{printf "%.4g", n/1073741824}')G -> $MEM"
+  [ $need_c = 1 ] && echo "   CPU  $(awk -v n=$ec 'BEGIN{printf "%g", n/1000000000}') 核 -> $CPUS 核"
   if [ -n "$SLICE" ] && command -v systemctl >/dev/null; then
     sudo -n systemctl set-property --runtime "$SLICE" \
       ${wc:+"CPUQuota=$(awk -v c="$CPUS" 'BEGIN{printf "%d", c*100}')%"} \
       "MemoryMax=$(echo "$MEM" | tr 'gmk' 'GMK')" >/dev/null 2>&1 \
-      || echo "   (提示：sudo -n systemctl set-property 没成功；父 slice 的上限可能还是旧值，下面会回读核对)"
+      || echo "   (提示：sudo -n systemctl set-property 没成功；父 slice 上限可能还是旧值，下面回读会看出来)"
   fi
-  docker update ${wc:+--cpus="$CPUS"} --memory="$MEM" --memory-swap="$(( wm * 2 ))" $NAME 2>&1 | sed 's/^/   docker: /' 
-  # codex r14#5：只看 docker update 的返回值不够——父 slice 若没改成，容器实际拿到的仍是旧上限，却会报"已生效"。
-  # 换一条不经过 docker 的读数：直接读容器自己的 cgroup，再和父 slice 的 MemoryMax 取小。
-  read -r eff_m eff_c < <(docker exec $NAME sh -c 'printf "%s %s\n" "$(cat /sys/fs/cgroup/memory.max 2>/dev/null)" "$(awk "{print \$1}" /sys/fs/cgroup/cpu.max 2>/dev/null)"' 2>/dev/null)
+  docker update ${wc:+--cpus="$CPUS"} --memory="$MEM" --memory-swap="$(( wm * 2 ))" $NAME 2>&1 | sed 's/^/   docker: /'
+  # 回读：同样取"容器 cgroup 与父 slice 的小者"，这条读数不经过 docker 的记账
+  read -r em ecq ecp < <(docker exec $NAME sh -c 'printf "%s %s\n" "$(cat /sys/fs/cgroup/memory.max 2>/dev/null)" "$(cat /sys/fs/cgroup/cpu.max 2>/dev/null)"' 2>/dev/null)
   slice_m=$(systemctl show -p MemoryMax --value "$SLICE" 2>/dev/null)
   case "${slice_m:-}" in ''|infinity|*[!0-9]*) slice_m="";; esac
-  [ -n "$slice_m" ] && [ -n "${eff_m:-}" ] && [ "${eff_m}" != max ] && [ "$slice_m" -lt "$eff_m" ] && eff_m=$slice_m
-  if [ "${eff_m:-}" = "$wm" ]; then echo "   内存已生效（回读容器 cgroup 与父 slice 取小 = $(awk -v n=$wm 'BEGIN{printf "%.4g", n/1073741824}')G）"
-  else echo "   !! 内存没改成：期望 $wm 字节，实际有效 ${eff_m:-读不到}。空闲时 sr down && sr up 重建容器。"; rc=1; fi
+  [ -n "$slice_m" ] && [ -n "${em:-}" ] && [ "$em" != max ] && [ "$slice_m" -lt "$em" ] && em=$slice_m
+  ec=""; case "${ecq:-}" in ''|max|*[!0-9]*) ;; *) case "${ecp:-}" in ''|*[!0-9]*) ;; *) ec=$(awk -v q="$ecq" -v p="$ecp" 'BEGIN{printf "%d", q*1000000000/p}');; esac;; esac
+  if [ "${em:-}" = "$wm" ]; then echo "   内存已生效（回读有效上限 $(awk -v n=$wm 'BEGIN{printf "%.4g", n/1073741824}')G）"
+  else echo "   !! 内存没改成：期望 $wm 字节，实际有效 ${em:-读不到}。下次 sr up 还会再试；要彻底解决请 sr down && sr up。"; fi
   if [ -n "$wc" ]; then
-    if [ "${eff_c:-}" = "$(awk -v n=$wc 'BEGIN{printf "%d", n/10000}')" ]; then echo "   CPU 已生效（回读 cpu.max 配额 $eff_c/100000）"
-    else echo "   !! CPU 没改成：期望配额 $(awk -v n=$wc 'BEGIN{printf "%d", n/10000}')，实际 ${eff_c:-读不到}。"; rc=1; fi
+    if [ "${ec:-}" = "$wc" ]; then echo "   CPU 已生效（回读有效 $CPUS 核）"
+    else echo "   !! CPU 没改成：期望 $CPUS 核，实际有效 $([ -n "${ec:-}" ] && awk -v n=$ec 'BEGIN{printf "%g", n/1000000000}' || echo 读不到) 核。下次 sr up 还会再试。"; fi
   fi
-  [ $rc = 0 ] || return 0
-  [ -n "$wc" ] && [ "$cc" != "$wc" ] || return 0        # CPU 没变就不用动 daemon
-  # codex r14#3：停 daemon 前必须确认真的没人在用它——判据同样是源码树锁，不是进程名快照。
-  if builds_running; then
-    echo "   (有构建在跑，本机 iceccd 仍按旧核数限并发；等它结束后再跑一次 sr up 即可刷新)"
-  else
-    docker exec $NAME sh -c 'pkill -x iceccd' >/dev/null 2>&1
-    echo "   本机 iceccd 已停，下次编译按新核数重新拉起"
-  fi; }
+  # codex 复查#3：不再自动 pkill iceccd——探测忙闲与动手之间必然有竞态，而误杀的后果是
+  # icecc 客户端失去并发闸门、无限制本地编译直到 OOM。daemon 的 -m 由 sr-build 在复用时核对并提示，
+  # 真要刷新就 sr down && sr up，那条路径不会杀到别人正在用的 daemon。
+  [ $need_c = 1 ] && echo "   (本机 iceccd 的 -m 是启动参数，仍是旧核数；下次构建会提示，空闲时 sr down && sr up 刷新)"
+  return 0; }
 
 # 从 $PWD 上溯找 StarRocks 根；给了参数就只认那个目录本身（不上溯）。build 分支里另有一个同义的局部实现，
 # 那个还要兼顾"参数里哪个才是目录"的扫描，这里只服务 pack 这类简单场景。
@@ -173,19 +176,6 @@ tree_root(){ local d
     [ -f "$1/build.sh" ] && [ -d "$1/be/src" ] && { (cd "$1" && pwd -P); return 0; }; return 1; fi
   d=$(pwd -P); while [ "$d" != / ]; do
     [ -f "$d/build.sh" ] && [ -d "$d/be/src" ] && { echo "$d"; return 0; }; d=$(dirname "$d"); done; return 1; }
-
-# 有没有构建在跑：以源码树锁为准，不用进程名快照。
-# codex r14#3：pgrep ninja/cc1plus 会漏掉 configure / gensrc / maven / 等远端任务这些阶段（BE 构建开头 30-60 秒
-# 就一个编译进程都没有），而且"看一眼再动手"本身与构建启动存在竞态。锁是 sr-build 全程持有的，没有这两个问题。
-# 锁文件在 $BASE/farm，和容器里的 /farm 是同一批 inode，宿主机 flock 与容器内的 flock 是同一把。
-# 判不了（没有 flock）时一律当作"在跑"，宁可不动。
-builds_running(){ local f
-  command -v flock >/dev/null || return 0
-  for f in "$BASE"/farm/sr-build.*.lock; do
-    [ -e "$f" ] || continue
-    ( exec 9>>"$f"; flock -n 9 ) 2>/dev/null || return 0
-  done
-  return 1; }
 
 # bind mount 钉的是目录本身（dentry），不是路径字符串。宿主机上把 ~/ccache 改名成 ~/ccache-old，
 # 容器里的 /ccache 还是同一个目录——inode 不变，缓存照常命中，人以为"清空了缓存"其实一点没清
@@ -201,7 +191,7 @@ check_mounts(){
   while read -r p ci; do
     case "$p" in /ccache) hp=$BASE/ccache;; /farm) hp=$BASE/farm;; /tp) hp=$TPDIR;; *) continue;; esac
     [ "$ci" = - ] && continue
-    hi=$(stat -c %d:%i "$hp" 2>/dev/null)
+    hi=$(stat -L -c %d:%i "$hp" 2>/dev/null)   # -L：挂载点本身可能是符号链接，docker 挂的是它的目标（codex 复查#10）
     [ "$hi" = "$ci" ] && continue
     if [ -z "$hi" ]; then
       echo "!! 容器里的 $p 挂的目录，在宿主机上已经不在 $hp 了（被改名或删了？）。"
@@ -393,17 +383,20 @@ PU
   PTGZ=$P_OUT/$P_NAME.tar.gz
   # codex r14#7：ninja install 是逐文件拷贝，构建收尾时打包会读到半装好的 output/，tar 不会报错，
   # 包名里的 sha 也证明不了产物就是那个提交。所以打包全程持有 sr-build 用的同一把源码树锁。
+  # codex 复查#8：锁文件不存在就跳过加锁，等于第一次用时没有互斥——无条件建出来再锁，没有 flock 就拒绝。
+  # codex 复查#9：无命令的 `exec … 2>/dev/null` 会把重定向留在当前 shell，后面 pigz/mv 的 stderr 全没了，
+  # 必须用 { } 限定（项目里已经踩过两次）。
   PLOCK=$BASE/farm/sr-build.$(printf %s "$PSR" | md5sum | cut -c1-12).lock
-  if command -v flock >/dev/null && [ -e "$PLOCK" ]; then
-    exec 9>>"$PLOCK" 2>/dev/null && flock -n 9 || {
-      echo "!! 这棵源码树正在编译：$PSR"
-      echo "   ninja install 是逐文件拷贝，这时候打包会得到半装好的 output/。等它编完再来。"; exit 1; }
-  fi
+  command -v flock >/dev/null || { echo "!! 没有 flock，无法与构建互斥；这时候打包可能得到半装好的 output/，已拒绝。"; exit 1; }
+  : > "$PLOCK" 2>/dev/null || [ -e "$PLOCK" ] || { echo "!! 建不了源码树锁 $PLOCK"; exit 1; }
+  chmod 666 "$PLOCK" 2>/dev/null
+  { exec 9>>"$PLOCK"; } 2>/dev/null || { echo "!! 打不开源码树锁 $PLOCK"; exit 1; }
+  flock -n 9 || { echo "!! 这棵源码树正在编译：$PSR"
+    echo "   ninja install 是逐文件拷贝，这时候打包会得到半装好的 output/。等它编完再来。"; exit 1; }
   # codex r14#4：两个 sr pack 同名并发会同时截断同一个 .part，还能各自绕过"已存在"检查。
   # 用按目标文件加的锁把"检查 + 发布"框起来，临时文件也每次唯一。
-  if command -v flock >/dev/null; then
-    exec 7>>"$PTGZ.lock" 2>/dev/null && flock -n 7 || { echo "!! 另一个 sr pack 正在生成同名包 $PTGZ"; exit 1; }
-  fi
+  { exec 7>>"$PTGZ.lock"; } 2>/dev/null || { echo "!! 建不了 $PTGZ.lock（输出目录不可写？）"; exit 1; }
+  flock -n 7 || { echo "!! 另一个 sr pack 正在生成同名包 $PTGZ"; exit 1; }
   [ -e "$PTGZ" ] && [ $P_FORCE = 0 ] && { echo "!! $PTGZ 已存在（--force 覆盖）"; exit 1; }
   PNEED=$(du -sk "$POUTD" 2>/dev/null | cut -f1); PFREE=$(df -Pk "$P_OUT" | awk 'NR==2{print $4}')
   [ "${PFREE:-0}" -lt "${PNEED:-0}" ] && { echo "!! $P_OUT 所在盘剩余 $((PFREE/1048576))G，产物 $((PNEED/1048576))G，空间可能不够，已中止（--out 换个盘）"; exit 1; }
