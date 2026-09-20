@@ -12,9 +12,17 @@
 # N 由 sr-build 按容器内存算好放进 SR_LINK_JOBS；没有该变量就原样透传，等于没装这个包装。
 real=${SR_REAL_CMAKE:-cmake}
 [ "$(readlink -f "$(command -v "$real" 2>/dev/null || echo "$real")" 2>/dev/null)" = "$(readlink -f "$0")" ] && real=cmake   # 防止环境里残留指向自己
+# 同时注入两道闸门，各管一层：
+#   CMAKE_JOB_POOLS/JOB_POOL_LINK —— ninja 内部的，管住"这一次构建"的链接并发；
+#   CMAKE_CXX_LINKER_LAUNCHER=linkgate —— 容器级的 flock 槽位，管住"整个容器里所有源码树"的链接并发。
+#   只有前者的话，多棵树同时链接会各按整个容器的内存算槽数，加起来照样撞上限（codex r14#6）。
+# -G 既可能写成 `-G Ninja` 也可能写成 `-GNinja`，两种都要认，否则静默不注入（codex 之外，自查发现）。
+GATE=${SR_LINK_GATE:-/usr/local/bin/linkgate}
 if [[ "${SR_LINK_JOBS:-}" =~ ^[1-9][0-9]*$ ]]; then
+  inj=("-DCMAKE_JOB_POOLS=link=$SR_LINK_JOBS" -DCMAKE_JOB_POOL_LINK=link)
+  [ -x "$GATE" ] && inj+=("-DCMAKE_CXX_LINKER_LAUNCHER=$GATE")
   for a in "$@"; do
-    [ "$a" = -G ] && exec "$real" "-DCMAKE_JOB_POOLS=link=$SR_LINK_JOBS" -DCMAKE_JOB_POOL_LINK=link "$@"
+    case "$a" in -G|-G?*) exec "$real" "${inj[@]}" "$@";; esac
   done
 fi
 exec "$real" "$@"

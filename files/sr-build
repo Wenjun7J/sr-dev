@@ -494,11 +494,12 @@ case $TARGET in
   # 单测：--dry-run = 全部编完但不执行测试（上游没有单独的只编开关）。--run 时第二阶段再调一次不带 --dry-run 去跑。
   # --without-debug-symbol-split：上游每次调用都无条件对 test/starrocks_test 做 objcopy 拆分调试符号，二进制没重新链接时
   # 再拆一次会用已剥离的文件覆盖上一次完整的 .debuginfo（ASAN 报告就没有文件:行号了）。我们要调它两次、用户也会反复跑，
-  # 所以拆分收回来自己做（见下面 split_fresh：只拆本次真的重新链接出来的）。
+  # 所以拆分收回来自己做（见下面 split_fresh：判据是有没有 .gnu_debuglink，天然幂等）。
   ut)  ARGS=(-j "$J" --dry-run --without-debug-symbol-split) ;;
 esac
 [ "$TARGET" != fe ] && [ $JAVAEXT = 0 ] && ARGS+=(--without-java-ext)
-[ $FEUT = 1 ] && CLEAN=0      # run-fe-ut.sh 不认 --clean，透传过去会被它的 usage 直接拒掉
+# run-fe-ut.sh 不认 --clean，透传过去会被它的 usage 直接拒掉；但也不能静默吞掉用户的意图
+[ $FEUT = 1 ] && [ $CLEAN = 1 ] && { echo "!! run-fe-ut.sh 不支持 --clean（它没有构建目录要清）。要清 FE 的 maven 产物请用 sr build --fe --clean"; exit 1; }
 # --clean 只传给 build.sh，由它删自己真正在用的目录。此处不再 rm 我们猜的 $TREE：
 # 透传 --with-gcov 时 build.sh 用 build_Debug_gcov，猜 build_Debug 会把普通 Debug 产物误删（review latest#2）；
 # 同时 SR_DRYRUN 也就不会再动任何产物（review latest#3）。
@@ -584,7 +585,7 @@ run_build(){ local i
   setsid --wait bash -c 'hs=$1; sr=$2; outf=$3; bs=$4; shift 4; echo $$ > "$hs.pgid"
       for i in $(seq 1 300); do [ -f "$hs.ack" ] && break; sleep 0.1; done
       [ -f "$hs.ack" ] || { echo "!! 构建包装 30s 未收到驱动确认，不开工" >&2; exit 250; }
-      cd "$sr" && ( "./$bs" "$@" ) 2>&1 | tee -a "$outf"; exit "${PIPESTATUS[0]}"' _ "$HS" "$SR" "$OUTF" "$BSCRIPT" "$@" 8>&- &
+      cd "$sr" && ( "./$bs" "$@" ) 2>&1 | tee -a "$outf"; exit "${PIPESTATUS[0]}"' _ "$HS" "$SR" "${RB_OUT:-$OUTF}" "$BSCRIPT" "$@" 8>&- &
   BPID=$!
   for i in $(seq 1 300); do [ -s "$HS.pgid" ] && break; sleep 0.1; done
   BPGID=$(cat "$HS.pgid" 2>/dev/null)
@@ -715,6 +716,13 @@ if [ "${MAXM:-0}" != 0 ] && [ "$MAXM" != max ] && [ "${PEAK:-0}" != 0 ]; then
 fi
 [ $CACHE = 1 ] && [ "$TARGET" != fe ] && ccache -s 2>/dev/null | grep -E 'Cacheable calls|Hits:|Uncacheable' | head -3   # 全局累计值，FE 不走 ccache 就不打
 
+# 回读校验链接闸门确实进了构建文件。上游分支的 env.sh 若不认 CUSTOM_CMAKE，注入会静默落空，
+# 而头部早就宣称过"链接池 N 个 ld 同时跑"——不验证就等于又造了一个"看着生效其实没有"的读数。
+if [ "$TARGET" != fe ] && [ -f "$TREE/build.ninja" ] && ! grep -q linkgate "$TREE/build.ninja" 2>/dev/null; then
+  echo "!! 链接闸门没进构建文件（$TREE/build.ninja 里找不到 linkgate），本次链接不受并发限制。"
+  echo "   多半是这个分支的 env.sh 不认 CUSTOM_CMAKE。大规模链接（尤其 ASAN 单测）可能撞内存上限。"
+fi
+
 # 产物落点。build.sh 只会闷头打一句 OUTPUT DIR=，既不说二进制在哪也不说是不是这次新出的
 # FE 单测没有"产物"可报（mvn verify 的结论看 surefire 摘要），到此为止
 [ $FEUT = 1 ] && exit $RC
@@ -772,9 +780,18 @@ if [ $RC -eq 0 ]; then
       [ "$(stat -c %Y "$b" 2>/dev/null || echo 0)" -ge "$S" ] || why="此前没拆过（链接它的那次构建多半失败了），补拆一次，之后不再拆"
       echo "   拆分调试符号: $(basename "$b") ($(du -h "$b" | cut -f1)) —— $why"
       echo "   需要几分钟，请稍候…"
-      if objcopy --only-keep-debug "$b" "$d" && strip --strip-debug "$b" && objcopy --add-gnu-debuglink="$d" "$b"; then
+      # codex r14#1：原来直接在原二进制上 strip，最后一步 add-gnu-debuglink 若失败（比如盘满），
+      # 二进制已经被剥离，失败分支却又把唯一那份 .debuginfo 删了，还打印"保持原样、带完整符号"——
+      # 完整调试信息就此永久丢失。改成全程在副本上做，三步都成了才顶替原文件；任何失败原文件一个字节没动。
+      local bt=$b.split.$$ dt=$d.new.$$
+      if cp -p "$b" "$bt" 2>/dev/null \
+         && objcopy --only-keep-debug "$bt" "$dt" && strip --strip-debug "$bt" && objcopy --add-gnu-debuglink="$dt" "$bt" \
+         && mv -f "$dt" "$d" && mv -f "$bt" "$b"; then
         echo "   已拆分 -> $(basename "$d")（用时 $(( ($(date +%s) - t0) / 60 ))m$(( ($(date +%s) - t0) % 60 ))s）"
-      else echo "   !! 拆分 $(basename "$b") 的调试符号失败，二进制保持原样（带完整符号，只是加载慢些）"; rm -f "$d"; fi; }
+      else
+        rm -f "$bt" "$dt" 2>/dev/null
+        echo "   !! 拆分 $(basename "$b") 的调试符号失败（盘满？），原二进制未改动，仍带完整符号，只是加载慢些"
+      fi; }
     for tb in starrocks_test starrocks_dw_test; do
       B=$UTB/$tb; [ -f "$B" ] || continue
       [ $NOSPLIT = 0 ] && split_fresh "$B"
@@ -800,15 +817,13 @@ if [ $RC -eq 0 ]; then
     # ---- 第二阶段：跑测试。再调一次 run-be-ut.sh，不带 --dry-run / --clean，-j 用本地值（ninja 此时应无事可做）。
     # 其余参数（尤其影响 configure 的 --with-gcov/--enable-shared-data 之类）必须与第一阶段完全一致，否则 CMake 重新配置、全量重编。
     # 环境（CCACHE/CMAKE_BUILD_PREFIX/BUILD_TYPE/STARROCKS_GCC_HOME）本来就是同一个进程的，天然一致。
-    # 不经 run_build 包装、不再采样心跳：测试可能跑一小时，农场该按空闲休眠，别被心跳钉着醒一小时。源码树锁保持持有——
-    # 测试跑着的时候另一个构建来替换二进制是坏事。Ctrl+C 走前台进程组直达测试进程，本驱动的 trap 随后收尾。
-    RARGS=(); skip=0
-    for a in "${ARGS[@]}"; do
-      [ $skip = 1 ] && { skip=0; continue; }
-      case "$a" in -j) skip=1; continue;; -j[0-9]*|--clean|--dry-run) continue;; esac
-      RARGS+=("$a")
-    done
-    RARGS+=(-j "$JLOCAL")
+    # 采样与农场心跳这时已经停了：测试可能跑一小时，农场该按空闲休眠，别被心跳钉着醒一小时。
+    # 源码树锁保持持有——测试跑着的时候另一个构建来替换二进制是坏事。
+    # codex r14#11：原来从 ARGS 里"剔掉 --dry-run"，分不清那是驱动自己加的还是用户传的，
+    # 于是 sr be-ut --dry-run 反而会真跑测试。改成直接用驱动参数 + 原样的用户参数重建，
+    # 用户显式给的 --dry-run 会保留（run-be-ut.sh 看到它就只打印不执行，正是用户要的）。
+    RARGS=(-j "$JLOCAL" --without-debug-symbol-split)
+    [ ${#PASS[@]} -gt 0 ] && RARGS+=("${PASS[@]}")
     # BE 打开 storage engine 前会检查 fd 上限，要求 >= 60000；容器默认软上限只有 1024（硬上限 524288），
     # 不抬就直接 "file descriptors limit is too small" 退出，一个用例都跑不了（2026-09-17 现场 rc=255，10 秒）。
     # 抬到 min(硬上限, 65536)；抬不动只提示不中止。ulimit 作用于本 shell 及其子进程，下面的 run-be-ut.sh 继承。
@@ -826,8 +841,11 @@ if [ $RC -eq 0 ]; then
     echo "== 开始跑单测: ./run-be-ut.sh ${RARGS[*]}"
     echo "   (它会先再过一遍 maven/gensrc/cmake，ninja 应无事可做，约 1 分钟后进入测试；输出同时记到 $UTLOG)"
     US=$(date +%s)
-    ( cd "$SR" && ./run-be-ut.sh "${RARGS[@]}" ) 2>&1 | tee "$UTLOG"; URC=${PIPESTATUS[0]}
-    chmod 666 "$UTLOG" 2>/dev/null; UE=$(date +%s)
+    # codex r14#10：原来直接前台跑，取消时 bash 会把 trap 推迟到前台管道结束，而 BPGID 已被第一阶段清空，
+    # on_signal 没有可杀的目标——测试会继续跑很久。改成复用 run_build 包装：独立进程组 + 后台 wait + 信号转发。
+    : > "$UTLOG"; chmod 666 "$UTLOG" 2>/dev/null
+    RB_OUT=$UTLOG run_build "${RARGS[@]}"; URC=$RC
+    UE=$(date +%s)
     printf "\n== 单测结束 rc=%d 用时 %dm%02ds  日志 %s ==\n" "$URC" $(( (UE-US)/60 )) $(( (UE-US)%60 )) "$UTLOG"
     exit $URC
   fi

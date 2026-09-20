@@ -117,6 +117,15 @@ if [ "$MODE" = stop ]; then stop_all; exit 0; fi
 
 SR=$(find_root) || die "当前目录 $(pwd -P) 不在任何 StarRocks 源码树里。sr deploy 必须在项目下执行（用该项目的产物部署）。"
 [ -d "$SR/output" ] || die "$SR/output 不存在——先 sr build 编出产物再部署。"
+# 和 sr pack 同一个道理（codex r14#7 指的是 pack，deploy 读的是同一个 output/，问题一样）：
+# ninja install 是逐文件拷贝，构建收尾时部署会把半装好的产物拷进集群目录，且不会有任何报错。
+# 用 sr-build 的同一把源码树锁；拿不到就直接拒绝，不要"等一会儿"——部署是人主动发起的，不急这一次。
+DLOCK=/farm/sr-build.$(printf %s "$SR" | md5sum | cut -c1-12).lock
+if command -v flock >/dev/null && [ -e "$DLOCK" ]; then
+  exec 9>>"$DLOCK" 2>/dev/null && flock -n 9 \
+    || die "这棵源码树正在编译：$SR
+   ninja install 是逐文件拷贝，这时候部署会拿到半装好的产物。等它编完再来。"
+fi
 
 BE_SRC=$SR/output/be; FE_SRC=$SR/output/fe
 [ "$WANT_BE" = 1 ] && [ ! -x "$BE_SRC/lib/starrocks_be" ] && { log "   （跳过 BE：$BE_SRC/lib/starrocks_be 不存在，这棵树还没编出 BE）"; WANT_BE=0; }
@@ -130,7 +139,11 @@ log " 部署到: $DEPLOY   (宿主机同路径可见)"
 log " 内容:   $([ "$WANT_BE" = 1 ] && echo -n BE\ )$([ "$WANT_FE" = 1 ] && echo -n FE)"
 log "=========================================================="
 
-stop_all
+# 只停这次要重新部署的那一侧。曾经无条件 stop_all：`sr deploy --fe-only` 把 BE 也停了却不再拉起，
+# 集群只剩 FE、BE 进黑名单（2026-09-17）。--stop 模式仍走 stop_all。
+log "== 停止现有集群"
+[ "$WANT_FE" = 1 ] && stop_one fe FE
+[ "$WANT_BE" = 1 ] && stop_one be BE
 
 # ---- 同步产物 ----
 # 容器里没有 rsync。服务已停，直接换目录最省事也最干净：先拷到 .new，成功了再原子换掉，

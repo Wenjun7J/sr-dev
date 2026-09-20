@@ -46,6 +46,7 @@ COPY files/sr-build    /usr/local/bin/sr-build
 COPY files/sr-farm     /usr/local/bin/sr-farm
 COPY files/sr-deploy   /usr/local/bin/sr-deploy
 COPY files/cmake-linkpool /usr/local/bin/cmake-linkpool
+COPY files/linkgate    /usr/local/bin/linkgate
 COPY files/tspapi.py   /usr/local/bin/tspapi.py
 COPY files/node-setup.sh /usr/local/bin/node-setup.sh
 
@@ -66,5 +67,5 @@ RUN set -e; TS=$(ls -d /opt/gcc-toolset-* 2>/dev/null); [ -n "$TS" ] || { echo "
 RUN mkdir -p /var/local/thirdparty/installed
 RUN mkdir -p /opt/noninja && printf '#!/bin/sh\nexit 1\n' > /opt/noninja/ninja && chmod +x /opt/noninja/ninja
 RUN git config --global --add safe.directory '*'
-RUN chmod +x /usr/local/bin/cxxlaunch /usr/local/bin/ccache-pch /usr/local/bin/oss-ccache-proxy.py /usr/local/bin/sr-build /usr/local/bin/sr-farm /usr/local/bin/sr-deploy /usr/local/bin/cmake-linkpool \
+RUN chmod +x /usr/local/bin/cxxlaunch /usr/local/bin/ccache-pch /usr/local/bin/oss-ccache-proxy.py /usr/local/bin/sr-build /usr/local/bin/sr-farm /usr/local/bin/sr-deploy /usr/local/bin/cmake-linkpool /usr/local/bin/linkgate \
              /usr/local/bin/tspapi.py /usr/local/bin/node-setup.sh

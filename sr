@@ -112,27 +112,55 @@ mem_bytes(){ local v=${1:-} n u; n=${v%[a-zA-Z]}; u=${v#"$n"}
 # 不走 sr down && sr up 是有原因的：那会连带杀掉 sr deploy 部署的 FE/BE 和别人正在跑的构建。
 # 例外是 iceccd 的 -m：它是启动参数，改不了，只能重启 daemon；空闲时顺手停掉让下次编译重新拉起，
 # 有构建在跑就只提示（sr-build 复用已有 daemon 时也会再提醒一次 -m 不符）。
+# "16" / "1.5" -> nanocpus；非法返回空
+cpu_nanos(){ case "${1:-}" in ''|*[!0-9.]*|.*|*.) return 1;; *.*.*) return 1;; esac
+  awk -v c="$1" 'BEGIN{ n=c*1000000000; if (n<1) exit 1; printf "%d", n }' 2>/dev/null; }
+
 resize_if_needed(){
-  local wc wm cc cm
-  case "$CPUS" in ''|*[!0-9]*) return 0;; esac          # 非整数核数（如 1.5）不参与比较，交给重建路径
-  wm=$(mem_bytes "$MEM") || return 0
-  wc=$(( CPUS * 1000000000 ))
+  local wc wm cc cm eff_m eff_c slice_m grow=0 shrink=0 rc=0
+  wm=$(mem_bytes "$MEM") || { echo "!! srdev.conf 里的 MEM=$MEM 认不出来（要像 64g / 4096m），配额未改"; return 0; }
+  # codex r14#14：原来 CPUS 非整数就整个函数返回，连内存改动也一起吞掉，注释里说的"交给重建路径"并不存在。
+  # 现在支持小数，认不出来只跳过 CPU 这一半并明说。
+  wc=$(cpu_nanos "$CPUS") || { echo "!! srdev.conf 里的 CPUS=$CPUS 认不出来（要像 16 或 1.5），本次只改内存"; wc=""; }
   read -r cc cm < <(docker inspect $NAME --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' 2>/dev/null)
   [ -n "${cc:-}" ] && [ -n "${cm:-}" ] || return 0
-  [ "$cc" = "$wc" ] && [ "$cm" = "$wm" ] && return 0
-  echo "== 容器配额与 srdev.conf 不符，热更新（不重建容器，不影响在跑的构建和已部署的集群）"
-  [ "$cc" != "$wc" ] && echo "   CPU  $(( cc / 1000000000 )) 核 -> $CPUS 核"
-  [ "$cm" != "$wm" ] && echo "   内存 $(( cm / 1073741824 ))G -> $MEM"
-  if [ -n "$SLICE" ] && command -v systemctl >/dev/null; then
-    sudo -n systemctl set-property --runtime "$SLICE" "CPUQuota=$((CPUS*100))%" \
-      "MemoryMax=$(echo "$MEM" | tr 'gmk' 'GMK')" >/dev/null 2>&1
+  [ -n "$wc" ] && [ "$cc" != "$wc" ] && { [ "$wc" -gt "$cc" ] && grow=1 || shrink=1; }
+  [ "$cm" != "$wm" ] && { [ "$wm" -gt "$cm" ] && grow=1 || shrink=1; }
+  [ $grow = 0 ] && [ $shrink = 0 ] && return 0
+  # codex r14#2：调小配额可能把正在跑的构建或已部署的集群直接压到 OOM——先降 slice 的 MemoryMax 更是立刻生效。
+  # 所以自动路径只放大；缩小要等真的空闲（以源码树锁为准），否则只提示不动手。
+  if [ $shrink = 1 ] && builds_running; then
+    echo "!! 容器配额要调小，但有构建正在跑（按源码树锁判断）。调小可能把它直接压到 OOM，本次不改。"
+    echo "   等构建结束再跑一次 sr up；或者空闲时 sr down && sr up 重建容器。"
+    return 0
   fi
-  docker update --cpus="$CPUS" --memory="$MEM" --memory-swap="$(( wm * 2 ))" $NAME >/dev/null 2>&1 || {
-    echo "   !! docker update 失败，配额未变。空闲时 sr down && sr up 重建容器。"; return 0; }
-  echo "   已生效"
-  [ "$cc" = "$wc" ] && return 0                          # 只改了内存，daemon 不用动
-  if docker exec $NAME sh -c 'pgrep -x ninja >/dev/null 2>&1 || pgrep -x cc1plus >/dev/null 2>&1' 2>/dev/null; then
-    echo "   (有构建在跑，本机 iceccd 仍按旧核数限并发；空闲时 sr down && sr up，或手动重启它)"
+  echo "== 容器配额与 srdev.conf 不符，热更新（docker update，不重建容器）"
+  [ -n "$wc" ] && [ "$cc" != "$wc" ] && echo "   CPU  $(awk -v n=$cc 'BEGIN{printf "%g", n/1000000000}') 核 -> $CPUS 核"
+  [ "$cm" != "$wm" ] && echo "   内存 $(awk -v n=$cm 'BEGIN{printf "%.4g", n/1073741824}')G -> $MEM"
+  if [ -n "$SLICE" ] && command -v systemctl >/dev/null; then
+    sudo -n systemctl set-property --runtime "$SLICE" \
+      ${wc:+"CPUQuota=$(awk -v c="$CPUS" 'BEGIN{printf "%d", c*100}')%"} \
+      "MemoryMax=$(echo "$MEM" | tr 'gmk' 'GMK')" >/dev/null 2>&1 \
+      || echo "   (提示：sudo -n systemctl set-property 没成功；父 slice 的上限可能还是旧值，下面会回读核对)"
+  fi
+  docker update ${wc:+--cpus="$CPUS"} --memory="$MEM" --memory-swap="$(( wm * 2 ))" $NAME 2>&1 | sed 's/^/   docker: /' 
+  # codex r14#5：只看 docker update 的返回值不够——父 slice 若没改成，容器实际拿到的仍是旧上限，却会报"已生效"。
+  # 换一条不经过 docker 的读数：直接读容器自己的 cgroup，再和父 slice 的 MemoryMax 取小。
+  read -r eff_m eff_c < <(docker exec $NAME sh -c 'printf "%s %s\n" "$(cat /sys/fs/cgroup/memory.max 2>/dev/null)" "$(awk "{print \$1}" /sys/fs/cgroup/cpu.max 2>/dev/null)"' 2>/dev/null)
+  slice_m=$(systemctl show -p MemoryMax --value "$SLICE" 2>/dev/null)
+  case "${slice_m:-}" in ''|infinity|*[!0-9]*) slice_m="";; esac
+  [ -n "$slice_m" ] && [ -n "${eff_m:-}" ] && [ "${eff_m}" != max ] && [ "$slice_m" -lt "$eff_m" ] && eff_m=$slice_m
+  if [ "${eff_m:-}" = "$wm" ]; then echo "   内存已生效（回读容器 cgroup 与父 slice 取小 = $(awk -v n=$wm 'BEGIN{printf "%.4g", n/1073741824}')G）"
+  else echo "   !! 内存没改成：期望 $wm 字节，实际有效 ${eff_m:-读不到}。空闲时 sr down && sr up 重建容器。"; rc=1; fi
+  if [ -n "$wc" ]; then
+    if [ "${eff_c:-}" = "$(awk -v n=$wc 'BEGIN{printf "%d", n/10000}')" ]; then echo "   CPU 已生效（回读 cpu.max 配额 $eff_c/100000）"
+    else echo "   !! CPU 没改成：期望配额 $(awk -v n=$wc 'BEGIN{printf "%d", n/10000}')，实际 ${eff_c:-读不到}。"; rc=1; fi
+  fi
+  [ $rc = 0 ] || return 0
+  [ -n "$wc" ] && [ "$cc" != "$wc" ] || return 0        # CPU 没变就不用动 daemon
+  # codex r14#3：停 daemon 前必须确认真的没人在用它——判据同样是源码树锁，不是进程名快照。
+  if builds_running; then
+    echo "   (有构建在跑，本机 iceccd 仍按旧核数限并发；等它结束后再跑一次 sr up 即可刷新)"
   else
     docker exec $NAME sh -c 'pkill -x iceccd' >/dev/null 2>&1
     echo "   本机 iceccd 已停，下次编译按新核数重新拉起"
@@ -146,29 +174,46 @@ tree_root(){ local d
   d=$(pwd -P); while [ "$d" != / ]; do
     [ -f "$d/build.sh" ] && [ -d "$d/be/src" ] && { echo "$d"; return 0; }; d=$(dirname "$d"); done; return 1; }
 
+# 有没有构建在跑：以源码树锁为准，不用进程名快照。
+# codex r14#3：pgrep ninja/cc1plus 会漏掉 configure / gensrc / maven / 等远端任务这些阶段（BE 构建开头 30-60 秒
+# 就一个编译进程都没有），而且"看一眼再动手"本身与构建启动存在竞态。锁是 sr-build 全程持有的，没有这两个问题。
+# 锁文件在 $BASE/farm，和容器里的 /farm 是同一批 inode，宿主机 flock 与容器内的 flock 是同一把。
+# 判不了（没有 flock）时一律当作"在跑"，宁可不动。
+builds_running(){ local f
+  command -v flock >/dev/null || return 0
+  for f in "$BASE"/farm/sr-build.*.lock; do
+    [ -e "$f" ] || continue
+    ( exec 9>>"$f"; flock -n 9 ) 2>/dev/null || return 0
+  done
+  return 1; }
+
 # bind mount 钉的是目录本身（dentry），不是路径字符串。宿主机上把 ~/ccache 改名成 ~/ccache-old，
 # 容器里的 /ccache 还是同一个目录——inode 不变，缓存照常命中，人以为"清空了缓存"其实一点没清
 # （目录改名后，容器仍指向原目录，docker inspect 中记录的路径也不会随之更新）。
 # 和当初 srdev.conf 单文件挂载被 inode 钉住是同一类坑，只是这次是目录。
 # 换挂载点只能重建容器，所以这里只做检测：比对容器里各挂载点的 inode 与宿主机上"现在"该路径的 inode。
+# codex r14#15：原来只告警就继续，但 /farm 漂移之后 sync_conf 写的是新目录、容器读的是旧挂载，
+# 宿主机与容器会基于两份不同的配置和农场状态干活——这比不干活更糟。所以 /farm 与 /tp 漂移直接失败；
+# /ccache 漂移只影响缓存命中，告警即可。比对带上设备号：跨文件系统时 inode 可能撞号。
 check_mounts(){
-  local out hi ci p hp
-  out=$(docker exec $NAME sh -c 'for d in /ccache /farm /tp; do printf "%s %s\n" "$d" "$(stat -c %i "$d" 2>/dev/null || echo -)"; done' 2>/dev/null) || return 0
+  local out hi ci p hp fatal=0
+  out=$(docker exec $NAME sh -c 'for d in /ccache /farm /tp; do printf "%s %s\n" "$d" "$(stat -c %d:%i "$d" 2>/dev/null || echo -)"; done' 2>/dev/null) || return 0
   while read -r p ci; do
     case "$p" in /ccache) hp=$BASE/ccache;; /farm) hp=$BASE/farm;; /tp) hp=$TPDIR;; *) continue;; esac
     [ "$ci" = - ] && continue
-    hi=$(stat -c %i "$hp" 2>/dev/null)
+    hi=$(stat -c %d:%i "$hp" 2>/dev/null)
+    [ "$hi" = "$ci" ] && continue
     if [ -z "$hi" ]; then
       echo "!! 容器里的 $p 挂的目录，在宿主机上已经不在 $hp 了（被改名或删了？）。"
-      echo "   bind mount 钉的是目录本身，容器仍在用原来那个目录；要换请 sr down && sr up 重建容器。"
-    elif [ "$hi" != "$ci" ]; then
-      echo "!! 容器里的 $p 不是现在的 $hp（inode $ci vs $hi）——多半是把原目录改名后又新建了一个同名的。"
-      echo "   容器还在用创建时那个目录；要让新目录生效，空闲时 sr down && sr up 重建容器。"
+    else
+      echo "!! 容器里的 $p 不是现在的 $hp（设备:inode $ci vs $hi）——多半是把原目录改名后又新建了一个同名的。"
     fi
+    echo "   bind mount 钉的是目录本身，容器仍在用创建时那个目录；要换请空闲时 sr down && sr up 重建容器。"
+    case "$p" in /farm|/tp) fatal=1; echo "   $p 关系到配置、农场状态与依赖，两边不一致会让宿主机和容器各说各话，已中止。";; esac
   done <<EOF
 $out
 EOF
-}
+  return $fatal; }
 
 ensure_container(){
   # 顺序要紧：先把 farm 目录收紧到 0700 再往里写配置——目录还开放时写固定路径会被预置的符号链接劫持（codex r8#3）。
@@ -178,8 +223,15 @@ ensure_container(){
     chmod 700 "$BASE/farm" 2>/dev/null || { echo "!! 无法把 $BASE/farm 设为 0700（其他用户可替换 state.env 提权），请先手动 chmod 700 后重试"; return 1; }
     echo "   (已把 $BASE/farm 收紧为 0700)"
   fi
+  # 挂载检查必须在 sync_conf 之前：/farm 漂移时 sync_conf 会把配置写进宿主机的新目录，而容器读的还是旧挂载，
+  # 两边各拿一份配置干活（codex r14#15）。所以先查挂载，致命就中止，别再往下写任何东西。
+  if running; then
+    check_mounts || return 1
+    sync_conf || { echo "!! 同步站点配置到 $BASE/farm/srdev.conf 失败（磁盘满/不可写？）。继续下去容器会按上一次的旧配置干活，已中止。"; return 1; }
+    resize_if_needed
+    return 0
+  fi
   sync_conf || { echo "!! 同步站点配置到 $BASE/farm/srdev.conf 失败（磁盘满/不可写？）。继续下去容器会按上一次的旧配置干活，已中止。"; return 1; }
-  running && { resize_if_needed; check_mounts; return 0; }
   ensure_image || { echo "!! 镜像构建失败"; return 1; }
   mkdir -p $BASE/ccache $BASE/m2 $BASE/farm $BASE/.tsp $BASE/iceccrun $TPDIR
   # review r7#3(P1)：原来 farm 是 0777 且无 sticky，本机任何用户都能删掉再放一个 state.env，容器 root 会读它 → 提权。
@@ -318,7 +370,13 @@ PU
     [ -n "$(git -C "$PSR" status --porcelain 2>/dev/null)" ] && PDIRTY=-dirty || PDIRTY=""
     P_NAME="$(basename "$PSR")-${PSHA}${PDIRTY}"
   fi
-  case "$P_NAME" in */*|"") echo "!! 包名不能为空或含 /：$P_NAME"; exit 1;; esac
+  # codex r14#16：包名会原样进 tar --transform 的 sed 替换串，`&` 在替换侧代表"整段匹配"，
+  # --name 'a&b' 实测打出来的顶层目录是 aoutputb/；`|` 是分隔符会直接让表达式失效。所以限定字符集。
+  case "$P_NAME" in
+    ''|.|..) echo "!! 包名不能为空，也不能是 . 或 ..：$P_NAME"; exit 1;;
+    -*) echo "!! 包名不能以 - 开头：$P_NAME"; exit 1;;
+    *[!A-Za-z0-9._-]*) echo "!! 包名只允许字母数字和 . _ -（它要当 tar 替换串和目录名）：$P_NAME"; exit 1;;
+  esac
   # 上传的前置条件必须在压缩之前查完：压一个包要几分钟，压完才说"没配桶"是在浪费时间（自测踩到）
   PURL=""
   if [ $P_UP = 1 ]; then
@@ -333,24 +391,55 @@ PU
   fi
   mkdir -p "$P_OUT" 2>/dev/null || { echo "!! 建不了输出目录 $P_OUT"; exit 1; }
   PTGZ=$P_OUT/$P_NAME.tar.gz
+  # codex r14#7：ninja install 是逐文件拷贝，构建收尾时打包会读到半装好的 output/，tar 不会报错，
+  # 包名里的 sha 也证明不了产物就是那个提交。所以打包全程持有 sr-build 用的同一把源码树锁。
+  PLOCK=$BASE/farm/sr-build.$(printf %s "$PSR" | md5sum | cut -c1-12).lock
+  if command -v flock >/dev/null && [ -e "$PLOCK" ]; then
+    exec 9>>"$PLOCK" 2>/dev/null && flock -n 9 || {
+      echo "!! 这棵源码树正在编译：$PSR"
+      echo "   ninja install 是逐文件拷贝，这时候打包会得到半装好的 output/。等它编完再来。"; exit 1; }
+  fi
+  # codex r14#4：两个 sr pack 同名并发会同时截断同一个 .part，还能各自绕过"已存在"检查。
+  # 用按目标文件加的锁把"检查 + 发布"框起来，临时文件也每次唯一。
+  if command -v flock >/dev/null; then
+    exec 7>>"$PTGZ.lock" 2>/dev/null && flock -n 7 || { echo "!! 另一个 sr pack 正在生成同名包 $PTGZ"; exit 1; }
+  fi
   [ -e "$PTGZ" ] && [ $P_FORCE = 0 ] && { echo "!! $PTGZ 已存在（--force 覆盖）"; exit 1; }
   PNEED=$(du -sk "$POUTD" 2>/dev/null | cut -f1); PFREE=$(df -Pk "$P_OUT" | awk 'NR==2{print $4}')
   [ "${PFREE:-0}" -lt "${PNEED:-0}" ] && { echo "!! $P_OUT 所在盘剩余 $((PFREE/1048576))G，产物 $((PNEED/1048576))G，空间可能不够，已中止（--out 换个盘）"; exit 1; }
+  PPART=$(mktemp "$P_OUT/.$P_NAME.XXXXXX.part") || { echo "!! 建不了临时文件"; exit 1; }
+  PERR=$(mktemp /tmp/sr-pack-tarerr.XXXXXX)
+  trap 'rm -f "$PPART" "$PERR" 2>/dev/null' EXIT
   echo "== 打包 $PSR/output -> $PTGZ"
   echo "   包内顶层目录: $P_NAME/    内容: $(ls "$POUTD" | tr '\n' ' ')"
   [ -n "$PURL" ] && echo "   上传目标: $PURL"
   echo "   压缩: pigz -$P_LEVEL -p$P_JOBS（产物 $(du -sh "$POUTD" | cut -f1)，需要几分钟）"
   PS0=$(date +%s)
   # flags=r：改写只作用于成员名，不碰符号链接的目标（否则指向 output/... 的链接会被改坏）
-  tar -C "$PSR" --transform "flags=r;s|^output|$P_NAME|" -cf - output 2>/dev/null | pigz -$P_LEVEL -p"$P_JOBS" > "$PTGZ.part"
-  PRC=${PIPESTATUS[0]}
-  [ "$PRC" = 0 ] || { echo "!! tar 失败（rc=$PRC）"; rm -f "$PTGZ.part"; exit 1; }
-  mv -f "$PTGZ.part" "$PTGZ" || { echo "!! 发布 $PTGZ 失败"; rm -f "$PTGZ.part"; exit 1; }
+  # codex r14#8：原来只看 PIPESTATUS[0]（tar）。pigz 在收尾时失败（盘写满、参数非法）照样被当成成功，
+  # 发布出一个截断的包。两个退出码都要看；tar 的 stderr 也别丢，失败时要说得出原因。
+  tar -C "$PSR" --transform "flags=r;s|^output|$P_NAME|" -cf - output 2>"$PERR" | pigz -"$P_LEVEL" -p"$P_JOBS" > "$PPART"
+  PRC=("${PIPESTATUS[@]}")
+  if [ "${PRC[0]}" != 0 ] || [ "${PRC[1]}" != 0 ]; then
+    echo "!! 打包失败：tar rc=${PRC[0]}  pigz rc=${PRC[1]}"
+    [ -s "$PERR" ] && sed 's/^/   tar: /' "$PERR" | head -10
+    exit 1
+  fi
+  mv -f "$PPART" "$PTGZ" || { echo "!! 发布 $PTGZ 失败"; exit 1; }
+  PSIZE=$(stat -c %s "$PTGZ" 2>/dev/null)
   echo "   完成: $(du -h "$PTGZ" | cut -f1)  用时 $(( ($(date +%s)-PS0)/60 ))m$(( ($(date +%s)-PS0)%60 ))s"
   [ $P_UP = 0 ] && { echo "   （只打包。要上传加 --upload）"; exit 0; }
   echo "== 上传 -> $PURL"
-  ossutil cp "$PTGZ" "$PURL" 2>&1 | tail -3
-  ossutil stat "$PURL" 2>/dev/null | grep -Ei "Content-Length|Last-Modified" | sed 's/^/   /'
+  # codex r14#9：原来 `ossutil cp | tail -3` 把退出码丢了，紧跟的 stat 又可能读到同名旧对象，
+  # 于是上传失败也显示得像成功。改成先看上传本身的退出码，再用远端大小和本地对比。
+  ossutil cp "$PTGZ" "$PURL" 2>&1 | tail -3; URC=${PIPESTATUS[0]}
+  [ "$URC" = 0 ] || { echo "!! 上传失败（ossutil rc=$URC），远端对象未更新或不完整"; exit 1; }
+  RSIZE=$(ossutil stat "$PURL" 2>/dev/null | awk -F': *' '/Content-Length/{print $2; exit}' | tr -d ' \r')
+  if [ -n "$PSIZE" ] && [ "$RSIZE" = "$PSIZE" ]; then
+    echo "   已上传并核对：远端 Content-Length = 本地 $PSIZE 字节"
+  else
+    echo "!! 上传后核对不上：本地 ${PSIZE:-?} 字节，远端 ${RSIZE:-读不到}。请重传。"; exit 1
+  fi
   ;;
 tp)
   echo "依赖目录: $TPDIR $([ "$TPDIR" = "$SHARED_TP" ] && echo "（全机共享）" || echo "（个人）")"
@@ -407,16 +496,26 @@ U
       # 与容器内 sr-build 同一规则找源码目录（review #7）：遇 -- 停；-j/--dist 跳过其值；其余 -* 跳过；
       # 第一个存在的目录型位置参数就是源码根（必须是根本身，不上溯）；没给时才从 $PWD 上溯。
       # 不能"扫所有参数里的现存目录"：-- 后面透传给 build.sh 的目录会被误认。
+      # 单测模式下 sr 不认识的参数会整段透传，它们的值是裸词（--module storage 的 storage）。
+      # codex r14#12：宿主机原来只看"是不是现存目录"，在含 storage/ 的目录里跑 sr be-ut --module storage
+      # 会把 storage 当成源码树，于是版本记忆按错的 key 去查，而容器内用的是上溯找到的真源码树——两边脱节。
+      # 判据和容器内 sr-build 保持一致：单测模式下位置参数必须真含 build.sh 才算源码树。
+      UTM=0; for a in "$@"; do [ "$a" = -- ] && break
+        case "$a" in --ut|--be-ut|--fe-ut) UTM=1; break;; esac; done
       TSTART=""; skipv=0
       for a in "$@"; do
         [ $skipv = 1 ] && { skipv=0; continue; }
-        case "$a" in --) break;; -j|--dist) skipv=1;; -*) ;; *) [ -d "$a" ] && { TSTART=$(cd "$a" && pwd -P); break; };; esac   # pwd -P：软链接与真路径同一个 key（review latest#1）
+        case "$a" in --) break;; -j|--dist) skipv=1;; -*) ;;
+          *) if [ -d "$a" ] && { [ "$UTM" = 0 ] || [ -f "$a/build.sh" ]; }; then TSTART=$(cd "$a" && pwd -P); break; fi;;   # pwd -P：软链接与真路径同一个 key（review latest#1）
+        esac
       done
       # review#7：只有会真用农场的 BE 编译才值得预唤醒——--fe 纯 Java 不碰农场，--dist off 明确禁分布式，都不该把整套农场叫醒
+      # codex r14#13：--fe-ut 也是纯 maven，不碰农场。原来只认 --fe，于是 sr fe-ut 在农场休眠时
+      # 还会把 4 台 worker 叫醒，白白占资源。
       WANTS_FARM=1; prevd=""
       for a in "$@"; do
         [ "$a" = -- ] && break
-        [ "$a" = --fe ] && WANTS_FARM=0
+        case "$a" in --fe|--fe-ut) WANTS_FARM=0;; esac
         [ "$prevd" = --dist ] && [ "$a" = off ] && WANTS_FARM=0
         prevd=$a
       done
