@@ -783,6 +783,30 @@ if [ "${MAXM:-0}" != 0 ] && [ "$MAXM" != max ] && [ "${PEAK:-0}" != 0 ]; then
 fi
 [ $CACHE = 1 ] && [ "$TARGET" != fe ] && ccache -s 2>/dev/null | grep -E 'Cacheable calls|Hits:|Uncacheable' | head -3   # 全局累计值，FE 不走 ccache 就不打
 
+# 把本次构建的 compile_commands.json 软链到源码树根，给 clangd 一个固定的寻址路径。
+# 为什么值得做：每种构建类型各有一份（build_Release / build_ASAN / ut_build_ASAN …），clangd 默认
+# 只认项目根或 build/ 下那一个，不固定下来就得手工改配置。根目录这个名字上游 .gitignore 里已经有了，
+# 不会污染 git status。语义是"最后编的那棵树赢"，符合"我现在在编哪个就查哪个"。
+# 用相对目标：源码树整个搬走或换个挂载路径时链接仍然有效。
+# 绝不覆盖普通文件——那可能是用户自己生成的一份，只有"不存在"或"本来就是软链接"才动。
+if [ "$TARGET" != fe ] && [ "${SR_CC_LINK:-1}" != 0 ] && [ -f "$TREE/compile_commands.json" ]; then
+  CCL=$SR/compile_commands.json
+  case "$TREE/" in "$SR"/*) CCREL=${TREE#"$SR"/}/compile_commands.json;; *) CCREL=$TREE/compile_commands.json;; esac
+  if [ -e "$CCL" ] && [ ! -L "$CCL" ]; then
+    echo "   (根目录已有真实的 compile_commands.json，没有动它；要用软链接请先把它删掉，或设 SR_CC_LINK=0 关掉这个功能)"
+  elif [ "$(readlink "$CCL" 2>/dev/null)" = "$CCREL" ]; then
+    : # 已经指向本次这棵树，不用动
+  else
+    CCTMP=$SR/.compile_commands.json.sr.$$
+    if ln -s "$CCREL" "$CCTMP" 2>/dev/null && mv -Tf "$CCTMP" "$CCL" 2>/dev/null; then
+      echo " clangd: compile_commands.json -> $CCREL"
+    else
+      rm -f "$CCTMP" 2>/dev/null
+      echo "   (没能在 $SR 下建 compile_commands.json 软链接，clangd 需自行指定路径)"
+    fi
+  fi
+fi
+
 # 回读校验两道闸门确实进了构建文件。上游分支的 env.sh 若不认 CUSTOM_CMAKE，注入会静默落空，
 # 而头部早就宣称过"链接池 N 个 ld 同时跑"——不验证就等于又造了一个"看着生效其实没有"的读数。
 # codex 复查#14：两者落在不同文件——CMake 的 Ninja 生成器把 pool 写进 build.ninja 的 build 语句，

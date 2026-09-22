@@ -112,6 +112,20 @@ sr fe-ut -j 8                                  # maven -T 8
 并发默认沿用上游的 4，只有显式给 `-j` 才透传。这里的并发是 maven 的 `-T`，每个线程还会 fork surefire JVM，
 拿容器核数当 `-T` 会同时起十几个 JVM 把内存吃光，所以不自动按核数放大。
 
+## clangd
+
+每次 BE 或单测构建完，`sr` 会在源码树根建一个指向本次构建树的 `compile_commands.json` 软链接：
+
+```
+compile_commands.json -> be/nj/build_Release/compile_commands.json
+```
+
+这样 clangd 永远在项目根找到它，不必因为切构建类型去改配置。语义是"最后编的那棵树赢"，
+所以 `sr build --be-ut` 之后它指向 `ut_build_ASAN`，编辑测试代码时补全和跳转也是对的。
+目标写成相对路径，源码树整个搬走仍然有效。这个文件名上游 `.gitignore` 里已经有了，不污染 `git status`。
+
+根目录若已存在一个**真实文件**（不是软链接），`sr` 不会动它，只提示一句。要彻底关掉：`srdev.conf` 里设 `SR_CC_LINK=0`。
+
 ## 打包产物
 
 `sr pack` 把当前源码树的 `output/` 打成与官方日构建同构的 tar.gz：包名与包内顶层目录同名，都是 `<树名>-<短sha>[-dirty]`，
