@@ -171,6 +171,22 @@ VSCode 侧：
 ]
 ```
 
+### 多版本并行开发
+
+每棵源码树各自钉一个依赖 digest，`clangd-host` 从当前目录上溯找到树、读出它的 digest，所以**每个 VSCode 窗口拿到的是各自那套依赖**。
+示例（digest 为占位值）：`starrocks@branch-3.5.20` 解析到 `aaaaaaaa`（gcc11），`sample-worktree` 解析到 `bbbbbbbb`（gcc14），互不串。
+
+跳转到第三方头文件要额外一层保证。clangd 把跳转解析成 `compile_commands.json` 里那个绝对路径，而 **VSCode 是在宿主机上打开它的**。
+真实编译用的是 bind 到固定路径 `/var/local/thirdparty`——宿主机上那个位置只有一份共用的旧拷贝，两棵树会跳到同一份，
+而且和各自钉住的依赖对不上（实测 gcc14 那份多出一整棵 `benchgen/` 头文件树，宿主机那份没有）。
+
+所以 `sr compdb` 不做 bind，直接把 `STARROCKS_THIRDPARTY` 指向依赖在**宿主机上的真实路径** `$SR_TPDIR/<digest>`，
+容器也按同名路径多挂一份，于是那条路径在容器内外指的是同一个东西，跳转落到各自版本的头文件上。
+真实编译仍走 bind，因为 CMakeCache 会把首次 configure 的绝对路径缓存死，那条路径必须恒定、不能跟着 digest 变。
+
+这意味着：**给 clangd 用的数据库要用 `sr compdb` 生成**（14 秒）。跑过 `sr build --be` 之后根目录软链接会指向真实构建树，
+那份数据库里的第三方路径只在容器内成立；想恢复精确跳转，再跑一次 `sr compdb` 即可。
+
 实测对比同一个文件：宿主机那份 clangd 的 stderr 里是
 `driver execution failed - '/opt/gcc-toolset-14/bin/g++' doesn't exist`，并且会报一条
 "protoc 版本比生成代码新"的假警告（它读到的是宿主机上一份过期的 thirdparty）；走容器之后这条假警告消失。

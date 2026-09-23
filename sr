@@ -280,7 +280,7 @@ ensure_container(){
     ${CGP[@]+"${CGP[@]}"} --cpus=$CPUS --memory=$MEM --ulimit nofile=655350:655350 \
     -v $WORK:$WORK -v $BASE/ccache:/ccache -v $BASE/m2:/root/.m2 \
     -v $BASE/farm:/farm -v $BASE/.tsp:/root/.tsp -v $BASE/iceccrun:/var/run/icecc \
-    -v $TPDIR:/tp ${CONF_MOUNT[@]+"${CONF_MOUNT[@]}"} \
+    -v $TPDIR:/tp $([ "${TPDIR#$WORK/}" = "$TPDIR" ] && echo "-v $TPDIR:$TPDIR") ${CONF_MOUNT[@]+"${CONF_MOUNT[@]}"} \
     -e SR_USER="$SR_USER" -e SR_UID="$(id -u)" -e SR_OSSCFG="$HOME/.ossutilconfig" -w $WORK $IMG sleep infinity >/dev/null
   local drc=$?; exec 8>&-   # 容器起完就放锁（无论成败）
   [ $drc = 0 ] || { echo "!! 容器启动失败（docker run 返回非零）"; return 1; }
@@ -619,6 +619,19 @@ U
       # MAVEN_OPTS: FE 的 maven JVM 参数/日志开关透传；SR_LOCAL_OK: 非交互且无农场时放行本机编（review：容器里提示了它，这里却没转发）
       # SR_DRYRUN / FARM_STATE：测试钩子，只走到决策打印就停 / 指向伪造的农场状态文件
       XENV=(); for v in CCACHE_REMOTE_STORAGE SR_CCACHE_DIR SR_EXPLAIN MAVEN_OPTS SR_LOCAL_OK SR_DRYRUN FARM_STATE; do [ -n "${!v:-}" ] && XENV+=(-e "$v"); done
+      # compdb 走另一条路：不做 bind，直接把 STARROCKS_THIRDPARTY 指向依赖目录在**宿主机上的真实路径**。
+      # 为什么：clangd 把"跳转到第三方头文件"解析成 compile_commands.json 里那个绝对路径，而 VSCode 是在
+      # 宿主机上打开它的。用 /var/local/thirdparty 的话，宿主机上只有一份共用的旧拷贝——多版本并行开发时
+      # 两棵树会跳到同一份，而且和各自钉住的依赖对不上（实测 gcc14 那份多出一整棵 benchgen/ 头文件树，
+      # 宿主机那份没有，跳过去就是文件不存在）。用 $TPDIR/<digest> 这个路径，容器内外指的是同一份东西。
+      # 真实编译仍走 bind：CMakeCache 会把首次 configure 的绝对路径缓存死，那条路径必须恒定，不能跟着 digest 变。
+      CDB=0; for a in "$@"; do [ "$a" = -- ] && break; [ "$a" = --compdb ] && { CDB=1; break; }; done
+      if [ "$CDB" = 1 ] && docker exec $NAME test -d "$TPDIR/$DG/installed" 2>/dev/null; then
+        exec docker exec -w "$PWD" \
+          -e STARROCKS_THIRDPARTY="$TPDIR/$DG" -e STARROCKS_GCC_HOME="$GHOME" -e SR_TPDIGEST="$DGS" -e SR_VER="$SPEC" -e SR_BRANCH="${BR:-?}" \
+          "${XENV[@]}" "${TTY[@]}" $NAME sr-build "$@"
+      fi
+      [ "$CDB" = 1 ] && echo "   (容器里看不到 $TPDIR，compdb 退回 bind 挂载：跳转到第三方头文件时 VSCode 会打开宿主机上那份旧拷贝。空闲时 sr down && sr up 重建容器即可修好)"
       docker exec -w "$PWD" \
         -e STARROCKS_THIRDPARTY=/var/local/thirdparty -e STARROCKS_GCC_HOME="$GHOME" -e SR_TPDIGEST="$DGS" -e SR_VER="$SPEC" -e SR_BRANCH="${BR:-?}" \
         "${XENV[@]}" "${TTY[@]}" $NAME unshare -m --propagation private sh -c \
