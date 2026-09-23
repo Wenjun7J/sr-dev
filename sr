@@ -543,7 +543,8 @@ U
       WANTS_FARM=1; prevd=""
       for a in "$@"; do
         [ "$a" = -- ] && break
-        case "$a" in --fe|--fe-ut) WANTS_FARM=0;; esac
+        # --compdb 只做 cmake configure，一个 TU 都不编，同样不该把农场叫醒（和 --fe/--fe-ut 一个道理）
+        case "$a" in --fe|--fe-ut|--compdb) WANTS_FARM=0;; esac
         [ "$prevd" = --dist ] && [ "$a" = off ] && WANTS_FARM=0
         prevd=$a
       done

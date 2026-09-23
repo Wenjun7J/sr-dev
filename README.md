@@ -143,6 +143,38 @@ sr compdb --asan     # 要 ASAN 的编译参数
 只覆盖 BE 主程序的源码（`MAKE_TEST=OFF`）。要让 clangd 认识 `be/test/` 下的测试代码，
 跑一次 `sr build --be-ut`，它的 `compile_commands.json` 包含测试文件。
 
+### clangd 必须跑在容器里
+
+`compile_commands.json` 里的编译器是 `/opt/gcc-toolset-14/bin/g++`，头文件路径里有 `/var/local/thirdparty/installed/...`。
+宿主机上前者根本不存在，`--query-driver` 问不出系统头路径，clangd 只能退回用发行版自带的 clang 头文件。
+更隐蔽的是**容器默认命名空间里 `/var/local/thirdparty/installed` 也是空的**——真正的依赖是每次编译时按 digest
+bind 进去的。所以 clangd 必须和编译用同一套挂载。
+
+`files/clangd-host` 就是干这个的：从当前目录上溯找到源码树，读出这棵树钉住的依赖 digest，
+然后 `docker exec -i` 进容器、在私有挂载命名空间里把依赖挂好再起 clangd。它绝不往 stdout 写任何东西，
+因为那条管道就是 LSP 协议本身。
+
+```bash
+ln -sf ~/srdev/files/clangd-host ~/bin/clangd
+```
+
+VSCode 侧：
+
+```jsonc
+"clangd.path": "/home/developer/bin/clangd",
+"clangd.arguments": [
+  "--compile-commands-dir=${workspaceRoot}",
+  "--query-driver=/opt/gcc*/bin/*",   // 一个 glob 覆盖镜像里全部四个 gcc（11/12/13/14）
+  "--background-index", "--clang-tidy", "--header-insertion=never",
+  "--all-scopes-completion", "--completion-style=detailed",
+  "--j=8"                             // 容器是 16 核，开 32 个索引线程只会互相挤
+]
+```
+
+实测对比同一个文件：宿主机那份 clangd 的 stderr 里是
+`driver execution failed - '/opt/gcc-toolset-14/bin/g++' doesn't exist`，并且会报一条
+"protoc 版本比生成代码新"的假警告（它读到的是宿主机上一份过期的 thirdparty）；走容器之后这条假警告消失。
+
 ## 打包产物
 
 `sr pack` 把当前源码树的 `output/` 打成与官方日构建同构的 tar.gz：包名与包内顶层目录同名，都是 `<树名>-<短sha>[-dirty]`，

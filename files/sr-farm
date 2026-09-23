@@ -624,6 +624,8 @@ _watchdog)
     # 幂等且便宜，索性每轮都发一次。
     $API op "$CID" disable_auto_release >/dev/null 2>&1 \
       || echo "$(date '+%F %T') !! disable_auto_release 失败，农场可能在 22 点被平台清扫" >>"$LOGF"
+    # 手动唤醒钩子：仓库里没有任何地方写这个文件，它是留给人用的——
+    # `touch /farm/resume-request` 就能让看门狗在下一轮把农场叫醒，不必自己去跑 sr farm resume。
     if [ -f "$FARM/resume-request" ]; then
       rm -f "$FARM/resume-request"; "$0" resume >>"$LOGF" 2>&1 6>&-
     else

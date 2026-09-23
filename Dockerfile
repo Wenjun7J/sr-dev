@@ -19,6 +19,7 @@ RUN if [ -n "$APT_MIRROR" ]; then \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
       ninja-build ccache icecc libiberty-dev binutils-dev procps bc util-linux sshpass iproute2 \
       mariadb-client \
+      clangd-18 \
 
       gcc-11 g++-11 gcc-12 g++-12 gcc-13 g++-13 \
  && rm -rf /var/lib/apt/lists/*
@@ -65,6 +66,11 @@ RUN set -e; TS=$(ls -d /opt/gcc-toolset-* 2>/dev/null); [ -n "$TS" ] || { echo "
 
 # 挂载点：每次编译在私有 mount ns 里把 /tp/<digest>/installed bind 到这里（thirdparty 的规范路径）
 RUN mkdir -p /var/local/thirdparty/installed
+# clangd 给 VSCode 用（见 files/clangd-host）。装 clangd-18 而不是 clangd 元包：
+# 后者会连带升级 libc6，在编译容器里动 glibc 不值当（实测 --no-install-recommends 下
+# clangd-18 只新增 9 个包、不升级任何东西）。软链成固定名字，换版本时上层不用改。
+RUN ln -sf /usr/bin/clangd-18 /usr/local/bin/clangd
+
 RUN mkdir -p /opt/noninja && printf '#!/bin/sh\nexit 1\n' > /opt/noninja/ninja && chmod +x /opt/noninja/ninja
 RUN git config --global --add safe.directory '*'
 RUN chmod +x /usr/local/bin/cxxlaunch /usr/local/bin/ccache-pch /usr/local/bin/oss-ccache-proxy.py /usr/local/bin/sr-build /usr/local/bin/sr-farm /usr/local/bin/sr-deploy /usr/local/bin/cmake-linkpool /usr/local/bin/linkgate \
