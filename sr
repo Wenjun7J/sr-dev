@@ -492,6 +492,8 @@ versions)
                      （只编不跑: sr build --be-ut；ut 是 be-ut 的旧名，仍可用）
   fe-ut [选项]        跑 FE 单测（run-fe-ut.sh，纯 maven，农场/ccache 不参与）；参数同样原样透传，
                      如 sr fe-ut --test com.starrocks.utframe.Demo / --filter X / --dry-run / -j 8
+  compdb [目录]       只生成 compile_commands.json 给 clangd 用，不编译（实测 14 秒）。用独立构建树，
+                     不影响真实产物；完事把源码树根的软链接指过去。默认 Release，--debug/--asan 可改
   farm {init|status|usage [--watch [秒]]|rebalance|resume|suspend|down}
   tp                 列出已拉下来的各版本依赖（全机共享目录）
   deploy [选项]      在项目下执行：用该项目的产物部署/替换唯一一套单节点集群（FE+BE，跑在容器里）
@@ -514,6 +516,8 @@ U
   case "$sub" in be-ut|ut) sub=build; set -- --be-ut --run "$@";; esac
   # sr fe-ut [选项] = sr build --fe-ut …：跑 FE 单测（纯 maven，不碰农场/ccache）
   [ "$sub" = fe-ut ] && { sub=build; set -- --fe-ut "$@"; }
+  # sr compdb = sr build --compdb：只生成 compile_commands.json，不编译
+  case "$sub" in compdb|ccdb) sub=build; set -- --compdb "$@";; esac
   case "$sub" in
     build)
       # 版本记忆：按「源码树 + 分支」记，切分支要重新指定

@@ -27,7 +27,7 @@ BT=Release ; DIST=auto ; JAVAEXT=1 ; CLEAN=0 ; GEN=ninja ; JLOCAL=$JDEF ; JSET=0
 BTSET=0 ; RUN=0 ; FEUT=0 ; BSCRIPT=build.sh   # BTSET：类型是否显式指定（单测默认 ASAN）；BSCRIPT：驱动上游哪个脚本
 # LOCALCAP（常驻 iceccd 的本机并发上限）挪到读完站点配置之后再算，见下面的 SRCONF 处：
 # 在这里算的话，srdev.conf 里的 SR_LOCAL_JOBS 永远不生效，配置模板里那个旋钮等于死的（codex r8#5）。
-TARGET=all  # be | fe | all | ut（默认 all：BE+FE；只编一个用 --be / --fe；--ut 编 BE 单测，走上游 run-be-ut.sh）
+TARGET=all  # be | fe | all | ut | compdb（默认 all：BE+FE；只编一个用 --be / --fe；--ut 编 BE 单测，走上游 run-be-ut.sh）
 usage(){ cat <<'U'
 用法: sr-build [源码目录] [选项] [-- 透传给 build.sh 的参数]
   不给源码目录就从当前目录上溯找 StarRocks 根
@@ -35,6 +35,7 @@ usage(){ cat <<'U'
   --be-ut                        编 BE 单测（run-be-ut.sh，产物在 ut_build_<类型>/test/），同样走农场+ccache；默认只编不跑
                                  （--ut 是它的旧名，仍可用）
   --fe-ut                        跑 FE 单测（run-fe-ut.sh，纯 maven，农场和 ccache 都不参与）
+  --compdb                       只生成 compile_commands.json（build.sh --configure-only + 跑一遍代码生成），不编译
                                  不认识的参数同样原样透传：sr fe-ut --test com.starrocks.utframe.Demo
   --run                          与 --be-ut 搭配：编完接着跑单测
                                  带 --be-ut / --fe-ut 时，sr 不认识的参数会原样交给上游脚本，不用写 --：
@@ -79,6 +80,7 @@ UTMODE=0; for a in "$@"; do [ "$a" = -- ] && break
 while [ $# -gt 0 ]; do case "$1" in
   --be) TARGET=be; shift;; --fe) TARGET=fe; shift;; --all) TARGET=all; shift;;
   --be-ut|--ut) TARGET=ut; shift;;   # --ut 是旧名，留着不破坏已有用法
+  --compdb) TARGET=compdb; shift;;
   --run) RUN=1; shift;;
   # FE 单测：TARGET 保持 fe，好让下面所有"跳过 BE 相关"的分支原样生效（农场、ccache、PCH、构建树、依赖戳全不碰）；
   # 只把驱动的脚本换成 run-fe-ut.sh，并按 FEUT 走自己的参数与收尾。
@@ -113,6 +115,15 @@ if [ "$FEUT" = 1 ]; then
   BSCRIPT=run-fe-ut.sh
   [ -f "$SR/$BSCRIPT" ] || { echo "!! $SR 里没有 run-fe-ut.sh，跑不了 FE 单测"; exit 1; }
   [ "$RUN" = 1 ] && { echo "!! --run 只对 --be-ut 有意义（BE 单测编完接着跑）；FE 单测本来就是直接跑"; exit 1; }
+elif [ "$TARGET" = compdb ]; then
+  # 只做 cmake configure，产出 compile_commands.json；不编译，也就不需要农场
+  DIST=off
+  grep -q CMAKE_BUILD_PREFIX "$SR/build.sh" 2>/dev/null || {
+    echo "!! 这个分支的 build.sh 不支持 CMAKE_BUILD_PREFIX，compdb 只能和真实构建共用一棵树。"
+    echo "   而 --configure-only 会把 WITH_PCH=OFF 写进 CMakeCache，那样下次编译会全量重来，得不偿失。"
+    echo "   请改用 sr build --be（编完同样会更新根目录的 compile_commands.json 软链接）。"; exit 1; }
+  grep -q '\-\-configure-only' "$SR/build.sh" 2>/dev/null || {
+    echo "!! 这个分支的 build.sh 没有 --configure-only，生成不了 compile_commands.json。请用 sr build --be。"; exit 1; }
 elif [ "$TARGET" = ut ]; then
   BSCRIPT=run-be-ut.sh
   [ -f "$SR/$BSCRIPT" ] || { echo "!! $SR 里没有 run-be-ut.sh，编不了 BE 单测"; exit 1; }
@@ -133,6 +144,9 @@ if grep -q CMAKE_BUILD_PREFIX "$SR/$BSCRIPT" 2>/dev/null; then
   # review extra#5：Ninja 与 Make 不能共用一个 CMake 构建目录（换生成器 CMake 拒绝配置）。新分支认 CMAKE_BUILD_PREFIX，
   # 就按生成器给不同前缀，各自一份互不撞；build.sh 在前缀下仍按 build_$BT 建目录，所以 TREE 仍能算准。
   export CMAKE_BUILD_PREFIX=$SR/be/nj; [ "$GEN" = make ] && export CMAKE_BUILD_PREFIX=$SR/be/nj-make
+  # compdb 必须用独立的树：build.sh --configure-only 会强制 WITH_PCH=OFF 并写进 CMakeCache，
+  # 在真实构建树里跑一次，下次编译所有 TU 的命令行都变了 —— 全量重编 + ccache 全 miss。
+  [ "$TARGET" = compdb ] && export CMAKE_BUILD_PREFIX=$SR/be/nj-compdb
   TREE_BASE=$CMAKE_BUILD_PREFIX
 else
   TREE_BASE=$SR/be                          # 老分支：只能用它原生的位置，生成器无法隔离（见下面的冲突检测）
@@ -330,6 +344,7 @@ edges(){ [ -f "$TREE/build.ninja" ] || { echo "99999 0"; return; }
 # 只会让人以为"就这么慢"，要放行请显式 SR_LOCAL_OK=1
 # FE 是 maven/Java，农场和 ccache 都帮不上：先定死本地，下面的农场检查只约束需要农场的构建（review：原来 --fe 也会被"无农场"拦住）
 [ "$TARGET" = fe ] && { DIST=off; FARM_NOTE="本地（FE$([ $FEUT = 1 ] && echo 单测)是 maven/Java，农场和 ccache 都帮不上）"; }
+[ "$TARGET" = compdb ] && FARM_NOTE="本地（只跑 cmake configure，不编译）"
 NOFARM=""
 if [ ! -f "$FARM_STATE" ] && [ "$DIST" != off ]; then
   echo "!! 还没有编译农场：无法分布式编译（全量约慢 1.9 倍），只能本机 -j$JLOCAL。"
@@ -535,12 +550,13 @@ else
   J=$JLOCAL
   # review r7#6：本地模式也经本机 iceccd。ICECC=no 让 icecc 客户端只在本机编、但仍占 daemon 的槽位（上游明确区分该路径与无 daemon 回退），
   # 于是 -m $LOCALCAP 成为跨源码树共享的本机并发闸门（原来直连编译器，两棵树各 -j16 会叠成 32 个 cc1plus），且绝不外发、不唤醒农场。
-  if [ "$TARGET" != fe ] && ensure_local_daemon; then
+  # compdb 不编译任何 TU，没必要为它把本机 daemon 拉起来
+  if [ "$TARGET" != fe ] && [ "$TARGET" != compdb ] && ensure_local_daemon; then
     export USE_ICECC=1 ICECC=no; [ $CACHE = 1 ] && export CCACHE_PREFIX=icecc
     FARM_NOTE="$FARM_NOTE；本机并发经 iceccd 闸门(-m $LOCALCAP)"
   else
     export USE_ICECC=0; unset CCACHE_PREFIX ICECC 2>/dev/null || true
-    [ "$TARGET" != fe ] && echo "!! 本地 iceccd 不可用，本机并发无跨树闸门（仅 ninja -j$J）"
+    [ "$TARGET" != fe ] && [ "$TARGET" != compdb ] && echo "!! 本地 iceccd 不可用，本机并发无跨树闸门（仅 ninja -j$J）"
   fi
 fi
 
@@ -556,6 +572,8 @@ case $TARGET in
   # 再拆一次会用已剥离的文件覆盖上一次完整的 .debuginfo（ASAN 报告就没有文件:行号了）。我们要调它两次、用户也会反复跑，
   # 所以拆分收回来自己做（见下面 split_fresh：判据是有没有 .gnu_debuglink，天然幂等）。
   ut)  ARGS=(-j "$J" --dry-run --without-debug-symbol-split) ;;
+  # java-extensions 和 compile_commands.json 毫无关系，别为它多花那几秒
+  compdb) ARGS=(--be --configure-only --without-java-ext -j "$J") ;;
 esac
 [ "$TARGET" != fe ] && [ $JAVAEXT = 0 ] && ARGS+=(--without-java-ext)
 # run-fe-ut.sh 不认 --clean，透传过去会被它的 usage 直接拒掉；但也不能静默吞掉用户的意图
@@ -567,16 +585,18 @@ esac
 [ ${#PASS[@]} -gt 0 ] && ARGS+=("${PASS[@]}")
 
 echo "=========================================================="
-echo " 目标: $([ $FEUT = 1 ] && echo "fe-ut   (FE 单测，run-fe-ut.sh；纯 maven，农场/ccache 不参与)" || echo "$([ "$TARGET" = ut ] && echo be || echo "$TARGET")$([ "$TARGET" = fe ] && echo "   (maven，农场/ccache 不参与)")$([ "$TARGET" = ut ] && echo "-ut   (BE 单测，run-be-ut.sh；$([ $RUN = 1 ] && echo 编完接着跑 || echo 只编不跑))")")"
+[ "$TARGET" = compdb ] && echo " 目标: compdb   (只生成 compile_commands.json，不编译；独立构建树，不碰真实产物)"
+[ "$TARGET" != compdb ] && echo " 目标: $([ $FEUT = 1 ] && echo "fe-ut   (FE 单测，run-fe-ut.sh；纯 maven，农场/ccache 不参与)" || echo "$([ "$TARGET" = ut ] && echo be || echo "$TARGET")$([ "$TARGET" = fe ] && echo "   (maven，农场/ccache 不参与)")$([ "$TARGET" = ut ] && echo "-ut   (BE 单测，run-be-ut.sh；$([ $RUN = 1 ] && echo 编完接着跑 || echo 只编不跑))")")"
 [ $FEUT = 1 ] && echo " 并发: maven -T $([ "$JSET" = 1 ] && echo "$JLOCAL（-j 指定）" || echo "4（run-fe-ut.sh 默认；-j N 可改）")"
 [ "$TARGET" = ut ] && [ $CLEAN = 1 ] && echo " 注意: run-be-ut.sh --clean 除了删 $TREE，还会删 $SR/be/output/（上游行为，BE 主程序产物也没了）"
-[ "$TARGET" != fe ] && echo " 类型: $BT      生成器: $GEN      并发: -j$J      链接闸门: 全容器同时 $LINKJ 个 ld（按 ${MEMGB}G 内存 / 最坏单个链接 ${LKMEM}G 估；SR_LINK_JOBS 可改）"
+[ "$TARGET" = compdb ] && echo " 类型: $BT      生成器: $GEN"
+[ "$TARGET" != fe ] && [ "$TARGET" != compdb ] && echo " 类型: $BT      生成器: $GEN      并发: -j$J      链接闸门: 全容器同时 $LINKJ 个 ld（按 ${MEMGB}G 内存 / 最坏单个链接 ${LKMEM}G 估；SR_LINK_JOBS 可改）"
 echo " 模式: $FARM_NOTE"
 [ -n "${SR_DRYRUN:-}" ] && { echo " (SR_DRYRUN=1：决策已打印，到此为止不编译)"; exit 0; }   # 测试钩子：验证农场/交互决策
 echo " 版本: ${SR_VER:-未指定}   编译器: $(${STARROCKS_GCC_HOME:-/usr}/bin/gcc -dumpfullversion 2>/dev/null || echo ?)   依赖: ${STARROCKS_THIRDPARTY:-默认}"
 echo " 源码树: $SR"
 [ "$TARGET" != fe ] && echo " 构建树: $TREE${TREE_NOTE:-}"   # FE / FE 单测不产出 BE 构建树，打出来只会误导
-if [ "$TARGET" = fe ]; then :          # 纯 maven，ccache 与 java-extensions 都不参与，不打这几行
+if [ "$TARGET" = fe ] || [ "$TARGET" = compdb ]; then :   # 纯 maven / 只 configure，ccache 与 java-extensions 都不参与，不打这几行
 elif [ $CACHE = 1 ]; then
   CS=$(ccache -s 2>/dev/null | sed -n 's/^Cache size (\{0,1\}[^)]*)\{0,1\}:[[:space:]]*//p' | head -1)
   [ -n "$CS" ] || CS=$(ccache -s 2>/dev/null | awk -F': *' '/Cache size/{print $2; exit}')
@@ -585,7 +605,7 @@ elif [ $CACHE = 1 ]; then
 else
   echo " ccache: 已禁用 (--no-ccache)"
 fi
-[ "$TARGET" != fe ] && echo " java-extensions: $([ $JAVAEXT = 1 ] && echo 构建 || echo 跳过'(产物将缺 jni-packages 等 jar)')"
+[ "$TARGET" != fe ] && [ "$TARGET" != compdb ] && echo " java-extensions: $([ $JAVAEXT = 1 ] && echo 构建 || echo 跳过'(产物将缺 jni-packages 等 jar)')"
 echo "=========================================================="
 # 心跳：容器是 root，宿主看门狗是普通用户，必须放宽权限双方才都能更新
 mkdir -p /farm 2>/dev/null; : > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null
@@ -783,6 +803,27 @@ if [ "${MAXM:-0}" != 0 ] && [ "$MAXM" != max ] && [ "${PEAK:-0}" != 0 ]; then
 fi
 [ $CACHE = 1 ] && [ "$TARGET" != fe ] && ccache -s 2>/dev/null | grep -E 'Cacheable calls|Hits:|Uncacheable' | head -3   # 全局累计值，FE 不走 ccache 就不打
 
+# compdb：configure 完还得把代码生成跑一遍，否则 gensrc 是空的，clangd 解析不了
+# #include "gen_cpp/xxx.h" 这类生成头文件。只跑这两个目标，不碰任何 .cpp 的编译。
+if [ "$TARGET" = compdb ] && [ $RC = 0 ]; then
+  if [ -f "$TREE/build.ninja" ]; then
+    echo ""
+    echo "== 生成 thrift / proto 代码（clangd 要靠它解析 gen_cpp 里的头文件）…"
+    CGT=""
+    for t in be_thrift_codegen be_proto_codegen; do
+      grep -q "^build $t: phony" "$TREE/build.ninja" 2>/dev/null && CGT="$CGT $t"
+    done
+    if [ -n "$CGT" ]; then
+      if ninja -C "$TREE" $CGT 2>&1 | tail -3; then :; else RC=1; echo "!! 代码生成失败，compile_commands.json 仍在，但 clangd 会报生成头文件找不到"; fi
+    else
+      echo "   (这个分支的 build.ninja 里没有 be_thrift_codegen / be_proto_codegen 目标，跳过)"
+    fi
+    echo "   gensrc 下生成头文件 $(find "$TREE/gensrc" -name '*.h' 2>/dev/null | wc -l) 个"
+  else
+    echo "!! $TREE/build.ninja 不存在，configure 可能没成功"; RC=1
+  fi
+fi
+
 # 把本次构建的 compile_commands.json 软链到源码树根，给 clangd 一个固定的寻址路径。
 # 为什么值得做：每种构建类型各有一份（build_Release / build_ASAN / ut_build_ASAN …），clangd 默认
 # 只认项目根或 build/ 下那一个，不固定下来就得手工改配置。根目录这个名字上游 .gitignore 里已经有了，
@@ -806,6 +847,8 @@ if [ "$TARGET" != fe ] && [ "${SR_CC_LINK:-1}" != 0 ] && [ -f "$TREE/compile_com
     fi
   fi
 fi
+
+[ "$TARGET" = compdb ] && exit $RC   # 只 configure，没有产物可报，也不必校验链接闸门
 
 # 回读校验两道闸门确实进了构建文件。上游分支的 env.sh 若不认 CUSTOM_CMAKE，注入会静默落空，
 # 而头部早就宣称过"链接池 N 个 ld 同时跑"——不验证就等于又造了一个"看着生效其实没有"的读数。

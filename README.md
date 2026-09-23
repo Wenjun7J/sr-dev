@@ -126,6 +126,23 @@ compile_commands.json -> be/nj/build_Release/compile_commands.json
 
 根目录若已存在一个**真实文件**（不是软链接），`sr` 不会动它，只提示一句。要彻底关掉：`srdev.conf` 里设 `SR_CC_LINK=0`。
 
+不想为了 clangd 编一整轮的话，用 `sr compdb`：
+
+```bash
+sr compdb            # 只生成 compile_commands.json，实测 14 秒（新克隆、从没编译过的树也是这个数）
+sr compdb --asan     # 要 ASAN 的编译参数
+```
+
+它走 `build.sh --configure-only`，只做 cmake configure，再跑一遍 thrift/proto 代码生成
+（否则 `gen_cpp/*.h` 不存在，clangd 会满屏报找不到头文件），然后把根目录软链接指过去。
+
+**用的是独立构建树 `be/nj-compdb/`（约 32M），不碰真实产物。** 这一点不能省：`--configure-only` 会强制
+`WITH_PCH=OFF` 并写进 CMakeCache，在真实构建树里跑一次，下次编译所有 TU 的命令行都变了，
+等于全量重编加 ccache 全 miss。顺带一个好处是生成的数据库里没有 PCH 相关标志，clangd 更干净。
+
+只覆盖 BE 主程序的源码（`MAKE_TEST=OFF`）。要让 clangd 认识 `be/test/` 下的测试代码，
+跑一次 `sr build --be-ut`，它的 `compile_commands.json` 包含测试文件。
+
 ## 打包产物
 
 `sr pack` 把当前源码树的 `output/` 打成与官方日构建同构的 tar.gz：包名与包内顶层目录同名，都是 `<树名>-<短sha>[-dirty]`，
