@@ -43,8 +43,9 @@ docker ps --filter name=<当前用户>_farm --format '{{.Names}} {{.Image}} {{.S
 
 ## 日常操作的关键约束
 
+- 日常构建和单测走宿主机 `sr` 入口，不直接 `docker exec ... sr-build`。宿主入口负责依赖解析、挂载和传入 `SR_BRANCH`、`SR_VER`、`SR_TPDIGEST`；直接调用内部驱动容易遗漏这些步骤，history 就会出现 `@?` / `?/?`。只有诊断内部驱动的任务才考虑直接调用，并显式核对所需环境。
 - 第一次非交互构建显式传 `-v <依赖版本>`；版本按源码树 + 分支记忆，tag 后续自动跟随 registry，**不是固定 digest**。
-- 普通 `sr build` 默认 **BE+FE、Release**。没有农场时，自动化本地构建明确加 `--dist off`；不要为了消除提示擅自申请农场。
+- 普通 `sr build` 默认 **BE+FE、Release**。已有农场时保留默认 `--dist auto`，不要仅因“只跑少量单测”就强制本地。明确选择本地执行、没有可用农场且本地执行符合任务意图，或做本地对照实验时才加 `--dist off`；不要为了消除提示擅自申请农场。
 - `sr be-ut` / `sr build --be-ut` 默认 **ASAN、动态模块、PCH，编完接着跑**；只编用 `--no-run`。
   `ut` / `--ut` 和用户级 `-j` 已移除。并发改 `SR_LOCAL_JOBS` / `SR_NODE_JOBS`，FE UT 可单独改 `SR_FE_UT_JOBS`。
 - 同一源码树的构建串行；并行任务用不同 worktree。不要删除锁文件或绕过 sr 直接运行上游 UT 脚本来规避锁。

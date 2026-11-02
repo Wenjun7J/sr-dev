@@ -1,17 +1,18 @@
 # 日常工作流与排障
 
 以下 `sr` 均在目标 Linux 宿主机运行；构建、部署、IDE 命令的工作目录是选定的 StarRocks worktree。
-首次使用或切分支时加 `-v <依赖版本>`；已有版本记录可省略。根据任务选择本地或农场模式。
+首次使用或切分支时加 `-v <依赖版本>`；已有版本记录可省略。已有农场时保留默认 auto。
+下面示例使用 auto；没有可用农场且要本地执行时改成 `--dist off`。首次安装的本地验证见 setup.md。
 
 ## 构建与单测
 
 ```bash
-sr -v <版本> build --be --debug --dist off
+sr -v <版本> build --be --debug --dist auto
 sr build --fe
-sr build --all --dist off
-sr be-ut --dist off --module storage --no-run
-sr be-ut --dist off --test <目标测试>
-sr be-ut --dist off --gtest_filter '<Suite>.<Case>'
+sr build --all --dist auto
+sr be-ut --dist auto --module storage --no-run
+sr be-ut --dist auto --test <目标测试>
+sr be-ut --dist auto --gtest_filter '<Suite>.<Case>'
 sr fe-ut --test <完整测试类名>
 ```
 
@@ -92,6 +93,8 @@ FE HTTP/RPC/query/edit-log 为基址 +0/+1/+2/+3，BE 的四个服务端口为 +
 | 现象 | 先检查什么，再做什么 |
 |---|---|
 | 首次非交互拒绝开工 | 明确传 `-v`；无农场且要本机编则传 `--dist off` |
+| history 出现 `@?` / `?/?` | 分别是 `SR_BRANCH` 和 `SR_VER` / `SR_TPDIGEST` 缺失的回退值。检查是否绕过宿主 sr 直接调用了容器 sr-build；不代表 Git 分支或依赖不存在 |
+| history 显示本地，但预期走农场 | 先查原始调用是否有 `--dist off`，再查外层日志的“模式”及原因。history 目前只保存模式简称，归档的构建日志不含外层决策表头 |
 | 找不到版本/digest | registry 表、`SR_TP_REPO`、匿名 HTTP v2 可达性、tag；不要自动换仓库。tag 列表有约一小时缓存 |
 | 工具版本不一致 | 比较当前工具输入摘要与容器 `/usr/local/share/sr/image-id`；准备镜像后在空闲升级窗口 `sr down && sr up` |
 | `/farm` 或 `/tp` 挂载漂移 | 核对宿主目录是否改名/重建；当前实现拒绝继续。不能删除状态强行绕过；空闲时重建挂载 |
