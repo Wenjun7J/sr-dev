@@ -1,0 +1,18 @@
+# Only send Dockerfile inputs; site configuration and Git history stay on the host.
+**
+!Dockerfile
+!files/
+!files/ccache.conf
+!files/cxxlaunch
+!files/ccache-pch
+!files/oss-ccache-proxy.py
+!files/sr-build
+!files/sr-farm
+!files/sr-deploy
+!files/sr-deploy-lock.py
+!files/cmake-linkpool
+!files/dynlib-compat.cmake
+!files/lldb-dap-env
+!files/linkgate
+!files/tspapi.py
+!files/node-setup.sh

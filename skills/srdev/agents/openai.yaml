@@ -1,0 +1,4 @@
+interface:
+  display_name: "srdev 开发工具链"
+  short_description: "StarRocks 多版本构建、编译农场、部署与调试的上手指南"
+  default_prompt: "使用 $srdev 检查目标开发机的配置，说明当前工具链，并完成这次构建或调试任务。"

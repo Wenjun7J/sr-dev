@@ -1,0 +1,59 @@
+#!/bin/bash
+# lldb-dap-env —— 在容器里按 run-be-ut.sh 的口径把 BE 单测的运行时环境摆好，然后 exec 后面的命令
+# （lldb-dap-20 / lldb-20）。
+#
+# 为什么要它：.so 模式的测试二进制没有 RPATH（readelf 看不到 RUNPATH），裸跑直接
+#   error while loading shared libraries: libExecRuntime.so: cannot open shared object file
+# run-be-ut.sh 是把构建树里所有含 .so 的目录、thirdparty 的 jemalloc/llvm/paimon、gcc 的 libstdc++、JDK 的 libjvm
+# 全前插进 LD_LIBRARY_PATH 才跑起来的（run-be-ut.sh 380~430 行）。这里按构建树计算路径，写成 lldb 命令文件，
+# 再由 initCommands / -S 加载为 target.env-vars，只交给被调试进程。
+#
+# 输入（都可省）：STARROCKS_HOME 源码树（默认从 cwd 上溯找）；SR_UT_TREE 构建树（默认 be/nj-dyn/ut_build_ASAN，
+# 其次 be/ut_build_ASAN —— 用哪棵树的 .so 就得指哪棵，两棵树的同名 .so 混进一个 LD_LIBRARY_PATH 会串）。
+set -u
+find_root(){ local d=${1:-}
+  while [ -n "$d" ] && [ "$d" != / ] && [ "$d" != . ]; do
+    [ -f "$d/build.sh" ] && [ -d "$d/be/src" ] && { printf '%s\n' "$d"; return 0; }
+    d=$(dirname "$d"); done; return 1; }
+SR=${STARROCKS_HOME:-$(find_root "$(pwd -P)" 2>/dev/null || true)}
+if [ -z "$SR" ]; then echo "lldb-dap-env: 不在 StarRocks 源码树里，不设单测环境，原样执行" >&2; exec "$@"; fi
+export STARROCKS_HOME=$SR
+export STARROCKS_THIRDPARTY=${STARROCKS_THIRDPARTY:-/var/local/thirdparty}
+export STARROCKS_GCC_HOME=${STARROCKS_GCC_HOME:-/opt/gcc-toolset-14}
+TREE=${SR_UT_TREE:-}
+if [ -z "$TREE" ]; then for t in "$SR/be/nj-dyn/ut_build_ASAN" "$SR/be/ut_build_ASAN"; do [ -d "$t" ] && { TREE=$t; break; }; done; fi
+add(){ [ -n "${1:-}" ] && [ -d "$1" ] && LD_LIBRARY_PATH="$1${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; return 0; }   # 前插，同 run-be-ut.sh
+# —— 以下与 run-be-ut.sh 逐项对应 ——
+export TERM=${TERM:-xterm} UDF_RUNTIME_DIR=$SR/lib/udf-runtime LOG_DIR=$SR/log
+export LSAN_OPTIONS=${LSAN_OPTIONS:-suppressions=$SR/conf/asan_suppressions.conf}
+if [ -f "$SR/conf/be_test.conf" ]; then
+  for i in $(sed 's/ //g' "$SR/conf/be_test.conf" | grep -E '^[[:upper:]]([[:upper:]]|_|[[:digit:]])*='); do export "$i"; done
+fi
+mkdir -p "$LOG_DIR" "$UDF_RUNTIME_DIR" 2>/dev/null
+LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
+for d in jemalloc/lib-shared lib lib64 llvm/lib paimon-cpp/lib; do add "$STARROCKS_THIRDPARTY/installed/$d"; done
+if [ -n "$TREE" ]; then
+  while IFS= read -r d; do add "$d"; done < <(find "$TREE" -type f \( -name '*.so' -o -name '*.so.*' \) ! -name '*.debuginfo' -printf '%h\n' 2>/dev/null | sort -u)
+else echo "lldb-dap-env: 找不到构建树（SR_UT_TREE 未设且 be/nj-dyn/ut_build_ASAN、be/ut_build_ASAN 都不在），.so 模式的二进制会起不来" >&2; fi
+add "$(dirname "$("$STARROCKS_GCC_HOME/bin/g++" -print-file-name=libstdc++.so 2>/dev/null)" 2>/dev/null)"
+JH=${JAVA_HOME:-$STARROCKS_THIRDPARTY/installed/open_jdk}
+[ -f "$JH/lib/server/libjvm.so" ] && { export JAVA_HOME=$JH; add "$JH/lib/server"; add "$JH/lib"; }
+# 这份 LD_LIBRARY_PATH 只能给被调试进程，不能给调试器：thirdparty/llvm/lib 里有 StarRocks 自带的 libLLVM-18.so（只编了 X86 后端），
+# 与系统 liblldb-18 / lldb-server 依赖的 libLLVM-18.so 同名不同货，谁沾上谁就
+#   symbol lookup error: liblldb-18.so.1: undefined symbol: LLVMInitializeAArch64TargetInfo
+# 试过用 ld.so --library-path 只钉 lldb 本体——不够：lldb 起子进程 lldb-server 时把环境原样传下去，lldb-server 一样死，
+# 表现为 attach/launch 无限挂起。所以这里【不导出】LD_LIBRARY_PATH，而是写成一份 lldb 命令文件，由 lldb 用
+# target.env-vars 只塞给被调试进程（launch.json 的 initCommands 里 command source 它；命令行 lldb 用 -S）。attach 用不着它。
+if [ -n "$TREE" ]; then
+  ENVF=$TREE/.sr-lldb-env
+  { echo "# 由 lldb-dap-env 生成（$(date '+%F %T')）：给被调试进程的运行时库路径，与 run-be-ut.sh 同款；调试器自己不能沾"
+    printf 'settings set target.inherit-env true\nsettings set target.env-vars LD_LIBRARY_PATH=%s\n' "$LD_LIBRARY_PATH"; } > "$ENVF.tmp" 2>/dev/null && mv -f "$ENVF.tmp" "$ENVF" 2>/dev/null \
+    || echo "lldb-dap-env: 写不了 $ENVF（被调试进程会缺 LD_LIBRARY_PATH，launch 会起不来；attach 不受影响）" >&2
+fi
+unset LD_LIBRARY_PATH
+# abort_on_error=1 让 ASan 报错时 SIGABRT，调试器正好停在报告现场（run-be-ut.sh 同款）；经 inherit-env 传给被调试进程
+# LSan 不支持 ptrace：默认关掉泄漏检查，避免测试已通过却在退出时因调试器附加而报 fatal error。
+# 仅影响此调试入口；正常 sr be-ut 仍按上游配置检查泄漏，显式 ASAN_OPTIONS 也仍优先。
+export ASAN_OPTIONS=${ASAN_OPTIONS:-abort_on_error=1:disable_coredump=0:unmap_shadow_on_exit=1:detect_stack_use_after_return=1:detect_leaks=0}
+[ -n "${SR_LLDB_ENV_DEBUG:-}" ] && { echo "lldb-dap-env: 源码树 $SR 构建树 ${TREE:-无}"; [ -n "$TREE" ] && cat "$TREE/.sr-lldb-env"; } >&2
+exec "$@"

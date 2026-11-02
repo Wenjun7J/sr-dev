@@ -12,15 +12,23 @@ SR_APT_MIRROR=                     # 建镜像/装节点时替换 archive.ubuntu
 SR_TPDIR=/srv/srdev/thirdparty     # 各版本 thirdparty 的公共目录（按 digest 存、全机共享）；不可写时退回 ~/thirdparty
 #CPUS=16                           # 容器 CPU 限额
 #MEM=64g                           # 容器内存限额
-#IMG=sr-dev:single                 # 镜像名
+#IMG=my-sr-dev:custom              # 可选镜像名；默认 sr-dev:<构建输入摘要>，避免不同工具版本混用
 
 ## 编译农场（sr farm init 申请的云上节点）
 SR_NODE_USER=sr                    # 节点上的 ssh 用户
 SR_NODE_PASSWORD=                  # 节点初始密码，仅首次铺 ssh 密钥用；之后全走专用密钥 ~/farm/ssh/id_farm
 WORKERS=5                          # 申请的机器总数（全部当 worker；平台自带的 1 台 FE 也算在内，写 5 就开 5 台）
-#SR_LOCAL_JOBS=8                   # 常驻本机 iceccd 的并发上限（默认=容器 CPU 配额；全局、只在 daemon 启动时生效）。单次构建限本机内存请用 sr build -j N（总并发上限）
+#SR_LOCAL_JOBS=8                   # 本机并发上限：既是常驻 iceccd 的 -m，也是 ninja 的本机份额（默认=容器 CPU 配额）。
+                                   # 全局、只在 daemon 启动时生效，改完要 sr down && sr up。用户级 -j 已移除。
+#SR_FE_UT_JOBS=8                   # FE 单测的 maven -T（默认跟 SR_LOCAL_JOBS）。控制的是 reactor 并发，
+                                   # 实际测试 JVM 数还取决于 surefire 的 fork 配置，别当成 JVM 总数。
+#SR_DYNLIB_PCH=1                   # BE 单测 .so 模式下补挂 PCH（1，默认）还是只 -include vector（0）。实测本地编译 PCH 快约 5%，
+                                   # 分布式无收益；切换会让该树全部 TU 重编。命令行 --[no-]dynlib-pch 优先。
 #SR_FE_HEAP=2g                     # sr deploy 起的 FE 堆上限（默认 2g；上游模板 8g 会和编译抢容器内存）
-#SR_LINK_JOBS=2                    # 同时跑几个链接器（默认按容器内存与构建类型估算；ASAN 单测单个 ld.lld 峰值可达 11G）
+#SR_PORT_BASE=28000                # FE/BE 端口基址。新部署默认 24000+(uid%300)*20；旧部署保留原端口
+#SR_FE_DEBUG_PORT=28008            # FE 调试端口，默认端口基址+8；starlet 使用基址+9
+#SR_LINK_JOBS=2                    # 同时跑几个链接器；默认取 CPU配额/5 与 (内存GiB-5)/SR_LINK_MEM_GB 较小值，限制在 1..8
+#SR_LINK_MEM_GB=15                 # 单条链接的历史内存估值，不是安全上界；内存不足一条时仍串行执行并告警
 #SR_CC_LINK=0                      # 关掉"编译完在源码树根建 compile_commands.json 软链接"（默认开，给 clangd 固定寻址路径）
 
 ## 端口：默认按 uid 取模推导，共享机上 uid 相差 250(SPORT)/500(DPORT、代理) 的两个人会撞在一起。

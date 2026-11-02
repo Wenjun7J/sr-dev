@@ -18,7 +18,7 @@ MEM=${MEM:-64g}
 SR_USER=${SR_USER:-$(id -un)}
 SLICE=${SLICE:-srfarm_${SR_USER}.slice}   # 名字必须用下划线：systemd 把 a-b.slice 当成 a.slice 的子节点
 NAME=${SR_USER}_farm
-IMG=${IMG:-sr-dev:single}
+IMG=${IMG:-}   # 默认为构建输入的内容标识，见 image_identity
 # 依赖按 digest 存，内容不可变、与用户无关——放公共目录全机共享，别人拉过的你不用再拉。
 # 公共目录不可写时退回自己 $HOME 下。
 SHARED_TP=${SR_TPDIR:-/srv/srdev/thirdparty}
@@ -81,12 +81,43 @@ running(){ [ "$(docker inspect -f '{{.State.Running}}' $NAME 2>/dev/null)" = tru
 # -t 只在 stdout 也是终端时加：stdout 进了管道（sr build | tee log）还挂 -t，docker 会拒绝或把回车/转义码灌进日志（review）
 TTY=(); if [ -t 0 ]; then TTY=(-i -e SR_TTY=1); [ -t 1 ] && TTY=(-it -e SR_TTY=1); fi
 
+image_identity(){
+  IMAGE_ID=$(python3 "$HERE/files/sr-image-id.py" "$HERE" "${SR_BASE_IMAGE:-}" "${SR_APT_MIRROR:-}") || return 1
+  IMG=${IMG:-sr-dev:${IMAGE_ID:0:24}}
+}
+check_container_version(){
+  image_identity || return 1
+  local actual
+  actual=$(docker exec "$NAME" cat /usr/local/share/sr/image-id 2>/dev/null)
+  [ "$actual" = "$IMAGE_ID" ] && return 0
+  if [ "${1:-check}" = allow-old ]; then
+    echo "   (容器工具版本较旧，本次仅执行状态、停止或维护命令)" >&2
+    return 0
+  fi
+  echo "!! 容器 $NAME 的工具版本与当前 srdev 不一致。为避免混用，已停止本次操作。" >&2
+  echo "   先 sr image 构建对应镜像；待构建和服务空闲后 sr down && sr up 切换。" >&2
+  return 1
+}
 build_image(){
+  image_identity || return 1
   echo "== 构建单镜像 $IMG（base=${SR_BASE_IMAGE:-Dockerfile 默认}，装 gcc 11/12/13 + 各自的 icecc 工具链包）…"
-  BA=(--build-arg APT_MIRROR="${SR_APT_MIRROR:-}"); [ -n "${SR_BASE_IMAGE:-}" ] && BA+=(--build-arg BASE="$SR_BASE_IMAGE")
+  BA=(--build-arg APT_MIRROR="${SR_APT_MIRROR:-}" --build-arg SR_IMAGE_ID="$IMAGE_ID"); [ -n "${SR_BASE_IMAGE:-}" ] && BA+=(--build-arg BASE="$SR_BASE_IMAGE")
   docker build -f "$HERE/Dockerfile" "${BA[@]}" -t $IMG "$HERE"; }
 # 没镜像就地构建（首次约 5 分钟）：sr up / sr build 都不该因为"还没跑 sr image"停下来；sr image 保留为显式重建
-ensure_image(){ docker image inspect $IMG >/dev/null 2>&1 && return 0; echo "== 镜像 $IMG 不存在，先构建（一次性）"; build_image; }
+ensure_image(){
+  image_identity || return 1
+  local metadata actual
+  metadata=$(docker image inspect -f '{{index .Config.Labels "org.srdev.image-id"}} {{.Id}}' "$IMG" 2>/dev/null)
+  read -r actual IMAGE_REF <<< "$metadata"
+  if [ "$actual" != "$IMAGE_ID" ]; then
+    echo "== 构建匹配当前工具版本的镜像 $IMG"
+    build_image || return 1
+    metadata=$(docker image inspect -f '{{index .Config.Labels "org.srdev.image-id"}} {{.Id}}' "$IMG") || return 1
+    read -r actual IMAGE_REF <<< "$metadata"
+    [ "$actual" = "$IMAGE_ID" ] || { echo '!! 镜像标签被其他构建更改，请重试' >&2; return 1; }
+  fi
+  [ -n "$IMAGE_REF" ]
+}
 # 站点配置每次调用都同步进容器可见的目录。原来把 srdev.conf 作为单个文件 bind mount 到 /etc/srdev.conf：Docker 单文件挂载钉的是
 # inode，vim/sed -i 保存都是"写新文件再 rename"换了 inode，容器就永远读到容器创建那一刻的旧内容（实测：宿主 WORKERS=6/8c16g，
 # 容器仍 5/8c32g）。/farm 是目录挂载，文件替换可见；写临时文件再 mv 保证容器不会读到半截。/etc/srdev.conf 的挂载保留，仅作旧容器兼容。
@@ -237,6 +268,7 @@ EOF
   return $fatal; }
 
 ensure_container(){
+  local version_policy=${1:-check}
   # 顺序要紧：先把 farm 目录收紧到 0700 再往里写配置——目录还开放时写固定路径会被预置的符号链接劫持（codex r8#3）。
   # 0700 迁移也必须在 running 短路之前，否则已在跑的老部署永远不会被修；改不动就拒绝，这是提权向量，不能带着跑。
   mkdir -p "$BASE/farm" 2>/dev/null
@@ -247,6 +279,7 @@ ensure_container(){
   # 挂载检查必须在 sync_conf 之前：/farm 漂移时 sync_conf 会把配置写进宿主机的新目录，而容器读的还是旧挂载，
   # 两边各拿一份配置干活（codex r14#15）。所以先查挂载，致命就中止，别再往下写任何东西。
   if running; then
+    check_container_version "$version_policy" || return 1
     check_mounts || return 1
     sync_conf || { echo "!! 同步站点配置到 $BASE/farm/srdev.conf 失败（磁盘满/不可写？）。继续下去容器会按上一次的旧配置干活，已中止。"; return 1; }
     resize_if_needed
@@ -264,7 +297,7 @@ ensure_container(){
   # 验证轮 #5：无命令的 `exec ... 2>/dev/null` 会永久吞掉本 shell 后续的 stderr；用 { } 把重定向限定在这一句
   { exec 8>"$BASE/farm/.container.lock"; } 2>/dev/null || { echo "!! 无法打开 $BASE/farm/.container.lock（目录权限？），拒绝在无互斥下起容器"; return 1; }
   flock -w 120 8 || { echo "!! 等待容器启动锁超时（另一个 sr 正在起容器？）"; return 1; }
-  if running; then exec 8>&-; return 0; fi   # 等锁期间另一方已把容器起好，别再 rm -f
+  if running; then exec 8>&-; check_container_version "$version_policy"; return $?; fi
   local CGP=() CONF_MOUNT=()
   [ -f "$CONF_FILE" ] && CONF_MOUNT=(-v "$CONF_FILE":/etc/srdev.conf:ro)
   if [ -n "$SLICE" ] && command -v systemctl >/dev/null; then
@@ -281,7 +314,7 @@ ensure_container(){
     -v $WORK:$WORK -v $BASE/ccache:/ccache -v $BASE/m2:/root/.m2 \
     -v $BASE/farm:/farm -v $BASE/.tsp:/root/.tsp -v $BASE/iceccrun:/var/run/icecc \
     -v $TPDIR:/tp $([ "${TPDIR#$WORK/}" = "$TPDIR" ] && echo "-v $TPDIR:$TPDIR") ${CONF_MOUNT[@]+"${CONF_MOUNT[@]}"} \
-    -e SR_USER="$SR_USER" -e SR_UID="$(id -u)" -e SR_OSSCFG="$HOME/.ossutilconfig" -w $WORK $IMG sleep infinity >/dev/null
+    -e SR_USER="$SR_USER" -e SR_UID="$(id -u)" -e SR_OSSCFG="$HOME/.ossutilconfig" -w $WORK "$IMAGE_REF" sleep infinity >/dev/null
   local drc=$?; exec 8>&-   # 容器起完就放锁（无论成败）
   [ $drc = 0 ] || { echo "!! 容器启动失败（docker run 返回非零）"; return 1; }
   echo "== 容器 $NAME 已启动（单容器，编所有版本；限额 ${CPUS}核/${MEM}）"
@@ -349,15 +382,68 @@ ensure_tp(){
 
 case "${1:-}" in
 image)   build_image ;;   # 显式重建（改了 Dockerfile 之后）；平时 sr up / sr build 发现没镜像会自动构建
+ide)     python3 "$HERE/files/sr-vscode.py" "$PWD" "$HERE" /farm/deploy --ide-only ;;
 up)      ensure_container ;;
 down)    docker rm -f $NAME >/dev/null 2>&1; echo "容器已删除（挂载卷保留）" ;;
-shell)   ensure_container && docker exec -it $NAME bash -l ;;
+shell)   ensure_container allow-old && docker exec -it $NAME bash -l ;;
 history|log)
   F=$BASE/farm/builds.tsv
-  [ -f "$F" ] || { echo "还没有编译记录"; exit 0; }
-  printf "%-16s %-8s %-22s %-14s %-6s %-5s %-6s %-7s %-6s %s\n" 时间 用户 源码树@分支 版本 模式 边数 结果 用时 anon峰 命中/编译
+  # 历史文件可选：第一次构建时它还不存在，但侧车里已经有"运行中"那一行了，
+  # 直接退出会让用户在最需要看进度的时候什么都看不到（codex#3）。
   # 第 7 列是 build.sh 的退出码：0=成功，其余=失败。history 只报成功/失败，不写原因（用户要求）；要查原因看末列日志路径
-  tail -n "${2:-20}" "$F" | awk -F"\t" '{r=($7==0?"成功":"失败"); printf "%-16s %-8s %-22s %-14s %-6s %-5s %-6s %-7s %-6s %s\n",$1,$2,substr($3,1,22),$4,$5,$6,r,$8,$9,$10}' ;;
+  # 对齐：printf 的 %-Ns 按字节补齐，而中文在终端占 2 列 —— 表头与数据、数据行彼此都会错开
+  # （本地/分布式/FEUT 三种值的字节数与显示宽度各不相同，原来三行各自歪一个量）。所以按显示宽度自己补：
+  # UTF-8 里 2 字节字符显示 1 列、3 字节显示 2 列、4 字节显示 2 列，减去差值即得。
+  # 列宽取"表头与本次要显示的数据"两者的最大值，不再写死 —— 原来源码树@分支 硬截到 22 字节，分支名整段看不见。
+  # 运行中的构建：sr-build 开工时写 /farm/sr-build.<md5>.run 侧车（前 7 列同 history 行 + 开始秒 + 临时日志/内存采样路径），收尾删。
+  # 判活不看 PID，看它持有的 .lock：flock -n 拿得到 = 没人在编 = 侧车是被 SIGKILL 留下的残骸，顺手清掉。
+  # 进度（ninja 的 [已完成/总数]）和内存峰值都在容器 /tmp 里，宿主机看不见，借一次 docker exec 读；
+  # 容器不在就不可能有运行中的构建，安静地不显示。结果列写 R，awk 里映射成"运行中"。
+  RUNNING=$(docker exec $NAME sh -c '
+    T=$(printf "\t")
+    for f in /farm/sr-build.*.run; do
+      [ -f "$f" ] || continue
+      lk=${f%.run}.lock
+      # 必须在持锁作用域内判活并删残骸：flock 命令一返回锁就没了，
+      # 新构建可能正好在这个窗口里拿到锁、写下侧车，然后被这里的 rm 误删（codex#5）。
+      if flock -n 9 -c "rm -f \"$f\"" 9<>"$lk" 2>/dev/null; then continue; fi
+      IFS=$T read -r st user tree ver mode n tgt s outf anonf phase < "$f" || continue
+      case "$s" in ""|*[!0-9]*) continue;; esac
+      el=$(( $(date +%s) - s ))
+      prog=$(grep -oE "^\[[0-9]+/[0-9]+\]" "$outf" 2>/dev/null | tail -1 | tr -d "[]"); [ -n "$prog" ] && n=$prog
+      pk=$(cat "$anonf" 2>/dev/null); case "$pk" in ""|*[!0-9]*) pk="?";; *) pk=$(awk -v n="$pk" "BEGIN{printf \"%.1fG\", n/1073741824}");; esac
+      printf "%s\t%s\t%s\t%s\t%s\t%s\tR\t%dm%02ds\t%s\t-\t%s\t%s\t%s\n" "$st" "$user" "$tree" "$ver" "$mode" "$n" $((el/60)) $((el%60)) "$pk" "$outf" "$tgt" "${phase:-}"
+    done' 2>/dev/null)
+  [ -s "$F" ] || [ -n "$RUNNING" ] || { echo "还没有编译记录"; exit 0; }
+  { [ -f "$F" ] && tail -n "${2:-20}" "$F"; [ -n "$RUNNING" ] && printf '%s\n' "$RUNNING"; } | LC_ALL=C awk -F'\t' '
+    function dw(s,  n,t){ n=length(s)
+      t=s; n-=gsub(/[\xc0-\xdf]/,"",t)
+      t=s; n-=gsub(/[\xe0-\xef]/,"",t)
+      t=s; n-=2*gsub(/[\xf0-\xf7]/,"",t)
+      return n }
+    function pad(s,w,  k){ k=w-dw(s); if(k<=0) return s; return s sprintf("%" k "s","") }
+    BEGIN{ h[1]="时间"; h[2]="用户"; h[3]="源码树@分支"; h[4]="版本"; h[5]="目标"; h[6]="模式"
+           h[7]="边数"; h[8]="结果"; h[9]="用时"; h[10]="anon峰"; h[11]="命中/编译"
+           NC=11
+           cap[3]=64 }   # 只有这列可能很长；列宽本来就按实际数据自适应，上限放宽对短名字零代价。
+                          # 截断时留下 .. 作记号，且仅在纯 ASCII 时截（按字节切中文会切碎）
+    { n++
+      # 目标是第 12 个字段（后加的）。老行没有它，从"模式"里的 UT*/FEUT 前缀反推，两代格式显示一致。
+      tgt=$12
+      if(tgt==""){ if($5 ~ /^UT/) tgt="be-ut"; else if($5=="FEUT") tgt="fe-ut"; else tgt="?" }
+      md=$5; sub(/^UT/,"",md); if(md=="FEUT") md="本地"
+      v[1]=$1; v[2]=$2; v[3]=$3; v[4]=$4; v[5]=tgt; v[6]=md
+      v[7]=$6; v[8]=($7=="R"?("运行中" ($13!=""?"·" $13:"")):($7==0?"成功":"失败")); v[9]=$8; v[10]=$9; v[11]=$10
+      run[n]=($7=="R")
+      for(i=1;i<=NC;i++){ c=v[i]
+        if((i in cap) && dw(c)>cap[i] && length(c)==dw(c)) c=substr(c,1,cap[i]-2) ".."
+        cell[n,i]=c; if(dw(c)>w[i]) w[i]=dw(c) } }
+    END{ for(i=1;i<=NC;i++) if(dw(h[i])>w[i]) w[i]=dw(h[i])
+         line=""; for(i=1;i<=NC;i++) line=line (i>1?" ":"") (i==NC?h[i]:pad(h[i],w[i])); print line
+         sep=0
+         for(j=1;j<=n;j++){ if(run[j] && !sep){ print "── 运行中（时间=本阶段开始时刻，用时=已运行）──"; sep=1 }
+           line=""
+           for(i=1;i<=NC;i++) line=line (i>1?" ":"") (i==NC?cell[j,i]:pad(cell[j,i],w[i])); print line } }' ;;
 pack)
   # 把当前源码树的 output/ 打成和官方日构建同构的包：顶层目录名 = 文件名 = <树名>-<短sha>[-dirty]，
   # 里面就是 be/ fe/（以及构建时带上的 apache_hdfs_broker/）和 LICENSE/NOTICE，不额外塞东西。
@@ -486,17 +572,19 @@ versions)
   up                 起容器（没镜像会先自动构建；单个容器编所有版本）。
                      改完 srdev.conf 里的 CPUS/MEM 后跑一次 sr up 即可热更新配额，不用重建容器
   image              强制重建镜像（改了 Dockerfile 之后用）
+  ide                为当前 worktree 配置用户自己的 clangd 入口（保留已有自定义设置）
   build [目录] [选项] 编译（默认 BE+FE；--be / --fe 单选）。首次会询问依赖版本（或用 -v 指定），之后记住；换版本再 -v
   be-ut [选项]        编 BE 单测（默认 ASAN，走农场+ccache）并接着跑；sr 不认识的参数原样交给 run-be-ut.sh，
                      如 sr be-ut --test CompactionUtilsTest / --gtest_filter 'A*:B*' / --module storage
-                     （只编不跑: sr build --be-ut；ut 是 be-ut 的旧名，仍可用）
+                     （只编不跑加 --no-run）
   fe-ut [选项]        跑 FE 单测（run-fe-ut.sh，纯 maven，农场/ccache 不参与）；参数同样原样透传，
-                     如 sr fe-ut --test com.starrocks.utframe.Demo / --filter X / --dry-run / -j 8
+                     如 sr fe-ut --test com.starrocks.utframe.Demo / --filter X / --dry-run
   compdb [目录]       只生成 compile_commands.json 给 clangd 用，不编译（实测 14 秒）。用独立构建树，
                      不影响真实产物；完事把源码树根的软链接指过去。默认 Release，--debug/--asan 可改
   farm {init|status|usage [--watch [秒]]|rebalance|resume|suspend|down}
   tp                 列出已拉下来的各版本依赖（全机共享目录）
   deploy [选项]      在项目下执行：用该项目的产物部署/替换唯一一套单节点集群（FE+BE，跑在容器里）
+                     自动开启 FE JDWP、建立 BE LLDB 入口并补齐 FE/BE 调试配置
                      已有集群在跑就先停再换。--status 看状态，--stop 停，--clean-data 连数据一起重建，--fe-heap 改 FE 堆（默认 2g）
   pack [目录] [选项]  把该树 output/ 打成与官方日构建同构的 tar.gz；--upload 传到 srdev.conf 配的 OSS 桶
   history [N]        最近 N 次编译概况（默认 20）
@@ -509,11 +597,13 @@ digest 变了会提示（若报依赖相关错误，先 rebase 代码）。换�
 U
 ;;
 *)
-  ensure_container || exit 1
+  VERSION_POLICY=check
+  case "$1:${2:-}" in deploy:--status|deploy:--stop|farm:status|farm:down|farm:suspend) VERSION_POLICY=allow-old;; esac
+  ensure_container "$VERSION_POLICY" || exit 1
   sub=$1; shift
-  # sr ut [选项] [-- run-be-ut.sh 参数] = sr build --ut --run …：编 BE 单测（走农场）然后接着跑。只编不跑用 sr build --ut
-  # sr be-ut [选项] = sr build --be-ut --run …；ut 是 be-ut 的旧名，留着不破坏已有用法
-  case "$sub" in be-ut|ut) sub=build; set -- --be-ut --run "$@";; esac
+  # sr be-ut [选项] [-- run-be-ut.sh 参数] = sr build --be-ut …：编 BE 单测（走农场）然后接着跑。
+  # 不再注入 --run：编完就跑已经是 --be-ut 自己的默认，只编不跑用 sr be-ut --no-run
+  case "$sub" in be-ut) sub=build; set -- --be-ut "$@";; esac
   # sr fe-ut [选项] = sr build --fe-ut …：跑 FE 单测（纯 maven，不碰农场/ccache）
   [ "$sub" = fe-ut ] && { sub=build; set -- --fe-ut "$@"; }
   # sr compdb = sr build --compdb：只生成 compile_commands.json，不编译
@@ -521,7 +611,7 @@ U
   case "$sub" in
     build)
       # 版本记忆：按「源码树 + 分支」记，切分支要重新指定
-      # 与容器内 sr-build 同一规则找源码目录（review #7）：遇 -- 停；-j/--dist 跳过其值；其余 -* 跳过；
+      # 与容器内 sr-build 同一规则找源码目录（review #7）：遇 -- 停；--dist 跳过其值；其余 -* 跳过；
       # 第一个存在的目录型位置参数就是源码根（必须是根本身，不上溯）；没给时才从 $PWD 上溯。
       # 不能"扫所有参数里的现存目录"：-- 后面透传给 build.sh 的目录会被误认。
       # 单测模式下 sr 不认识的参数会整段透传，它们的值是裸词（--module storage 的 storage）。
@@ -529,11 +619,11 @@ U
       # 会把 storage 当成源码树，于是版本记忆按错的 key 去查，而容器内用的是上溯找到的真源码树——两边脱节。
       # 判据和容器内 sr-build 保持一致：单测模式下位置参数必须真含 build.sh 才算源码树。
       UTM=0; for a in "$@"; do [ "$a" = -- ] && break
-        case "$a" in --ut|--be-ut|--fe-ut) UTM=1; break;; esac; done
+        case "$a" in --be-ut|--fe-ut) UTM=1; break;; esac; done
       TSTART=""; skipv=0
       for a in "$@"; do
         [ $skipv = 1 ] && { skipv=0; continue; }
-        case "$a" in --) break;; -j|--dist) skipv=1;; -*) ;;
+        case "$a" in --) break;; --dist) skipv=1;; -*) ;;
           *) if [ -d "$a" ] && { [ "$UTM" = 0 ] || [ -f "$a/build.sh" ]; }; then TSTART=$(cd "$a" && pwd -P); break; fi;;   # pwd -P：软链接与真路径同一个 key（review latest#1）
         esac
       done
@@ -610,7 +700,6 @@ U
       GREAL=$(docker exec $NAME sh -c "$GHOME/bin/gcc -dumpversion 2>/dev/null" | cut -d. -f1)
       [ "$GREAL" = "$GMAJ" ] || { echo "!! $GHOME 里的 gcc 实际是 ${GREAL:-未知} 版，依赖 $DGS 要求 $GMAJ 版。"
                                   echo "   用错编译器的产物 ABI 不一致且不会报错，已中止。请 sr image 重建镜像。"; exit 1; }
-      [ -n "$KEY" ] && { mkdir -p "$PDIR" 2>/dev/null; echo "$SPEC $DG" > "$PDIR/$KEY"; }
       # 每次编译进自己的私有 mount namespace，把该版本的依赖 bind 到规范路径 /var/local/thirdparty。
       # 不能改路径挂成 /tp/<digest> 直接用：CMakeCache 会把首次 configure 找到的 FILEPATH 缓存成
       # /var/local/thirdparty/...，之后不再重找（踩过：toolchains base 上 libcurl.a 找不到；dev-env base 上
@@ -618,7 +707,9 @@ U
       # 可选透传：CCACHE_REMOTE_STORAGE(ccache 远端存储 URL) / SR_CCACHE_DIR(换一个缓存目录做对照实验)
       # MAVEN_OPTS: FE 的 maven JVM 参数/日志开关透传；SR_LOCAL_OK: 非交互且无农场时放行本机编（review：容器里提示了它，这里却没转发）
       # SR_DRYRUN / FARM_STATE：测试钩子，只走到决策打印就停 / 指向伪造的农场状态文件
-      XENV=(); for v in CCACHE_REMOTE_STORAGE SR_CCACHE_DIR SR_EXPLAIN MAVEN_OPTS SR_LOCAL_OK SR_DRYRUN FARM_STATE; do [ -n "${!v:-}" ] && XENV+=(-e "$v"); done
+      # 并发类旋钮平时从容器里的 /farm/srdev.conf 读；放进白名单是为了允许命令行临时覆盖单次构建
+      # （SR_FE_UT_JOBS=6 sr fe-ut 这种）。不放进来的话环境变量到不了容器，会静默失效。
+      XENV=(-e "SR_VERSION_KEY=$KEY" -e "SR_TPDIGEST_FULL=$DG"); for v in CCACHE_REMOTE_STORAGE SR_CCACHE_DIR SR_EXPLAIN MAVEN_OPTS SR_LOCAL_OK SR_DRYRUN FARM_STATE SR_FE_UT_JOBS SR_LOCAL_JOBS SR_LINK_JOBS SR_LINK_MEM_GB SR_BUILD_PREFIX SR_EXTRA_CMAKE_ARGS SR_DYNLIB_PCH; do [ -n "${!v:-}" ] && XENV+=(-e "$v"); done
       # compdb 走另一条路：不做 bind，直接把 STARROCKS_THIRDPARTY 指向依赖目录在**宿主机上的真实路径**。
       # 为什么：clangd 把"跳转到第三方头文件"解析成 compile_commands.json 里那个绝对路径，而 VSCode 是在
       # 宿主机上打开它的。用 /var/local/thirdparty 的话，宿主机上只有一份共用的旧拷贝——多版本并行开发时
@@ -638,7 +729,28 @@ U
           'mount --bind "/tp/$0/installed" /var/local/thirdparty/installed && exec sr-build "$@"' "$DG" "$@" ;;
     farm) docker exec "${TTY[@]}" $NAME sr-farm "$@" ;;
     # deploy 必须带 -w "$PWD"：它要从当前目录上溯找源码树，用这棵树的产物部署（通用转发分支不带工作目录）
-    deploy) docker exec -w "$PWD" -e SR_UID="$(id -u)" "${TTY[@]}" $NAME sr-deploy "$@" ;;
+    deploy)
+      docker exec -w "$PWD" -e SR_UID="$(id -u)" -e SR_DEPLOY_DIR="${SR_DEPLOY_DIR:-/farm/deploy}" \
+        -e SR_FE_DEBUG_PORT="${SR_FE_DEBUG_PORT:-}" -e SR_PORT_BASE="${SR_PORT_BASE:-}" \
+        ${TTY[@]+"${TTY[@]}"} $NAME sr-deploy "$@"
+      DRC=$?; [ "$DRC" = 0 ] || exit "$DRC"
+      # 在宿主用户下写配置和入口，避免生成 root 所有的 .vscode 或使用容器的 HOME。
+      VSCODE=1; VBE=1; VFE=1; VARGS=()
+      for a in "$@"; do
+        case "$a" in
+          --status|--stop|-h|--help) VSCODE=0;;
+          --fe-only) VBE=0;; --be-only) VFE=0;;
+        esac
+      done
+      if [ "$VSCODE" = 1 ]; then
+        [ "$VBE" = 0 ] && VARGS+=(--no-be)
+        if [ "$VFE" = 1 ]; then
+          VPORT=$(docker exec "$NAME" cat "${SR_DEPLOY_DIR:-/farm/deploy}/.fe-debug-port" 2>/dev/null) || VPORT=""
+          [[ "$VPORT" =~ ^[1-9][0-9]{0,4}$ ]] && VARGS+=(--fe-port "$VPORT")
+        fi
+        python3 "$HERE/files/sr-vscode.py" "$PWD" "$HERE" "${SR_DEPLOY_DIR:-/farm/deploy}" ${VARGS[@]+"${VARGS[@]}"} \
+          || echo '!! 产物部署已完成，但 VS Code 调试配置未就绪，请检查上方错误。' >&2
+      fi ;;
     *) if docker exec $NAME sh -c "command -v \"\$1\"" _ "$sub" >/dev/null 2>&1; then
          docker exec "${TTY[@]}" $NAME "$sub" "$@"
        else echo "未知子命令: $sub"; exec "$0" --help; fi ;;

@@ -18,9 +18,17 @@ real=${SR_REAL_CMAKE:-cmake}
 #   只有前者的话，多棵树同时链接会各按整个容器的内存算槽数，加起来照样撞上限（codex r14#6）。
 # -G 既可能写成 `-G Ninja` 也可能写成 `-GNinja`，两种都要认，否则静默不注入（codex 之外，自查发现）。
 GATE=${SR_LINK_GATE:-/usr/local/bin/linkgate}
+# 两类注入各自独立判断：原来整段都包在 SR_LINK_JOBS 的正则里，
+# 没设它时连带把别的注入也吞掉（耦合，虽然 sr-build 总会 export）。
+inj=()
 if [[ "${SR_LINK_JOBS:-}" =~ ^[1-9][0-9]*$ ]]; then
-  inj=("-DCMAKE_JOB_POOLS=link=$SR_LINK_JOBS" -DCMAKE_JOB_POOL_LINK=link)
+  inj+=("-DCMAKE_JOB_POOLS=link=$SR_LINK_JOBS" -DCMAKE_JOB_POOL_LINK=link)
   [ -x "$GATE" ] && inj+=("-DCMAKE_CXX_LINKER_LAUNCHER=$GATE")
+fi
+# sr-build 可以再塞别的 configure 参数（目前用于 --dynlib 的 CMAKE_PROJECT_INCLUDE）。
+# 故意不加引号：这里就是要按空格拆成多个参数。
+[ -n "${SR_EXTRA_CMAKE_ARGS:-}" ] && inj+=($SR_EXTRA_CMAKE_ARGS)
+if [ ${#inj[@]} -gt 0 ]; then
   for a in "$@"; do
     case "$a" in -G|-G?*) exec "$real" "${inj[@]}" "$@";; esac
   done

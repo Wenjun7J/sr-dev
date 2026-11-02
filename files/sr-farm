@@ -182,9 +182,15 @@ warm_workers(){
   { [ -n "$envf" ] && [ -n "$gxx" ]; } || { echo "   (跳过预热：镜像里没有配对的 icecc 工具链包与编译器)"; return 0; }
   # 预热必须经本机 iceccd 才会外发；没有 daemon 时 icecc 直接在本机编，白跑且留不下远端评分（codex r10#2）。
   # daemon 由 sr-build 每次构建时按配对参数启动，这里只检查不另起，免得起出一个参数不匹配的常驻 daemon。
-  for q in $(pgrep -x iceccd 2>/dev/null); do st=$(awk '{print $3}' /proc/$q/stat 2>/dev/null); [ "$st" != Z ] && { alive=1; break; }; done
-  [ "$alive" = 1 ] || [ -n "$(ss -ltnH "sport = :${DPORT:-10245}" 2>/dev/null)" ] \
-    || { echo "   (跳过预热：本机 iceccd 还没起来——它由 sr build 启动。首次构建后若仍有 worker 零任务，跑一次 sr farm rebalance 即可)"; return 0; }
+  # 判据是"客户端真能 connect 到 socket"，不是"有进程/端口"：容器重建后常见 socket 残留但 daemon 已死，
+  # 那时 icecc 静默全本地编译，预热白跑还留不下远端评分（与 sr-build 的 daemon_connectable 同一问题）。
+  if ! { [ -S "${ICESOCK:-/var/run/icecc/iceccd.socket}" ] && python3 -c "import socket,sys
+s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(2)
+try: s.connect('${ICESOCK:-/var/run/icecc/iceccd.socket}'); s.close()
+except Exception: sys.exit(1)" 2>/dev/null; }; then
+    echo "   (跳过预热：本机 iceccd 连不上——它由 sr build 启动。首次构建后跑一次 sr farm rebalance 即可)"
+    return 2   # 2 = 跳过（不是失败也不是成功）；调用方据此如实报告就绪程度
+  fi
   # rebalance 刚重启 scheduler 时 worker 还没重连完，有界等待它们注册（最多 60 秒）。
   # 必须按 $NODES 里的 IP 逐个数：listcs 的总行数含本机提交端，拿它和 WORKERS 比会提前满足，
   # 结果最后重连的那台被当成"未注册"跳过预热——正是我们要防的那台（实测 192.0.2.12 中招）。
@@ -379,9 +385,24 @@ EOF
     exit 1; }
   beat; wd_ensure
   # 预热前先放生命周期锁：预热会编译几分钟，不该把 suspend/down 一直挡在外面（codex r9）
-  { exec 8>&-; } 2>/dev/null; warm_workers
+  # 预热结果要参与就绪判定：原来无论预热跳过与否都打"农场就绪"，而跳过时 4 台 worker 的 speed 全是 0、
+  # scheduler 一个任务都不派，用户看到"就绪"却全压本机（2026-09-24 实测：远端 0/64，本容器 63 个 cc1plus）。
+  # codex 也独立指出"未完成预热不能伪装成全部就绪"。
+  { exec 8>&-; } 2>/dev/null; warm_workers; WARM_RC=$?
+  # 只影响报告，不改 FARM_STATUS：state.env 对它有白名单校验、看门狗也只认 running，
+  # 引入新状态值会破坏那两处。集群本身确实可用，"未预热"是使用姿势问题不是集群问题。
   echo ""
-  if [ "$INIT_STATUS" = degraded ]; then echo "== 初始化未完成（degraded）==============================="; else echo "== 农场就绪 =========================================="; fi
+  if [ "$INIT_STATUS" = degraded ]; then
+    echo "== 初始化未完成（degraded）==============================="
+  elif [ "${WARM_RC:-0}" = 2 ]; then
+    # 原来无论预热跳过与否都打"农场就绪"，而跳过时 4 台 worker 的 speed 全是 0、scheduler 一个任务都不派，
+    # 用户看到"就绪"却全压本机（2026-09-24 实测：远端 0/64，本容器 63 个 cc1plus 打满 16 核）。
+    echo "== 集群已建好，但【尚未预热】=============================="
+    echo "   worker 的 speed 还是 0，scheduler 不会派活 —— 现在编译会全压本机。"
+    echo "   跑一次 sr build（它会拉起本机 iceccd），再 sr farm rebalance 即可。"
+  else
+    echo "== 农场就绪 =========================================="
+  fi
   printf "   集群 %s (id=%s)   区域 %s\n" "$NAME" "$ID" "$($API spec "$NAME" | cut -d'|' -f4)"
   printf "   规格 %s × %s   磁盘 %sG/台   scheduler 在本容器 %s:%s   网络名 %s\n" \
          "$NW" "$($API spec "$NAME" | cut -d'|' -f2)" "$($API spec "$NAME" | cut -d'|' -f3)" "$SCHED" "$SPORT" "$NETNAME"

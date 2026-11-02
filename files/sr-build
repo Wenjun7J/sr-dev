@@ -23,30 +23,39 @@ LOCK=""   # 源码树定下来之后才能算，见下
 quota_cores(){ local q p; read -r q p < /sys/fs/cgroup/cpu.max 2>/dev/null || { nproc 2>/dev/null; return; }
   [ "$q" = max ] && { nproc 2>/dev/null; return; }; echo $(( (q + p - 1) / p )); }
 JDEF=$(quota_cores); case "$JDEF" in ''|*[!0-9]*|0) JDEF=16;; esac
-BT=Release ; DIST=auto ; JAVAEXT=1 ; CLEAN=0 ; GEN=ninja ; JLOCAL=$JDEF ; JSET=0 ; VERBOSE=0 ; CACHE=1
-BTSET=0 ; RUN=0 ; FEUT=0 ; BSCRIPT=build.sh   # BTSET：类型是否显式指定（单测默认 ASAN）；BSCRIPT：驱动上游哪个脚本
+BT=Release ; DIST=auto ; JAVAEXT=1 ; CLEAN=0 ; GEN=ninja ; JLOCAL=$JDEF ; VERBOSE=0 ; CACHE=1   # JLOCAL 读完配置后按 SR_LOCAL_JOBS 重定
+BTSET=0 ; RUN=0 ; RUNSET=0 ; FEUT=0 ; BPFX="" ; DYNLIB=1 ; DYNPCH="" ; BSCRIPT=build.sh   # DYNLIB：BE 单测默认编成 .so（实测链接快 3.36 倍、内存 1/5）   # BTSET：类型是否显式指定（单测默认 ASAN）；BSCRIPT：驱动上游哪个脚本
 # LOCALCAP（常驻 iceccd 的本机并发上限）挪到读完站点配置之后再算，见下面的 SRCONF 处：
 # 在这里算的话，srdev.conf 里的 SR_LOCAL_JOBS 永远不生效，配置模板里那个旋钮等于死的（codex r8#5）。
-TARGET=all  # be | fe | all | ut | compdb（默认 all：BE+FE；只编一个用 --be / --fe；--ut 编 BE 单测，走上游 run-be-ut.sh）
+TARGET=all  # be | fe | all | ut | compdb（默认 all：BE+FE；只编一个用 --be / --fe；--be-ut 编 BE 单测，走上游 run-be-ut.sh）
 usage(){ cat <<'U'
 用法: sr-build [源码目录] [选项] [-- 透传给 build.sh 的参数]
   不给源码目录就从当前目录上溯找 StarRocks 根
   --be | --fe | --all            编译目标（默认 all=BE+FE；FE 走原生 maven，不经农场/ccache）
-  --be-ut                        编 BE 单测（run-be-ut.sh，产物在 ut_build_<类型>/test/），同样走农场+ccache；默认只编不跑
-                                 （--ut 是它的旧名，仍可用）
-  --fe-ut                        跑 FE 单测（run-fe-ut.sh，纯 maven，农场和 ccache 都不参与）
-  --compdb                       只生成 compile_commands.json（build.sh --configure-only + 跑一遍代码生成），不编译
-                                 不认识的参数同样原样透传：sr fe-ut --test com.starrocks.utframe.Demo
-  --run                          与 --be-ut 搭配：编完接着跑单测
-                                 带 --be-ut / --fe-ut 时，sr 不认识的参数会原样交给上游脚本，不用写 --：
+  --be-ut                        编 BE 单测（run-be-ut.sh，产物在 ut_build_<类型>/test/），同样走农场+ccache，编完接着跑
+                                 sr 不认识的参数原样交给 run-be-ut.sh，不用写 --：
                                    sr be-ut --test CompactionUtilsTest / --gtest_filter 'A*:B*' / --module storage
+                                   sr be-ut --module storage --no-run  （只编不跑）
+  --fe-ut                        跑 FE 单测（run-fe-ut.sh，纯 maven，农场和 ccache 都不参与）
+                                 同样原样透传给 run-fe-ut.sh：sr fe-ut --test com.starrocks.utframe.Demo
+  --compdb                       只生成 compile_commands.json（build.sh --configure-only + 跑一遍代码生成），不编译
+  --no-run                       与 --be-ut 搭配：只编不跑（--run 是默认行为，仍可显式写）
+  --build-prefix DIR             换一棵构建树（默认 be/nj）。做 A/B 对照时用，免得把实验配置写进主树；
+                                 也可用 SR_BUILD_PREFIX。指定的树若已有冲突配置会拒绝而不是覆盖
+  --no-dynlib                    BE 单测默认把各模块编成 .so（上游 --with-dynamic），用它关掉、回到静态链接。
+                                 为什么默认开：链接实测 408s -> 121s（快 3.36 倍）、anon 峰值 38G -> 7.6G，
+                                 而单测不在意运行性能。验收过：树外启动依赖 0 未解析、315 个测试套与静态树完全一致。
+                                 产物依赖构建树里的 .so，只适合本机跑单测；默认落在 be/nj-dyn，不碰静态树
+  --no-dynlib-pch                .so 模式下 sr 默认给各模块补挂上游漏掉的 PCH（与静态模式同一份 starrocks_pch.h），
+                                 用它退回只补 -include vector。也可用 SR_DYNLIB_PCH=0。切换会让该树全部 TU 重编。
+                                 实测（1588 TU）：本地编译 PCH 快约 5%（小 TU 最多快 1/3），改 .cpp/改项目头/ccache 命中
+                                 都无害；分布式下远端拿不到 .gch，没有收益（单轮略慢，在噪声内）。codex 五轮评审后定的默认。
   --debug | --release | --asan   构建类型（默认 release，单测默认 asan；仅对 be/ut 生效）
   --dist auto|on|off             是否用编译农场（默认 auto）
   --no-java-ext                  跳过 java-extensions（默认构建；跳过则产物缺 jni-packages 等 jar）
   --clean                        清空该类型的构建树后重建
   --make                         回退到 Unix Makefiles（默认 ninja）
   --no-ccache                    绕过 ccache（仅用于做纯编译计时对比）
-  -j N                           本次总并发上限。不给=农场容量+本地16；显式给则整次最多 N 个并发（含本机），内存紧时真能限住本机
   --why                          打印各默认值背后的实测依据
 U
 }
@@ -68,27 +77,58 @@ why(){ cat <<'W'
                          实测改 1 个 TU 走农场亏 1.9%，改 377 个赚 45%
   默认建 java-extensions: 热 .m2 下仅 5.8 秒，而跳过会导致
                          output/be/lib/jni-packages 缺 jar，Hive/Iceberg 等连接器运行时失败
+  链接闸门按 CPU 定    : 2026-09-23 空载实测（16核64G 容器，24 个真实 UT 链接目标，预热后每档两次）
+                         24 目标 并发 3: 65s/15G  6: 64s/23G  10: 69s/31G  16: 75s/45G
+                         全 56 目标 并发 3: 408s/38G  并发 4: 426s/42G（调大是负收益）
+                         并发越高越慢而内存线性涨 —— 并发 3 已吃掉 13.2/16 核(83%)，lld 自身多线程，
+                         CPU 是主要瓶颈。内存侧全量串行实测最坏单条 anon 14.70G(starrocks_dw_test，产物 3164M)，
+                         与产物大小线性(1MB 产物≈4.7MB anon)；3 条最坏同时跑约 44G/64G，余量很薄，内存也是约束
+  mold 不用            : 同组实测并发 3/6/12 墙钟 45.9/47.6/45.3s，几乎不随并发变化(单条就吃满 16 核)，
+                         anon 是 lld 的 2.2~2.5 倍。单条虽快(5.1s vs 7.0s)，但构建本身已有链接级并行，优势归零
 W
 }
 PASS=(); SRARG=""
-# 单测模式（sr ut / sr build --ut）下，sr 不认识的参数一律原样交给 run-be-ut.sh，不用再写 --。
-# 先扫一遍再进解析循环：--ut 不一定出现在最前面，而 `--test CompactionUtilsTest` 这种带值参数，
+# 单测模式（sr be-ut / sr build --be-ut）下，sr 不认识的参数一律原样交给 run-be-ut.sh，不用再写 --。
+# 先扫一遍再进解析循环：--be-ut 不一定出现在最前面，而 `--test CompactionUtilsTest` 这种带值参数，
 # 值本身是个裸词，必须在看到它之前就知道该透传（否则会被当成"源码目录"或报未知参数）。
 # 遇到显式的 -- 就停止扫描：-- 后面的东西本来就会整体透传。
-UTMODE=0; for a in "$@"; do [ "$a" = -- ] && break
-  case "$a" in --ut|--be-ut|--fe-ut) UTMODE=1; break;; esac; done
+ORIGARGS=("$@")   # 原样留一份：解析循环会 shift 掉参数，而后面要分辨"用户显式写了 --dynlib"和"用的是默认值"
+UTMODE=0; UTS=""; for a in "$@"; do [ "$a" = -- ] && break
+  case "$a" in --be-ut) UTMODE=1; UTS=run-be-ut.sh; break;; --fe-ut) UTMODE=1; UTS=run-fe-ut.sh; break;; esac; done
 while [ $# -gt 0 ]; do case "$1" in
   --be) TARGET=be; shift;; --fe) TARGET=fe; shift;; --all) TARGET=all; shift;;
-  --be-ut|--ut) TARGET=ut; shift;;   # --ut 是旧名，留着不破坏已有用法
+  --be-ut) TARGET=ut; shift;;
   --compdb) TARGET=compdb; shift;;
-  --run) RUN=1; shift;;
+  --build-prefix) BPFX=$2; shift 2;;
+  --dynlib) DYNLIB=1; shift;; --no-dynlib) DYNLIB=0; shift;;
+  --dynlib-pch) DYNPCH=1; shift;; --no-dynlib-pch) DYNPCH=0; shift;;
+  --run) RUN=1; RUNSET=1; shift;; --no-run) RUN=0; RUNSET=1; shift;;
   # FE 单测：TARGET 保持 fe，好让下面所有"跳过 BE 相关"的分支原样生效（农场、ccache、PCH、构建树、依赖戳全不碰）；
   # 只把驱动的脚本换成 run-fe-ut.sh，并按 FEUT 走自己的参数与收尾。
   --fe-ut) TARGET=fe; FEUT=1; shift;;
   --debug) BT=Debug; BTSET=1; shift;; --release) BT=Release; BTSET=1; shift;; --asan) BT=ASAN; BTSET=1; shift;;
   --dist) DIST=$2; shift 2;; --no-java-ext) JAVAEXT=0; shift;;
   --clean) CLEAN=1; shift;; --make) GEN=make; shift;; --no-ccache) CACHE=0; shift;;
-  -j) JLOCAL=$2; JSET=1; shift 2;; --why) why; exit 0;; -h|--help) usage; exit 0;;
+  # -j 已移除。分布式下它只影响 ninja 的在途总数，派几个回本机是 scheduler 决定的（上限 iceccd -m），
+  # 它控制不了真正吃本机内存的那部分；本地模式/FE 也统一由 SR_LOCAL_JOBS 与上游默认决定，少一个会骗人的旋钮。
+  -j|-j[0-9]*) echo "!! -j 已移除：分布式下它管不了本机并发（派几个回本机由 scheduler 决定，上限是 iceccd -m）。"
+       echo "   本机并发改 srdev.conf 的 SR_LOCAL_JOBS，节点槽数改 SR_NODE_JOBS，然后 sr down && sr up。"; exit 1;;
+  --why) why; exit 0;;
+  -h|--help) usage
+    # 单测模式再补一段上游脚本的选项：sr 不认识的参数全都原样交给它，只印 sr 自己的等于没回答"能传什么"。
+    # 上游 usage() 退出码是 1、且前面会吐一段 python/maven 版本横幅，所以忽略退出码并从 Usage: 开始截。
+    if [ "$UTMODE" = 1 ] && [ -n "$UTS" ]; then
+      HR=$(find_root 2>/dev/null) || HR=""
+      if [ -n "$HR" ] && [ -f "$HR/$UTS" ]; then
+        echo ""
+        echo "以下是上游 $UTS 自己的选项（sr 不认识的参数原样传给它）:"
+        ( cd "$HR" && ./"$UTS" --help 2>&1 | sed -n '/^Usage:/,$p' | sed 's/^/  /' )
+      else
+        echo ""
+        echo "（当前目录不在源码树里，或树中没有 $UTS，无法列出它的选项）"
+      fi
+    fi
+    exit 0;;
   -v) VERBOSE=1; shift;;
   --) shift; PASS+=("$@"); break;;
   # 目录型位置参数 = 指定源码树，放前放后都行
@@ -98,6 +138,9 @@ while [ $# -gt 0 ]; do case "$1" in
      elif [ "$UTMODE" = 1 ]; then PASS+=("$1"); shift
      else echo "未知参数: $1"; usage; exit 1; fi;;
 esac; done
+# --be-ut 的默认是"编完接着跑"，没显式写 --run/--no-run 时在这里补上。
+# 必须用 RUNSET 而不是 RUN 判断下面那两处"搭配错误"，否则默认值会把 --fe-ut 和普通构建全部误伤成参数错误。
+[ "$TARGET" = ut ] && [ $RUNSET = 0 ] && RUN=1
 
 # 指定了目录就用它，否则从 $PWD 上溯
 if [ -n "$SRARG" ]; then
@@ -114,7 +157,7 @@ fi
 if [ "$FEUT" = 1 ]; then
   BSCRIPT=run-fe-ut.sh
   [ -f "$SR/$BSCRIPT" ] || { echo "!! $SR 里没有 run-fe-ut.sh，跑不了 FE 单测"; exit 1; }
-  [ "$RUN" = 1 ] && { echo "!! --run 只对 --be-ut 有意义（BE 单测编完接着跑）；FE 单测本来就是直接跑"; exit 1; }
+  [ "$RUNSET" = 1 ] && { echo "!! --run/--no-run 只对 --be-ut 有意义；FE 单测本来就是直接跑"; exit 1; }
 elif [ "$TARGET" = compdb ]; then
   # 只做 cmake configure，产出 compile_commands.json；不编译，也就不需要农场
   DIST=off
@@ -128,7 +171,14 @@ elif [ "$TARGET" = ut ]; then
   BSCRIPT=run-be-ut.sh
   [ -f "$SR/$BSCRIPT" ] || { echo "!! $SR 里没有 run-be-ut.sh，编不了 BE 单测"; exit 1; }
   [ $BTSET = 1 ] || BT=ASAN     # 跟上游 run-be-ut.sh 的默认（ASAN）；BE 主程序默认仍是 Release
-elif [ $RUN = 1 ]; then echo "!! --run 只能和 --be-ut 搭配（编完单测接着跑）"; exit 1; fi
+elif [ $RUNSET = 1 ]; then echo "!! --run/--no-run 只能和 --be-ut 搭配"; exit 1; fi
+# --dynlib 只对 BE 单测有意义：BE 主程序要发布，产物不能依赖一堆 .so
+# DYNLIB 默认是 1，所以这里不能一律报错 —— 只有【显式】写了 --dynlib 又不是 be-ut 才是用户搞错了。
+# 非 be-ut 目标（BE 主程序、FE）一律静默回到静态：主程序要发布，产物不能依赖一堆 .so。
+if [ "$TARGET" != ut ]; then
+  case " ${ORIGARGS[*]-} " in *" --dynlib "*) echo "!! --dynlib 只能和 --be-ut 搭配（BE 主程序要发布，产物不能依赖一堆 .so）"; exit 1;; esac
+  DYNLIB=0
+fi
 LOCK=/farm/sr-build.$(printf %s "$SR" | md5sum | cut -c1-12).lock
 command -v flock >/dev/null && exec 9>$LOCK && flock -n 9 || {
   echo "!! 这棵源码树已有构建在进行：$SR"
@@ -136,6 +186,16 @@ command -v flock >/dev/null && exec 9>$LOCK && flock -n 9 || {
   echo "   等它结束，或换一棵 worktree（不同树可以并行）。"; exit 1; }
 chmod 666 $LOCK 2>/dev/null
 printf '%s\n' "$SR" > "$LOCK.tree" 2>/dev/null; chmod 666 "$LOCK.tree" 2>/dev/null
+# 只有成功取得源码树锁的构建才能发布依赖记录。失败的并发请求不得改变 IDE 所见版本。
+if [ -n "${SR_VERSION_KEY:-}" ]; then
+  [[ "$SR_VERSION_KEY" =~ ^[0-9a-f]{12}$ ]] && [[ "${SR_TPDIGEST_FULL:-}" =~ ^[0-9a-f]{64}$ ]] \
+    || { echo '!! 非法的依赖版本记录'; exit 1; }
+  mkdir -p /farm/versions || exit 1
+  VTMP=$(mktemp /farm/versions/.version.XXXXXX) || exit 1
+  if ! { printf '%s %s\n' "$SR_VER" "$SR_TPDIGEST_FULL" > "$VTMP" && chmod 644 "$VTMP" && mv -f "$VTMP" "/farm/versions/$SR_VERSION_KEY"; }; then
+    rm -f "$VTMP"; echo '!! 发布依赖版本记录失败'; exit 1
+  fi
+fi
 
 export STARROCKS_HOME=$SR
 # 隔离构建树，避免和原生 be/build_* 打架。但老分支的 build.sh 不认这个变量——
@@ -147,6 +207,19 @@ if grep -q CMAKE_BUILD_PREFIX "$SR/$BSCRIPT" 2>/dev/null; then
   # compdb 必须用独立的树：build.sh --configure-only 会强制 WITH_PCH=OFF 并写进 CMakeCache，
   # 在真实构建树里跑一次，下次编译所有 TU 的命令行都变了 —— 全量重编 + ccache 全 miss。
   [ "$TARGET" = compdb ] && export CMAKE_BUILD_PREFIX=$SR/be/nj-compdb
+  # --build-prefix / SR_BUILD_PREFIX 可以换树。为什么要有这个：原来这里无条件写死 $SR/be/nj，
+  # 外部传 CMAKE_BUILD_PREFIX 会被静默覆盖 —— 2026-09-24 我就是这样把 --with-dynamic 的实验配置
+  # 写进了用户的主构建树（ENABLE_MULTI_DYNAMIC_LIBS 被改成 ON，事后重配+重编才恢复）。
+  # 做任何 A/B 对照都需要它。相对路径按源码树根解析，免得落到 $PWD 这种意外位置。
+  # --dynlib 默认落在独立树：静态库和共享库的产物互不兼容，混在一棵树里换模式就得全量重来
+  # （2026-09-24 我就是没隔离，把用户主树的 58 个测试二进制全作废了）。显式 --build-prefix 优先。
+  [ $DYNLIB = 1 ] && [ -z "$BPFX" ] && [ -z "${SR_BUILD_PREFIX:-}" ] && BPFX=$SR/be/nj-dyn
+  BPFX=${BPFX:-${SR_BUILD_PREFIX:-}}
+  if [ -n "$BPFX" ]; then
+    case "$BPFX" in /*) ;; *) BPFX=$SR/$BPFX;; esac
+    export CMAKE_BUILD_PREFIX=$BPFX
+    echo "   构建树改用 $BPFX（--build-prefix / SR_BUILD_PREFIX）"
+  fi
   TREE_BASE=$CMAKE_BUILD_PREFIX
 else
   TREE_BASE=$SR/be                          # 老分支：只能用它原生的位置，生成器无法隔离（见下面的冲突检测）
@@ -171,27 +244,81 @@ SRCONF=/farm/srdev.conf; [ -f "$SRCONF" ] || SRCONF=/etc/srdev.conf
 [ -f "$SRCONF" ] && { set -a; . "$SRCONF"; set +a; }
 # 常驻本机 iceccd 的并发上限（全局、只在它首次启动时生效，不随单次 -j 变——不能为了某一次构建重启别的构建也在用的 daemon）。
 # 必须在读完配置之后算，否则 srdev.conf 的 SR_LOCAL_JOBS 不生效（codex r8#5）。非正整数一律回退 16。
-# 单次构建要限住本机内存，用显式 -j N：它是本次「总并发上限」，ninja 最多同时发 N 个任务（review extra2#1）。
+# 本机 ninja 并发（JLOCAL）也跟这个值走：本地模式就是 ninja -j$LOCALCAP，分布式时是"农场容量 + LOCALCAP"里的本机份额。
+# 这样 SR_LOCAL_JOBS 是唯一的本机并发旋钮：daemon 的 -m 与 ninja 的本机份额同源，不会一个改了另一个没改。
 # 先十进制归一化再判正数：只比字面量 "0" 的话，"00"/"000" 会绕过检查、算出 0，daemon 拿到 -m 0（codex r9#2）
 LOCALCAP=${SR_LOCAL_JOBS:-$JDEF}
 case "$LOCALCAP" in ''|*[!0-9]*) LOCALCAP=$JDEF;; *) LOCALCAP=$((10#$LOCALCAP)); [ "$LOCALCAP" -gt 0 ] || LOCALCAP=$JDEF;; esac
+JLOCAL=$LOCALCAP
+# FE 单测并发：默认跟本机份额，但允许单独压低 —— maven 每个 reactor 线程可能再 fork 测试 JVM，
+# 内存竞争比 BE 编译更难估（codex 建议）。非正整数一律回退到 JLOCAL。
+FEUTJ=${SR_FE_UT_JOBS:-$JLOCAL}
+case "$FEUTJ" in ''|*[!0-9]*) FEUTJ=$JLOCAL;; *) FEUTJ=$((10#$FEUTJ)); [ "$FEUTJ" -gt 0 ] || FEUTJ=$JLOCAL;; esac
 # 链接边单独一个 ninja 并发池，经 /usr/local/bin/cmake-linkpool 在 configure 时注入（原因见该脚本头注：ASAN 单测
 # 上百个 ld.lld 各 2~4G、链接不经 icecc 只受 -j 约束，-j80 时 35 个同时跑撞 32G，-j8 时 8 个也把 24G 顶死）。
 # 池大小按容器内存算：(内存 - 4G 给 FE/BE/代理) / 每个链接 8G 余量，钳在 1~4；SR_LINK_JOBS 可覆盖。也放在读完配置之后算。
 MEMGB=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
 case "$MEMGB" in ''|max|*[!0-9]*) MEMGB=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}');; *) MEMGB=$(( MEMGB / 1073741824 ));; esac
-# 单个链接进程要多少内存：2026-09-17 现场实测 ASAN 单测三个 ld.lld 同时占 15.5G/13.2G/12.2G，
-# 把 48G 容器填满（memory.peak 49151M/49152M）并被内核 OOM 杀掉一个。为什么这么贵：
-#   每个测试可执行文件静态链入整个 BE（libExec 137M + libExpr 136M + libStorage 125M …，单次链接 393 个输入），
-#   ASAN 插桩让代码和元数据翻倍，-O0 不内联所以函数全量发射，-ggdb3 -gdwarf-5 是最啰嗦的调试信息（含宏定义），
-#   产出的单个测试二进制就有 2.8~3.2G；而 -fuse-ld=lld 的 lld 为了快会把全部输入读进内存再合并 DWARF。
-# codex 复查#5：原来按构建类型分别取 16/5/3G 估，但槽位是全容器共享的、不带内存权重——
-# ASAN 树算出 1 个槽、Debug 树算出 3 个，三者能同时持槽，加起来仍然超预算。
-# 共享的闸门只能用一个数，而且必须按最坏的那种链接（ASAN 16G）估，这样不管几棵树、什么类型混着跑，
-# "同时在跑的链接器数 × 最坏单个开销" 都在预算内。代价是 Release 少一两个槽，它的链接才 3G 左右，无所谓。
-LKMEM=16
-LINKJ=${SR_LINK_JOBS:-$(( (${MEMGB:-24} - 5) / LKMEM ))}
-case "$LINKJ" in ''|*[!0-9]*) LINKJ=1;; *) LINKJ=$((10#$LINKJ));; esac; [ "$LINKJ" -lt 1 ] && LINKJ=1; [ "$LINKJ" -gt 4 ] && LINKJ=4
+# 池大小按什么定：2026-09-23 夜间在空载机器上实测（宿主机 182G 空闲、容器 16 核 64G，24 个真实 UT 链接目标，
+# 先跑一轮预热再每档两次取稳定值 —— 不预热的话第一档会背下全部冷缓存代价，看起来像"并发越高越快"，我实测被骗过一次）：
+#     24 个目标：并发 3  墙钟 65.1 / 64.6s   anon 14.9 / 15.1G
+#                并发 6  墙钟 62.8 / 65.8s   anon 23.0 / 22.7G
+#                并发 10 墙钟 69.0 / 68.8s   anon 31.2 / 30.4G
+#                并发 16 墙钟 75.6 / 74.5s   anon 44.2 / 45.7G
+#     全部 56 个目标：并发 3 墙钟 407.8s anon 38.0G  ·  并发 4 墙钟 426.0s anon 42.0G
+#     （/tmp 是 overlay 不是 tmpfs、shmem 为 0，anon 口径干净，不含写出去的产物）
+# 结论：提高并发不但不加快，反而变慢，而内存线性上涨。原因是 lld 自身多线程 —— 同一组实测里
+# 并发 3 已经吃掉 13.2 核 / 16 核配额（83%），并发 10 也只到 14.3 核，CPU 早就是瓶颈，再加并发只是让
+# 更多 lld 同时把几百 MB 的 .a 读进内存互相挤。所以闸门按 CPU 定，内存只作上限保护。
+#
+# 内存那一侧的口径重测过。旧注释写 LKMEM=16（单条 16G）是 RSS 口径 —— RSS 把 lld mmap 进来的 .a 输入页
+# 也算进去，那是可回收的文件页，不是会把容器打爆的部分。但换成 anon 之后我又连错两次，记下来免得再犯：
+#   错法一：拿"并发 N 时的 anon 峰值 / N"当单条占用。不成立 —— 峰值取决于是否恰好同时撞上几个大目标。
+#   错法二：看到 8/24/48 个目标测出 anon 峰 3.8/13.7/36.8G 就断定"随目标数累积"。也不成立 ——
+#           100ms 采样的时序显示 anon 全程在 1.4~12.7G 剧烈波动、结束后干净回落到 0.5G、ld 进程数恒为 3，
+#           没有泄漏。目标越多只是越容易采样到"几个大目标同时跑"的极值，是极值随样本量增长。
+# 正确做法是串行逐条量，按最坏单条估。2026-09-24 实测（并发 1，前 20 个目标）：
+#   最坏 connector_lake_test +5.84G（产物 1565M）、connector_changes_test +5.81G、connector_starrocks_test +5.77G，
+#   最小 base_test +0.55G（产物 159M）。anon 与产物大小高度线性，约 1MB 产物 ≈ 3.7MB anon（codex 指出我原先写反了）。
+# 另注：memory.current 在 24/48 目标时都顶到 64G 上限，但那含可回收的 page cache（file_dirty 峰 12~16G），
+# 不等于要 OOM；决定会不会被杀的是 anon。两个读数都要看，不能只看一个（codex 指出我原先弃用 memory.current 是错的）。
+# 全 56 条链接的实测直接否掉了"调大一点也好"：并发 4 比 3 慢 4.5%（426.0s vs 407.8s）且多吃 4G。
+# 所以按 1/5 核数取（16 核 -> 3），内存侧只作上限保护。SR_LINK_JOBS 仍可手动覆盖。
+LKMEM=${SR_LINK_MEM_GB:-15}         # 全 56 个目标实测最坏 14.70G 向上取整。不是可靠上界：50ms 采样仍可能漏峰，
+                                    # 换构建类型/调试信息/.so 模式都会变；只是"当前配置下已测到的最大值"
+case "$LKMEM" in ''|*[!0-9]*) LKMEM=6;; *) LKMEM=$((10#$LKMEM)); [ "$LKMEM" -gt 0 ] || LKMEM=6;; esac   # 防 0 导致除零（codex）
+LINKJ_CPU=$(( ${JDEF:-16} / 5 ))    # CPU 侧：实测 3 条已吃掉 13.2/16 核(83%)，再加就是负收益
+LINKJ_MEM=$(( (${MEMGB:-24} - 5) / LKMEM ))   # 内存侧：只作上限保护，正常不会是它卡住
+LINKJ=${SR_LINK_JOBS:-$(( LINKJ_CPU < LINKJ_MEM ? LINKJ_CPU : LINKJ_MEM ))}
+case "$LINKJ" in ''|*[!0-9]*) LINKJ=1;; *) LINKJ=$((10#$LINKJ));; esac
+# 内存侧算出 0 = 预算装不下一条已测最坏链接。仍然取 1（总得让构建能跑），但必须说出来 ——
+# 静默抬成 1 会让人以为"闸门算过了、内存没问题"，而实际上这一条链接就可能把容器打爆（codex）。
+if [ "$LINKJ" -lt 1 ]; then
+  [ "${LINKJ_MEM:-1}" -lt 1 ] && echo "!! 内存预算不足以容纳一条最坏链接（可用 $(( ${MEMGB:-24} - 5 ))G < 单条 ${LKMEM}G）：仍按 1 条串行跑，但这一条就可能触顶。
+   要么给容器加内存，要么确认你的目标比 starrocks_dw_test(14.7G) 小很多后用 SR_LINK_MEM_GB 调低估值。"
+  LINKJ=1
+fi
+[ "$LINKJ" -gt 8 ] && LINKJ=8
+# --dynlib 下补上 .so 模式缺失的标准库头（上游 ADD_BE_LIB 的 SHARED 分支没挂 PCH，见该文件头注）。
+# 走 CMAKE_PROJECT_INCLUDE，不改源码树 —— 任何 worktree 开箱即用，rebase 也不会丢。
+# 同一个文件按 -DSR_DYNLIB_PCH 选两种补法：ON = 补挂 PCH（默认，见 --help 里的实测）；OFF = 只 -include vector。
+# 命令行 --[no-]dynlib-pch 优先，其次 srdev.conf/环境的 SR_DYNLIB_PCH，只认 0/1。
+DYNCOMPAT=/usr/local/share/sr/dynlib-compat.cmake
+[ -z "$DYNPCH" ] && DYNPCH=${SR_DYNLIB_PCH:-1}
+case "$DYNPCH" in 0|1) ;; *) echo "!! SR_DYNLIB_PCH=$DYNPCH 不合法，只认 0/1"; exit 1;; esac
+if [ $DYNLIB = 1 ] && [ -f "$DYNCOMPAT" ]; then
+  # 追加而不是覆盖：用户可能自己设了 SR_EXTRA_CMAKE_ARGS，直接赋值会把它静默吞掉（codex）。
+  case " ${SR_EXTRA_CMAKE_ARGS:-} " in
+    *" -DCMAKE_PROJECT_INCLUDE="*)
+      # 已经有人占了这个变量。CMake 的 CMAKE_PROJECT_INCLUDE 只认一个文件，静默替换会让对方的注入失效，
+      # 所以明确报错让用户决定，而不是我们替他选。
+      echo "!! SR_EXTRA_CMAKE_ARGS 里已有 -DCMAKE_PROJECT_INCLUDE，与 --dynlib 需要的注入冲突。"
+      echo "   CMAKE_PROJECT_INCLUDE 只能指向一个文件。要么在你自己的注入文件里 include $DYNCOMPAT，"
+      echo "   要么用 --no-dynlib 回到静态链接。"; exit 1;;
+  esac
+  WANTPCH=OFF; [ "$DYNPCH" = 1 ] && WANTPCH=ON
+  export SR_EXTRA_CMAKE_ARGS="${SR_EXTRA_CMAKE_ARGS:+$SR_EXTRA_CMAKE_ARGS }-DCMAKE_PROJECT_INCLUDE=$DYNCOMPAT -DSR_DYNLIB_PCH=$WANTPCH"
+fi
 export SR_LINK_JOBS=$LINKJ SR_REAL_CMAKE=${CUSTOM_CMAKE:-cmake} CUSTOM_CMAKE=/usr/local/bin/cmake-linkpool
 REMOTE_NOTE=""
 # TARGET=fe（含 --fe-ut）是纯 maven，一次 ccache 都不会调用：不必为它起 OSS 代理，也不必打 ccache 那两行
@@ -306,6 +433,31 @@ TREE=$TREE_BASE/build_$BT
 GCOV=0; for a in ${PASS[@]+"${PASS[@]}"}; do case "$a" in --with-gcov) GCOV=1;; --without-gcov) GCOV=0;; esac; done
 [ "$GCOV" = 1 ] && TREE=${TREE}_gcov
 [ "$TARGET" = ut ] && TREE=$TREE_BASE/ut_build_$BT   # run-be-ut.sh 固定用 ut_build_<类型>，gcov 也不加后缀
+# 动态/静态模式冲突：目标树已有的 CMakeCache 与本次要用的模式不符时，拒绝而不是覆盖（codex 建议）。
+# 为什么要这道闸：2026-09-24 我用 `-- --with-dynamic` 在默认树上跑，把用户主树的 ENABLE_MULTI_DYNAMIC_LIBS
+# 静默改成了 ON，58 个测试二进制全部作废，事后重配+重编才恢复。configure 层面一句话就能挡住。
+# 显式 --clean 视为"我知道要重来"，放行。
+if [ "$TARGET" != fe ] && [ "$TARGET" != compdb ] && [ -f "$TREE/CMakeCache.txt" ] && [ $CLEAN = 0 ]; then
+  # 两个来源都要看：--dynlib（本驱动的开关）和用户经 -- 透传的 --with-dynamic。
+  # 只扫 PASS 的话 --dynlib 会绕过这道闸门 —— 那正是这道闸门存在的意义所在。
+  WANTDYN=OFF; [ $DYNLIB = 1 ] && WANTDYN=ON
+  for a in ${PASS[@]+"${PASS[@]}"}; do case "$a" in --with-dynamic) WANTDYN=ON;; esac; done
+  PREVDYN=$(sed -n 's/^ENABLE_MULTI_DYNAMIC_LIBS:[A-Z]*=//p' "$TREE/CMakeCache.txt" | head -1)
+  # PCH 补法切换不致命（CMake 会重新配置），但所有 TU 的命令行都变了 = 全量重编，值得先说一声
+  # 旧版 sr 配出来的 .so 树没有这个缓存项，等价于 OFF（那时只 -include vector）
+  PREVPCH=$(sed -n 's/^SR_DYNLIB_PCH:[A-Z]*=//p' "$TREE/CMakeCache.txt" | head -1); [ "$PREVDYN" = ON ] && PREVPCH=${PREVPCH:-OFF}
+  if [ "$WANTDYN" = ON ] && [ -n "$PREVPCH" ] && [ -n "${WANTPCH:-}" ] && [ "$PREVPCH" != "$WANTPCH" ]; then
+    echo "== 注意：该树上次 SR_DYNLIB_PCH=$PREVPCH，本次 $WANTPCH，编译命令全变，这次会全量重编（ccache 命中也会掉一轮）"
+  fi
+  if [ -n "$PREVDYN" ] && [ "$PREVDYN" != "$WANTDYN" ]; then
+    echo "!! 构建树 $TREE 上次配的是 ENABLE_MULTI_DYNAMIC_LIBS=$PREVDYN，本次要 $WANTDYN。"
+    echo "   直接覆盖会让树里已有的产物全部作废（静态库 <-> 共享库互不兼容）。三选一："
+    echo "     换一棵树:  sr build ... --build-prefix be/nj-dyn $([ "$WANTDYN" = ON ] && echo -- --with-dynamic)"
+    echo "     确认重来:  在原命令后加 --clean"
+    echo "     或者去掉本次的 $([ "$WANTDYN" = ON ] && echo -- --with-dynamic || echo 模式差异)"
+    exit 1
+  fi
+fi
 # 老分支无法按生成器隔离目录：已有 CMakeCache 记的是另一种生成器时，CMake 会拒绝配置，提前识别并要求 --clean（review extra#5）
 if [ "$TARGET" != fe ] && [ "$TREE_BASE" = "$SR/be" ] && [ -f "$TREE/CMakeCache.txt" ] && [ $CLEAN = 0 ]; then
   PREVGEN=$(sed -n 's/^CMAKE_GENERATOR:[A-Z]*=//p' "$TREE/CMakeCache.txt" | head -1)
@@ -417,6 +569,17 @@ fi
 # 必须排除僵尸：pgrep 会匹配 <defunct> 的 iceccd；端口全机唯一，多 profile 容器只有第一个能 bind，其余共用同一 daemon。
 iceccd_alive(){ local p st; for p in $(pgrep -x iceccd 2>/dev/null); do st=$(awk '{print $3}' /proc/$p/stat 2>/dev/null); [ "$st" != Z ] && return 0; done; return 1; }
 port_taken(){ [ -n "$(ss -ltnH "sport = :${DPORT:-10245}" 2>/dev/null)" ]; }
+# 客户端真的连得上吗：进程在、端口占着，都不等于 icecc 客户端能用。
+# icecc 连的是编译期写死的 unix socket（/var/run/icecc/iceccd.socket）；容器重建后常见
+# "socket 文件还在、daemon 进程没了"，此时 icecc 只在 debug 日志里写一行 no local daemon found，
+# 然后静默全本地编译 —— 2026-09-24 我因此白跑了一整轮远端预处理实验，数据全废（codex 也独立指出了这点）。
+# 用 python 尝试真正 connect()，这是唯一不经过"进程/端口"这层间接判断的读数。
+ICESOCK=${ICESOCK:-/var/run/icecc/iceccd.socket}
+daemon_connectable(){ [ -S "$ICESOCK" ] || return 1
+  python3 -c "import socket,sys
+s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(2)
+try: s.connect('$ICESOCK'); s.close()
+except Exception: sys.exit(1)" 2>/dev/null; }
 # iceccd 的 env 基目录（默认 /var/tmp/icecc-envs）：daemon 会**先降权**到 -u <用户>，之后才在 cleanup_cache()
 # 里 chown/chmod 这个目录。降权后的进程只有在自己已经是属主时才动得了它，所以「目录属主」和「-u 用户」
 # 必须一致，否则 daemon 启动即退出：chown/chmod in cleanup_cache() failed(Error: Operation not permitted)
@@ -465,14 +628,19 @@ ensure_local_daemon(){ local sopt=() p cl ru wu dm
       fi
       break
     done
-    return 0
+    # 已有 daemon 不等于客户端连得上：socket 残留 + 进程已死是容器重建后的常见状态，
+    # 那时 icecc 会静默全本地编译。这里直接 connect 一次作准（codex）。
+    daemon_connectable && return 0
+    echo "!! 检测到 iceccd 进程/端口，但客户端连不上 $ICESOCK —— 多半是容器重建后的残留 socket。"
+    echo "   继续下去 icecc 会静默退回本地编译（农场白开）。请 sr down && sr up 重建容器。"
+    return 1
   fi
   [ -n "${SCHED:-}" ] && sopt=(-s "$SCHED:$SPORT")
   mkdir -p /var/run/icecc
   # 8>&- 9>&-：daemon 常驻，不得继承农场锁/构建锁的 fd（踩过：锁被永久占住，编完再也拿不到锁）
   /usr/sbin/iceccd -d ${sopt[@]+"${sopt[@]}"} -n "${NETNAME:-srfarm}" -m $LOCALCAP -p "${DPORT:-10245}" \
     -N "$(hostname)-${SR_USER:-u}" -u "$(icecc_user)" -l /tmp/iceccd.log </dev/null >/dev/null 2>&1 8>&- 9>&-
-  sleep 3; { iceccd_alive || port_taken; }; }
+  sleep 3; daemon_connectable; }   # 判据是"连得上"，不是"进程在"（见 daemon_connectable 注释）
 if [ "$DIST" != off ]; then
   sr-farm _wd 2>/dev/null || true   # 容器重启后把看门狗拉回来
   # state.env 已在上面按白名单键解析进变量（SCHED / FARM_STATUS / WORKERS / NCPU…），不再 source（review r7#3）
@@ -519,9 +687,11 @@ if [ $USE_FARM = 1 ]; then
   # 并发 = 远端总核 + 本机 16。写死 48 会在 worker 数变化时吃亏（5 台时容量其实是 56）
   # 总并发 = 每台 worker 的槽数(NCPU，init 时按节点核数或 SR_NODE_JOBS 写进 state.env) × 台数 + 本地。
   # 老的 state.env 没有 NCPU 时退回 8（旧农场都是 8 核，行为不变）。
-  # 显式 -j N 是本次总并发上限（review extra2#1：原来 -j 只加在远端容量上，用户为省内存写 -j4 却仍 -j44 且本机可跑 16 个）
+  # 本机份额 = LOCALCAP（SR_LOCAL_JOBS）。用户级 -j 已移除：ninja 的 -j 只是在途总数，
+  # 这 J 个任务里派几个回本机由 scheduler 决定（本机也是 worker，speed 最高会被优先选，上限 iceccd -m）——
+  # 用户调 -j 压不到真正吃本机内存的那部分，只会白白拖慢远端。
   export USE_ICECC=1; unset ICECC 2>/dev/null || true   # 显式清掉 ICECC=no：环境若继承了它，icecc 会禁掉外发（codex 第三轮）
-  if [ "$JSET" = 1 ]; then J=$JLOCAL; else J=$(( ${WORKERS:-4} * ${NCPU:-8} + JLOCAL )); fi
+  J=$(( ${WORKERS:-4} * ${NCPU:-8} + JLOCAL ))
   # icecc 拒绝符号链接，必须给真实文件；给错了会静默退回本地编译。
   # 单容器带多套 gcc，工具链包必须和当前 STARROCKS_GCC_HOME 配对——
   # 传错版本的包，worker 上就用错编译器编，产物 ABI 不一致且不报错。
@@ -543,8 +713,10 @@ if [ $USE_FARM = 1 ]; then
     /usr/sbin/iceccd -d -s "$SCHED:${SPORT:-8765}" -n "${NETNAME:-srfarm}" -m $LOCALCAP \
       -p "${DPORT:-10245}" -N "$(hostname)-${SR_USER:-u}" -u "$(icecc_user)" -l /tmp/iceccd.log </dev/null >/dev/null 2>&1 9>&-
     sleep 3; }
-  # 兜底：daemon 没起来就绝不能用远端级别的并发，否则全落本地把容器撑爆
-  { iceccd_alive || port_taken; } || { echo "!! 本地 iceccd 起不来，降级为本地编译 -j$JLOCAL"; \
+  # 兜底：daemon 连不上就绝不能用远端级别的并发，否则全落本地把容器撑爆。
+  # 判据是"客户端能否 connect 到 socket"，不是"有没有进程/端口" —— 后者会把
+  # "socket 残留但 daemon 已死" 误判成可用，结果 icecc 静默全本地编译（见 daemon_connectable 注释）。
+  daemon_connectable || { echo "!! 本地 iceccd 连不上（socket $ICESOCK），农场任务会静默退回本地编译，已降级为本地 -j$JLOCAL"; \
                     USE_FARM=0; export USE_ICECC=0; J=$JLOCAL; ASYNC_WAKE=0; FARM_NOTE="本地（本地 iceccd 起不来，已降级）"; unset CCACHE_PREFIX ICECC_VERSION 2>/dev/null || true; }
 else
   J=$JLOCAL
@@ -564,14 +736,16 @@ case $TARGET in
   be)  ARGS=(--be -j "$J") ;;
   # FE 单测的并发是 maven 的 -T（每个线程还会 fork surefire JVM），和编译并发不是一回事：
   # 只有用户显式给了 -j 才透传，否则用上游默认（4）。拿容器核数当 -T 会同时起十几个 JVM 把内存吃光。
-  fe)  if [ $FEUT = 1 ]; then ARGS=(); [ "$JSET" = 1 ] && ARGS=(-j "$JLOCAL")
+  # FE 单测并发单列一个旋钮：它控制的是 maven reactor 并发，实际测试 JVM 数还取决于 surefire 的
+  # fork 配置，不能把这个值当成 JVM 总数（codex）。优先级 SR_FE_UT_JOBS > SR_LOCAL_JOBS。
+  fe)  if [ $FEUT = 1 ]; then ARGS=(-j "$FEUTJ")
        else ARGS=(--fe -j "$J"); fi ;;
   all) ARGS=(--be --fe -j "$J") ;;
   # 单测：--dry-run = 全部编完但不执行测试（上游没有单独的只编开关）。--run 时第二阶段再调一次不带 --dry-run 去跑。
   # --without-debug-symbol-split：上游每次调用都无条件对 test/starrocks_test 做 objcopy 拆分调试符号，二进制没重新链接时
   # 再拆一次会用已剥离的文件覆盖上一次完整的 .debuginfo（ASAN 报告就没有文件:行号了）。我们要调它两次、用户也会反复跑，
   # 所以拆分收回来自己做（见下面 split_fresh：判据是有没有 .gnu_debuglink，天然幂等）。
-  ut)  ARGS=(-j "$J" --dry-run --without-debug-symbol-split) ;;
+  ut)  ARGS=(-j "$J" --dry-run --without-debug-symbol-split); [ $DYNLIB = 1 ] && ARGS+=(--with-dynamic) ;;   # 缺头/PCH 注入见上面 DYNCOMPAT
   # java-extensions 和 compile_commands.json 毫无关系，别为它多花那几秒
   compdb) ARGS=(--be --configure-only --without-java-ext -j "$J") ;;
 esac
@@ -587,12 +761,18 @@ esac
 echo "=========================================================="
 [ "$TARGET" = compdb ] && echo " 目标: compdb   (只生成 compile_commands.json，不编译；独立构建树，不碰真实产物)"
 [ "$TARGET" != compdb ] && echo " 目标: $([ $FEUT = 1 ] && echo "fe-ut   (FE 单测，run-fe-ut.sh；纯 maven，农场/ccache 不参与)" || echo "$([ "$TARGET" = ut ] && echo be || echo "$TARGET")$([ "$TARGET" = fe ] && echo "   (maven，农场/ccache 不参与)")$([ "$TARGET" = ut ] && echo "-ut   (BE 单测，run-be-ut.sh；$([ $RUN = 1 ] && echo 编完接着跑 || echo 只编不跑))")")"
-[ $FEUT = 1 ] && echo " 并发: maven -T $([ "$JSET" = 1 ] && echo "$JLOCAL（-j 指定）" || echo "4（run-fe-ut.sh 默认；-j N 可改）")"
+# 来源要按"实际生效的"判，不能只看变量是否设过：设了非法值会回退到 JLOCAL，那时说 SR_FE_UT_JOBS 生效是误导
+[ $FEUT = 1 ] && echo " 并发: maven -T $FEUTJ（$([ "$FEUTJ" != "$JLOCAL" ] && echo "SR_FE_UT_JOBS" || echo "跟本机份额 SR_LOCAL_JOBS")；测试 JVM 数另受 surefire fork 配置影响）"
 [ "$TARGET" = ut ] && [ $CLEAN = 1 ] && echo " 注意: run-be-ut.sh --clean 除了删 $TREE，还会删 $SR/be/output/（上游行为，BE 主程序产物也没了）"
 [ "$TARGET" = compdb ] && echo " 类型: $BT      生成器: $GEN"
-[ "$TARGET" != fe ] && [ "$TARGET" != compdb ] && echo " 类型: $BT      生成器: $GEN      并发: -j$J      链接闸门: 全容器同时 $LINKJ 个 ld（按 ${MEMGB}G 内存 / 最坏单个链接 ${LKMEM}G 估；SR_LINK_JOBS 可改）"
+[ "$TARGET" != fe ] && [ "$TARGET" != compdb ] && echo " 类型: $BT      生成器: $GEN      并发: -j$J$([ "$USE_FARM" = 1 ] && echo "（远端 $(( J - JLOCAL )) + 本机 $JLOCAL）")      链接闸门: 全容器同时 $LINKJ 个 ld（按 ${MEMGB}G 内存 / 最坏单个链接 ${LKMEM}G 估；SR_LINK_JOBS 可改）"
 echo " 模式: $FARM_NOTE"
 [ -n "${SR_DRYRUN:-}" ] && { echo " (SR_DRYRUN=1：决策已打印，到此为止不编译)"; exit 0; }   # 测试钩子：验证农场/交互决策
+# 模式/目标在这里就定了（表头已经打过），开工时写"运行中"侧车和收尾写 history 行都用同一份
+MODE_SHORT=本地; case "$FARM_NOTE" in 分布式*) MODE_SHORT=分布式;; esac
+# 目标单独成一列（第 12 个字段，追加在末尾所以老行不受影响），不再往"模式"里塞 UT/FEUT 前缀。
+# 老行没有这一列，sr history 会从"模式"的 UT*/FEUT 前缀反推，显示上两代格式一致。
+TGT=$TARGET; [ "$TARGET" = ut ] && TGT=be-ut; [ $FEUT = 1 ] && TGT=fe-ut
 echo " 版本: ${SR_VER:-未指定}   编译器: $(${STARROCKS_GCC_HOME:-/usr}/bin/gcc -dumpfullversion 2>/dev/null || echo ?)   依赖: ${STARROCKS_THIRDPARTY:-默认}"
 echo " 源码树: $SR"
 [ "$TARGET" != fe ] && echo " 构建树: $TREE${TREE_NOTE:-}"   # FE / FE 单测不产出 BE 构建树，打出来只会误导
@@ -612,7 +792,7 @@ mkdir -p /farm 2>/dev/null; : > /farm/last-build 2>/dev/null; chmod 666 /farm/la
 # ---- OOM 观测 ----
 # 三个互相独立的读数，不共用同一条链路（单一读数骗过自己太容易了）：
 #   1) cgroup oom_kill 计数器 —— 内核的权威记账
-#   2) 编译日志里 g++ 自报的 "Killed signal terminated program cc1plus"
+#   2) 编译日志里 g++ 自报的 "<信号名> signal terminated program cc1plus"（earlyoom 先发 SIGTERM 报 Terminated，升级后才是 Killed）
 #   3) memory.peak 距 memory.max 的余量 —— 就算没被杀也能看出贴没贴顶
 CG=/sys/fs/cgroup
 oomcnt(){ awk '/^oom_kill /{print $2}' $CG/memory.events 2>/dev/null \
@@ -649,7 +829,7 @@ HS=""   # 当前 run_build 的握手文件前缀；取消路径 on_signal 直接
 # .debuginfo 一旦由 objcopy 完整写出就不该被 trap 删：要么接着被用上，要么构建失败而原二进制仍完整，
 # 它只是个会被下次覆盖的多余文件。半路被打断留下的半截文件同样会被下次覆盖，无害。
 SPLIT_TMP=""
-cleanup(){ kill $SAMPLER ${WAKER:-} 2>/dev/null; rm -f "$ANONF" "${RUNFLAG:-/nonexistent}" "${PROBE:-/nonexistent}" 2>/dev/null
+cleanup(){ kill $SAMPLER ${WAKER:-} 2>/dev/null; rm -f "$ANONF" "${RUNFLAG:-/nonexistent}" "${PROBE:-/nonexistent}" "${RUNF:-/nonexistent}" 2>/dev/null
   [ -n "$SPLIT_TMP" ] && rm -f "$SPLIT_TMP" 2>/dev/null
   [ -n "$HS" ] && rm -f "$HS" "$HS.pgid" "$HS.ack" 2>/dev/null; }
 on_signal(){ local sig=$1 i
@@ -716,6 +896,15 @@ S=$(date +%s)
 # 输出文件必须每次构建独立：不同源码树可以在同一容器里并发编，共用一个 /tmp 文件会把两份输出搅在一起，
 # 失败那次的报错被另一边的进度行冲掉（踩过：只剩 FAILED 一行，错误正文没了）
 OUTF=$(mktemp /tmp/sr-build.XXXXXX)
+# "运行中"侧车：与 .lock 同名前缀，字段 = history 行的前几列 + 开始秒 + 临时日志/内存采样路径。
+# sr history 读它显示运行中的构建，并借 .lock 的 flock 判活（SIGKILL 留下的残骸拿得到锁，直接忽略）。
+# cleanup 里删；正常/INT/TERM 都走 cleanup。
+RUNF=${LOCK%.lock}.run
+# 第 11 个字段是阶段（编译 / 跑测试）：be-ut 编完接着跑测试时 history 行已经写了（记的是编译结果），进程却还握着树锁在跑测试，
+# 不标阶段的话同一次调用会同时显示成"成功"和"运行中"两行，看着像两个任务。
+write_runf(){ printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%m-%d %H:%M:%S')" "${SR_USER:-?}" "$(basename "$SR")@${SR_BRANCH:-?}" \
+  "${SR_VER:-?}/${SR_TPDIGEST:-?}" "$MODE_SHORT" "${N:-?}" "$TGT" "$1" "$OUTF" "$ANONF" "$2" > "$RUNF" 2>/dev/null; chmod 666 "$RUNF" 2>/dev/null; }
+write_runf "$S" 编译
 # 调试钩子：SR_EXPLAIN=1 时在开工前让 ninja 解释哪些边为什么脏（排查"明明没改代码却全量"用）
 [ -n "${SR_EXPLAIN:-}" ] && [ -f "$TREE/build.ninja" ] && { echo "== ninja explain（开工前，前 15 条）:"; ninja -C "$TREE" -n -d explain 2>&1 | grep "^ninja explain" | head -15 | cut -c1-220; }
 # review r7#1：强制 clean 前在目录外记 pending（想切到的 digest），并在树内放唯一探针；结束后“探针消失 + 构建文件重新存在”才证明真的清过
@@ -728,38 +917,39 @@ run_build "${ARGS[@]}"
 E=$(date +%s)
 : > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null
 
-# 先读一遍 OOM 痕迹用于决定要不要重试；采样器不停——重试期间要继续采样（review #6），结束后再读最终值。
-# grep -c 计数为 0 时退出码是 1，写 `|| echo 0` 会变成两行 "0\n0"，后面 [ "$KILLED" -gt 0 ] 就报 integer expression expected（踩过两次了）
+# 编译器进程被信号杀掉时给出明确诊断 —— 但【不自动重试】，重试与否交给用户决定。
+# 为什么不自动重试（2026-09-24 定）：降并发重试未必降低了真正导致失败的资源占用 ——
+# 把 ninja 的 -j 从 80 砍到 40，本机 iceccd 的 -m 16 仍然能跑满、链接池 3 也不变，
+# 很可能只是原样再撞一次；而且共享机上自动重试会悄悄占着资源。ninja 是增量的，
+# 用户自己重跑一次同样只补没编完的部分，代价和自动重试一样，但他知道发生了什么。
+#
+# 判据放宽到"编译器进程被信号杀掉"这件事本身，不追究是谁杀的：
+#   宿主机的 earlyoom 在 MemAvailable 低时【先发 SIGTERM】，g++ 报 "Terminated signal terminated program cc1plus"，
+#   更低时才升级 SIGKILL（报 "Killed ..."）。它是宿主机用户态守护进程，cgroup 的 oom_kill 计数器不会动。
+#   原来只 grep "Killed" 且只看 oom_kill —— 对 earlyoom 两个判据都命中不了：实测 2026-09-23 那 9 次连续失败，
+#   日志里清一色是 Terminated、oom_kill 全程为 0，这段诊断对那次日志里的那两条错误不会触发（不等于历史上从未触发过 —— 那要全量历史才能说，codex）。
+# 注意 Terminated 本身不等于 earlyoom（任何人 kill 都会这样），所以文案只陈述"被信号杀了"，不武断归因。
+# grep -c 计数为 0 时退出码是 1，写 `|| echo 0` 会变成两行 "0\n0"，后面比较会报 integer expression expected（踩过两次）
 OOM1=$(oomcnt)
-KILLED=$(grep -c "Killed signal terminated program" "$OUTF" 2>/dev/null); KILLED=${KILLED:-0}
+KILLED=$(grep -c "signal terminated program" "$OUTF" 2>/dev/null); KILLED=${KILLED:-0}
 PEAK=$(cat $ANONF 2>/dev/null || echo 0); MAXM=$(cat $CG/memory.max 2>/dev/null || echo 0)
 
-# 失败 + 有 OOM 痕迹 = 明确诊断，并自动降并发重试一次（ninja 是增量的，重试只补没编完的）
 if [ $RC -ne 0 ] && { [ "${OOM1:-0}" -gt "${OOM0:-0}" ] || [ "${KILLED:-0}" -gt 0 ]; }; then
   echo ""
-  echo "!! 编译失败是内存打爆导致的，不是代码问题："
-  echo "   cgroup oom_kill: $OOM0 -> $OOM1   g++ 自报被杀: $KILLED 次"
+  echo "!! 本次失败是编译器进程被信号终止，不是代码问题："
+  echo "   g++ 自报被信号终止 $KILLED 次   cgroup oom_kill: $OOM0 -> $OOM1"
   [ "${MAXM:-0}" != 0 ] && [ "$MAXM" != max ] && \
     echo "   anon 峰值 $(g ${PEAK:-0})G / 上限 $(g $MAXM)G"
-  # review extra#4：重试并发绝不能高于原并发（用户为省内存手动 -j2，OOM 后原来会被抬到 4）；已是 -j1 无从再降就不重试
-  RETRY=$(( J / 2 )); [ "$RETRY" -lt 1 ] && RETRY=1; [ "$RETRY" -ge "$J" ] && RETRY=$(( J > 1 ? J - 1 : 1 ))
-  if [ "$J" -le 1 ]; then
-    echo "   已是 -j1，无法再降并发重试；内存仍不够请减小容器内其它占用或换更大内存"
+  # 不把"被信号终止"直接断言成 OOM：SIGTERM/SIGKILL 来源很多（别人 kill、超时脚本、宿主机 earlyoom…），
+  # 只有 cgroup 计数器动了才是本容器 OOM 的硬证据。按证据分两种说法，别替用户下结论（codex）。
+  if [ "${OOM1:-0}" -gt "${OOM0:-0}" ]; then
+    echo "   cgroup oom_kill 增加了 -> 本容器内存打爆，这是硬证据。"
   else
-  echo "   -> 自动降到 -j$RETRY 重试（ninja 增量，只补没编完的部分）"
-  # 从原参数派生：只换并发、去掉 --clean（重试是增量）。目标（--fe/--all）和 -- 透传全部保留（review #5：
-  # 原来重建成 --be 会把 FE 和透传丢掉，BE 重试成功还会把整体报成成功）。build.sh 只认 "-j N"，-jN 顺手也处理
-  RARGS=(); skip=0
-  for a in "${ARGS[@]}"; do
-    [ $skip = 1 ] && { skip=0; continue; }
-    case "$a" in -j) skip=1; continue;; -j[0-9]*) continue;; --clean) continue;; esac
-    RARGS+=("$a")
-  done
-  RARGS+=(-j "$RETRY")
-  echo "   重试: ./$BSCRIPT ${RARGS[*]}" | tee -a "$OUTF"
-  run_build "${RARGS[@]}"   # 输出追加进同一份日志；复用同一包装，进程组/取消语义与首次一致（review r7#7）
-  E=$(date +%s)
+    echo "   cgroup oom_kill 没动 -> 不是本容器 OOM。常见来源是宿主机 earlyoom（按全机可用内存挑 cc1plus/ld"
+    echo "   下手，先 SIGTERM 再 SIGKILL），但也可能是别的 kill；要坐实得拿宿主机日志对上 PID 和时间。"
   fi
+  echo "   不自动重试。ninja 是增量的，直接重跑同一条命令只会补没编完的部分；"
+  echo "   要降本机压力就改 srdev.conf 的 SR_LOCAL_JOBS（本机并发）或 SR_LINK_JOBS（同时链接数），再 sr down && sr up。"
 fi
 # 依赖戳写入（review r7#1 定案）：RC=0 写；失败时只有“本次强制 clean 且探针已被清掉且生成器构建文件重新存在”才写——
 # 这证明目录真的被清并重新配置过、树里已是新依赖的产物。写成功即删 pending。其它情况保留旧戳/pending，下次照样强制 clean（多清不漏清）。
@@ -777,23 +967,23 @@ rm -f $RUNFLAG      # 采样与异步唤醒循环到这里才退出：重试期�
 : > /farm/last-build 2>/dev/null; chmod 666 /farm/last-build 2>/dev/null
 kill $SAMPLER 2>/dev/null
 # 最终值覆盖两次尝试：峰值取采样器全程最大，oom/Killed 计数含重试
-OOM1=$(oomcnt); KILLED=$(grep -c "Killed signal terminated program" "$OUTF" 2>/dev/null); KILLED=${KILLED:-0}
+OOM1=$(oomcnt); KILLED=$(grep -c "signal terminated program" "$OUTF" 2>/dev/null); KILLED=${KILLED:-0}   # 同上：含 Terminated 与 Killed 两种
 PEAK=$(cat $ANONF 2>/dev/null || echo 0)
 
 printf "\n== 结束 rc=%d 用时 %dm%02ds ==\n" $RC $(( (E-S)/60 )) $(( (E-S)%60 ))
 # 每次编译记一行概况到 /farm/builds.tsv（宿主机卷，sr history 看），完整输出另存一份
 HIT1=$(ccache -s 2>/dev/null | awk -F'[ /]+' '/^ *Hits:/{print $3; exit}'); HIT1=${HIT1:-0}
 CALL1=$(ccache -s 2>/dev/null | awk -F'[ /]+' '/^Cacheable calls:/{print $3; exit}'); CALL1=${CALL1:-0}
-MODE_SHORT=本地; case "$FARM_NOTE" in 分布式*) MODE_SHORT=分布式;; esac
-[ "$TARGET" = ut ] && MODE_SHORT="UT$MODE_SHORT"   # history 里能一眼分出单测构建
-[ $FEUT = 1 ] && MODE_SHORT=FEUT
 mkdir -p /farm/logs 2>/dev/null
-LOGF=/farm/logs/$(date +%Y%m%d-%H%M%S)-$(basename "$SR")-$([ $FEUT = 1 ] && echo feut || { [ "$TARGET" = ut ] && echo ut_; echo "$BT"; }).log
+# 后缀先拼成一个变量再用。原来写成 $(... { echo ut_; echo "$BT"; })：两个 echo 出两行，$( ) 只吃末尾换行，
+# 中间那个留在文件名里 —— UT 构建的日志名变成 "…-ut_<换行>ASAN.log"，history 那行也被切成两半。
+SUF=$BT; [ "$TARGET" = ut ] && SUF=ut_$BT; [ $FEUT = 1 ] && SUF=feut
+LOGF=/farm/logs/$(date +%Y%m%d-%H%M%S)-$(basename "$SR")-$SUF.log
 cp "$OUTF" "$LOGF" 2>/dev/null; chmod 666 "$LOGF" 2>/dev/null; ln -sfn "$LOGF" /tmp/sr-build-last.out; rm -f "$OUTF"
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
   "$(date '+%m-%d %H:%M:%S')" "${SR_USER:-?}" "$(basename "$SR")@${SR_BRANCH:-?}" "${SR_VER:-?}/${SR_TPDIGEST:-?}" \
   "$MODE_SHORT" "${N:-?}" "$RC" "$(( (E-S)/60 ))m$(( (E-S)%60 ))s" "$(g ${PEAK:-0})G" \
-  "$(( HIT1 - ${HIT0:-0} ))/$(( CALL1 - ${CALL0:-0} ))" "$LOGF" >> /farm/builds.tsv 2>/dev/null; chmod 666 /farm/builds.tsv 2>/dev/null
+  "$(( HIT1 - ${HIT0:-0} ))/$(( CALL1 - ${CALL0:-0} ))" "$LOGF" "$TGT" >> /farm/builds.tsv 2>/dev/null; chmod 666 /farm/builds.tsv 2>/dev/null
 # 报 anon 余量（不含 page cache）。ASAN 每槽约 2.04G、Debug 约 1.77G，贴到 85% 再加并发就危险了
 if [ "${MAXM:-0}" != 0 ] && [ "$MAXM" != max ] && [ "${PEAK:-0}" != 0 ]; then
   PCT=$(awk -v a=$PEAK -v b=$MAXM 'BEGIN{printf "%.0f", a*100/b}')
@@ -971,7 +1161,9 @@ if [ $RC -eq 0 ]; then
     # codex 复查#11：只写死两个驱动参数会丢掉 --without-java-ext（用户明确要求跳过的 java 扩展会被重建）；
     # 而用户经 -- 透传的 --clean 必须滤掉，否则第二阶段又清一遍，变成完整重编，且此时采样和唤醒都已结束。
     RARGS=(-j "$JLOCAL" --without-debug-symbol-split)
+    [ $DYNLIB = 1 ] && RARGS+=(--with-dynamic)   # 两阶段 configure 参数必须一致，否则 CMake 重新配置、全量重编
     [ $JAVAEXT = 0 ] && RARGS+=(--without-java-ext)
+    write_runf "$(date +%s)" 跑测试   # 侧车换成本阶段：sr history 显示"运行中·跑测试"，时间/用时都按这一阶段算
     for a in ${PASS[@]+"${PASS[@]}"}; do
       case "$a" in --clean) continue;; esac
       RARGS+=("$a")

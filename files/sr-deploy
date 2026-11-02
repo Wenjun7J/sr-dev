@@ -2,26 +2,41 @@
 # sr-deploy —— 把当前源码树的编译产物部署成一套可跑的单节点集群（跑在容器内）。
 #
 # 设计约束（用户定的）：
-#   1) 全机只允许一套集群，部署目录固定（不按源码树分），换棵树部署就是把这一套换成那棵树的产物；
+#   1) 每个用户一套集群，部署目录固定（不按源码树分），换棵树部署就是替换这一套的产物；
 #   2) 必须在源码树里执行，用的就是这棵树 output/ 下的产物；
 #   3) 已经有集群在跑，就停掉、换成当前产物、再起来。
 #
 # 为什么不需要 docker cp：容器是 -v $HOME:$HOME 起的，部署目录在 $HOME 之下，宿主机和容器看到的是同一份。
 # 所以"部署到容器里"= 写进这个共享目录 + 在容器内起进程，进程的 cgroup/限额都归容器管。
 set -uo pipefail
+ORIGINAL_ARGS=("$@")
 
 SRCONF=/farm/srdev.conf; [ -f "$SRCONF" ] || SRCONF=/etc/srdev.conf
 [ -f "$SRCONF" ] && { set -a; . "$SRCONF"; set +a; }
 
-DEPLOY=${SR_DEPLOY_DIR:-/farm/deploy}
+DEPLOY=$(realpath -m "${SR_DEPLOY_DIR:-/farm/deploy}") || exit 1
 UIDN=${SR_UID:-$(id -u 2>/dev/null || echo 0)}
 HOSTIP=$(hostname -I 2>/dev/null | awk '{print $1}')
 
-# 端口：按 uid 取一段连续 8 个，避开已用的几段——农场 scheduler 187xx、本机 iceccd 197xx、ccache 代理 207xx，
-# 以及用户自己手搭测试环境常用的 188xx。共享机上每人一段，互不串台。
-PBASE=$(( 21000 + (UIDN % 300) * 10 ))
-FE_HTTP=$PBASE FE_RPC=$((PBASE+1)) FE_QUERY=$((PBASE+2)) FE_EDIT=$((PBASE+3))
-BE_PORT=$((PBASE+4)) BE_HTTP=$((PBASE+5)) BE_HB=$((PBASE+6)) BE_BRPC=$((PBASE+7))
+# 兼容现有部署端口；新部署用独立于 farm/ccache 的端口段。
+# UID 取模只给出候选值，实际占用必须在停止旧服务之前检查。
+saved_base=$(cat "$DEPLOY/.port-base" 2>/dev/null || true)
+if [ -z "$saved_base" ]; then
+  saved_base=$(awk '$1=="http_port" && $2=="="{p=$3} END{print p}' "$DEPLOY/fe/conf/fe.conf" 2>/dev/null || true)
+fi
+if [ -z "$saved_base" ]; then
+  saved_base=$(awk '$1=="be_port" && $2=="="{p=$3} END{if(p) print p-4}' "$DEPLOY/be/conf/be.conf" 2>/dev/null || true)
+fi
+PBASE=${SR_PORT_BASE:-${saved_base:-$((24000 + (UIDN % 300) * 20))}}
+[[ "$PBASE" =~ ^[1-9][0-9]{3,4}$ ]] && [ "$PBASE" -ge 1024 ] && [ "$PBASE" -le 65524 ] \
+  || { echo '!! SR_PORT_BASE 必须为 1024..65524' >&2; exit 1; }
+set_ports(){
+  FE_HTTP=$PBASE FE_RPC=$((PBASE+1)) FE_QUERY=$((PBASE+2)) FE_EDIT=$((PBASE+3))
+  BE_PORT=$((PBASE+4)) BE_HTTP=$((PBASE+5)) BE_HB=$((PBASE+6)) BE_BRPC=$((PBASE+7))
+  FE_DEBUG_PORT=${SR_FE_DEBUG_PORT:-$((PBASE+8))}
+  BE_STARLET=$((PBASE+9))
+}
+set_ports
 
 usage(){ cat <<U
 用法: sr-deploy [选项]      （必须在 StarRocks 源码树里执行）
@@ -34,6 +49,12 @@ usage(){ cat <<U
   --clean-data            连 meta 与 storage 一起重建（清空数据！首次部署或元数据坏了才用）
   --no-start              只换产物，不启动
   --fe-heap <大小>         FE 堆上限，如 2g / 4096m（默认 2g；也可在 srdev.conf 设 SR_FE_HEAP）
+  --be-heap <大小>         BE 内嵌 JVM 的堆上限（默认 2g；srdev.conf 可设 SR_BE_HEAP）。BE 的 JVM 由 libhdfs 按 be.conf 的
+                           JAVA_OPTS 创建，首次用到 JNI（Hive/Iceberg/JDBC 扫描、Java UDF）才起；不设 -Xmx 时 JDK 按容器
+                           内存的 1/4 定上限，64G 容器就是 16G —— 开发集群里没必要留这么大
+
+  部署 FE 自动启用 JDWP（127.0.0.1，不等待调试器，SR_FE_DEBUG_PORT 可覆盖端口）。
+  宿主 sr 自动补齐本次部署组件的 VS Code 调试配置和 BE 的 LLDB 入口。
 U
 }
 
@@ -43,8 +64,10 @@ die(){ printf '!! %s\n' "$*" >&2; exit 1; }
 MODE=deploy; WANT_BE=1; WANT_FE=1; CLEAN_DATA=0; NO_START=0
 # FE 堆默认 2g：上游 fe.conf 模板是 -Xmx8192m，那是给生产机的；这套集群和编译一起挤在 24G 的容器里，8G 堆涨满就把编译挤爆
 FE_HEAP=${SR_FE_HEAP:-2g}
+BE_HEAP=${SR_BE_HEAP:-2g}
 while [ $# -gt 0 ]; do case "$1" in
   --fe-heap) FE_HEAP=$2; shift 2;;
+  --be-heap) BE_HEAP=$2; shift 2;;
   --be-only) WANT_FE=0; shift;;
   --fe-only) WANT_BE=0; shift;;
   --stop) MODE=stop; shift;;
@@ -55,6 +78,19 @@ while [ $# -gt 0 ]; do case "$1" in
   *) echo "未知参数: $1"; usage; exit 1;;
 esac; done
 [[ "$FE_HEAP" =~ ^[0-9]+[mMgG]$ ]] || die "--fe-heap 要像 2g 或 4096m 这样：$FE_HEAP"
+[[ "$BE_HEAP" =~ ^[0-9]+[mMgG]$ ]] || die "--be-heap 要像 2g 或 4096m 这样：$BE_HEAP"
+if [ "$MODE" = deploy ] && [ -n "$saved_base" ] && [ "$saved_base" != "$PBASE" ]; then
+  [ "$WANT_BE" = 1 ] && [ "$WANT_FE" = 1 ] || die '改变端口基址需要同时部署 FE 和 BE'
+  if [ "$CLEAN_DATA" = 0 ] && [ -n "$(find "$DEPLOY/fe/meta" "$DEPLOY/be/storage" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    die "已有数据的部署使用端口基址 $saved_base；改端口会改变 BE 注册地址。请保留原基址或用新的 SR_DEPLOY_DIR 部署，不能自动迁移现有数据。"
+  fi
+fi
+if [ "$WANT_FE" = 1 ]; then
+  [[ "$FE_DEBUG_PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$FE_DEBUG_PORT" -le 65535 ] \
+    || die "SR_FE_DEBUG_PORT 必须为 1..65535 的端口"
+  { [ "$FE_DEBUG_PORT" -lt "$PBASE" ] || [ "$FE_DEBUG_PORT" -gt "$((PBASE+11))" ] || [ "$FE_DEBUG_PORT" = "$((PBASE+8))" ]; } \
+    || die "FE 调试端口 $FE_DEBUG_PORT 与本集群服务端口冲突"
+fi
 
 # ---- 进程发现 ----
 # 只认部署目录下的进程：同机其他人（甚至你自己在 ~/example-deploy 手搭的那套）也在跑 starrocks_be，
@@ -109,10 +145,24 @@ if [ "$MODE" = status ]; then
   log "== 端口（按 uid $UIDN 派生）"
   log "   FE  http=$FE_HTTP  rpc=$FE_RPC  query=$FE_QUERY  edit_log=$FE_EDIT"
   log "   BE  be=$BE_PORT  http=$BE_HTTP  heartbeat=$BE_HB  brpc=$BE_BRPC"
+  # 显示已部署的端口，避免配置改动后误报运行中 FE 的端口。
+  if [ -f "$DEPLOY/.fe-debug-port" ]; then
+    log "   FE 调试: 127.0.0.1:$(cat "$DEPLOY/.fe-debug-port")（已部署配置）"
+  else log "   FE 调试: 未启用 sr 管理的 JDWP"; fi
   [ -n "$fp" ] && log "== 连接: mysql -h $HOSTIP -P $FE_QUERY -u root"
   exit 0
 fi
 
+# 源码树锁只保护 output；部署目录锁保护所有 worktree 共用的目的地。
+# host 网络的 abstract Unix socket 对所有 sr 容器可见，自动协调不同用户的端口分配。
+# FD 200 由 exec 保留，服务启动时关闭；无共享可写文件，也不会留下过期锁。
+if [ "${SR_DEPLOY_PORT_LOCK:-}" != held ] || [ ! -S /proc/$$/fd/200 ]; then
+  exec python3 "$(dirname "$(readlink -f "$0")")/sr-deploy-lock.py" "$0" "${ORIGINAL_ARGS[@]}"
+fi
+command -v flock >/dev/null || die "没有 flock，无法安全部署"
+mkdir -p "$DEPLOY" || die "无法创建 $DEPLOY"
+{ exec 8>>"$DEPLOY/.deploy.lock"; } 2>/dev/null || die "无法打开部署锁"
+flock -n 8 || die "部署目录正在被另一条 deploy/stop 使用：$DEPLOY"
 if [ "$MODE" = stop ]; then stop_all; exit 0; fi
 
 SR=$(find_root) || die "当前目录 $(pwd -P) 不在任何 StarRocks 源码树里。sr deploy 必须在项目下执行（用该项目的产物部署）。"
@@ -137,6 +187,56 @@ BE_SRC=$SR/output/be; FE_SRC=$SR/output/fe
 [ "$WANT_FE" = 1 ] && [ -z "$(ls "$FE_SRC/lib" 2>/dev/null)" ] && { log "   （跳过 FE：$FE_SRC/lib 是空的，这棵树还没编出 FE）"; WANT_FE=0; }
 [ "$WANT_BE" = 0 ] && [ "$WANT_FE" = 0 ] && die "BE 和 FE 都没有可部署的产物。"
 
+# 新部署自动避让其他用户；已启动过或已有数据的部署保持原端口，避免改变 BE 身份。
+if [ -z "${SR_PORT_BASE:-}" ] && [ ! -e "$DEPLOY/.ports-activated" ] \
+   && [ -z "$(find "$DEPLOY/fe/meta" "$DEPLOY/be/storage" -mindepth 1 -print -quit 2>/dev/null)" ] \
+   && [ -z "$(pids_of fe)$(pids_of be)" ]; then
+  occupied=$(ss -H -ltn) || die '无法读取宿主机端口占用'
+  occupied=$(awk '{p=$4; sub(/^.*:/,"",p); print p}' <<< "$occupied")
+  selected=""
+  for base in "$PBASE" $(seq 24000 20 29980); do
+    free=1
+    if [ -n "${SR_FE_DEBUG_PORT:-}" ] && [ "$SR_FE_DEBUG_PORT" -ge "$base" ] \
+       && [ "$SR_FE_DEBUG_PORT" -le "$((base+11))" ] && [ "$SR_FE_DEBUG_PORT" != "$((base+8))" ]; then
+      continue
+    fi
+    for port in $(seq "$base" "$((base+9))"); do
+      if grep -qx "$port" <<< "$occupied"; then free=0; break; fi
+    done
+    [ "$free" = 1 ] && { selected=$base; break; }
+  done
+  [ -n "$selected" ] || die '找不到可用服务端口段，请配置 SR_PORT_BASE'
+  [ "$selected" = "$PBASE" ] || log "   默认端口已占用，自动选择端口基址 $selected"
+  PBASE=$selected; set_ports
+fi
+
+# 在停现有服务之前检查全部端口；容器外进程也会显示占用，但不会被认成本部署。
+check_port(){ local port=$1 which=$2 label=$3 listeners listener p owned ps
+  listeners=$(ss -H -ltnp "sport = :$port") || die "无法检查 $label 端口 $port"
+  if [ -n "$listeners" ]; then
+    ps=$(pids_of "$which")
+    while IFS= read -r listener; do
+      owned=0
+      for p in $ps; do [[ "$listener" == *"pid=$p,"* ]] && owned=1; done
+      [ "$owned" = 1 ] || die "$label 端口 $port 已被其他进程占用；请配置 SR_PORT_BASE（JDWP 可单独配置 SR_FE_DEBUG_PORT）。现有集群未停止。"
+    done <<< "$listeners"
+  fi
+}
+if [ "$WANT_FE" = 1 ]; then
+  for p in "$FE_HTTP" "$FE_RPC" "$FE_QUERY" "$FE_EDIT" "$FE_DEBUG_PORT"; do check_port "$p" fe FE; done
+fi
+if [ "$WANT_BE" = 1 ]; then
+  for p in "$BE_PORT" "$BE_HTTP" "$BE_HB" "$BE_BRPC" "$BE_STARLET"; do check_port "$p" be BE; done
+fi
+# Arrow Flight 默认关闭；用户启用时也纳入预检，保持原有端口。
+for side in fe be; do
+  [ "$side" = fe ] && [ "$WANT_FE" = 0 ] && continue
+  [ "$side" = be ] && [ "$WANT_BE" = 0 ] && continue
+  conf="$DEPLOY/$side/conf/$side.conf"; [ -f "$conf" ] || conf="$SR/output/$side/conf/$side.conf"
+  port=$(awk '$1=="arrow_flight_port" && $2=="="{p=$3} END{print p}' "$conf" 2>/dev/null)
+  if [[ "$port" =~ ^[1-9][0-9]*$ ]]; then check_port "$port" "$side" 'Arrow Flight'; fi
+done
+
 log "=========================================================="
 log " 源码树: $SR"
 log " 提交:   $(git -C "$SR" rev-parse --short HEAD 2>/dev/null || echo ?)@$(git -C "$SR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo ?)"
@@ -149,15 +249,20 @@ log "=========================================================="
 log "== 停止现有集群"
 [ "$WANT_FE" = 1 ] && stop_one fe FE
 [ "$WANT_BE" = 1 ] && stop_one be BE
-
 # ---- 同步产物 ----
 # 容器里没有 rsync。服务已停，直接换目录最省事也最干净：先拷到 .new，成功了再原子换掉，
 # 半路失败不会留下一个拼凑出来的 lib（踩过太多次"半成品被当成成品"）。
-sync_dir(){ local src=$1 dst=$2
+sync_dir(){ local src=$1 dst=$2 tmp old
   [ -d "$src" ] || return 0
-  rm -rf "$dst.new" 2>/dev/null
-  cp -a "$src" "$dst.new" || { rm -rf "$dst.new"; die "拷贝 $src 失败"; }
-  rm -rf "$dst" 2>/dev/null; mv "$dst.new" "$dst" || die "发布 $dst 失败"; }
+  tmp=$(mktemp -d "$dst.new.XXXXXX") || die "创建临时目录失败"
+  cp -a "$src/." "$tmp" || { rm -rf "$tmp"; die "拷贝 $src 失败"; }
+  old="$tmp.old"
+  if [ -e "$dst" ]; then mv "$dst" "$old" || { rm -rf "$tmp"; die "备份 $dst 失败"; }; fi
+  if ! mv "$tmp" "$dst"; then
+    [ ! -e "$old" ] || mv "$old" "$dst"
+    rm -rf "$tmp"; die "发布 $dst 失败，已尝试恢复原目录"
+  fi
+  rm -rf "$old"; }
 
 # conf 只在首次铺模板，之后保留你的改动；端口/路径这些由下面的 managed 块每次重写
 seed_conf(){ local src=$1 dst=$2
@@ -177,16 +282,39 @@ write_managed(){ local conf=$1; shift
 # 所以在块里再写一遍 JAVA_OPTS 就能覆盖模板那行。以块外现有的 JAVA_OPTS 为底（你手改的其它 -D/-XX 都保留），
 # 只把 -Xmx 换成 $FE_HEAP；没有 -Xmx 就补一个；整份 conf 都没有 JAVA_OPTS 时才自己写一条最小的。
 # 老分支的 JAVA_OPTS_FOR_JDK_* 同样处理（模式 JAVA_OPTS[A-Z_0-9]*）。
-fe_java_opts_lines(){ local conf=$1 heap=$2 line out=0
+# BE 复用同一函数：be.conf 也是 export_env_from_conf 逐行 eval export、后写覆盖先写；start_backend.sh 把 JAVA_OPTS
+# 交给 LIBHDFS_OPTS，libhdfs 创建 JVM 时就用它。所以在 be.conf 的 managed 块里再写一遍带 -Xmx 的 JAVA_OPTS 同样生效。
+append_java_opt(){ local line=$1 opt=$2
+  case "$line" in
+    *\") printf '%s %s"\n' "${line%\"}" "$opt";;
+    *\') printf "%s %s'\n" "${line%\'}" "$opt";;
+    *) printf '%s %s\n' "$line" "$opt";;
+  esac; }
+
+fe_java_opts_lines(){ local conf=$1 heap=$2 debug=${3:-0} line out=0 prefix match
+  local jdwp_re="(^|[[:blank:]\"'])(-agentlib:jdwp=|-Xrunjdwp:)[^[:blank:]\"']+"
   while IFS= read -r line; do
     out=1
     if [[ "$line" =~ -Xmx[0-9]+[kKmMgG]? ]]; then line=${line//"${BASH_REMATCH[0]}"/-Xmx$heap}
-    elif [[ "$line" == *\" ]]; then line="${line%\"} -Xmx$heap\""
-    else line="$line -Xmx$heap"; fi
+    else line=$(append_java_opt "$line" "-Xmx$heap"); fi
+    if [ "$debug" = 1 ]; then
+      # FE 由 sr 管理 JDWP，先移除原有参数，避免重复加载 agent 或保留旧端口。
+      # BE 调用不传第三个参数，其 JVM 选项保持原样。
+      while [[ "$line" =~ $jdwp_re ]]; do
+        match=${BASH_REMATCH[0]}; prefix=${BASH_REMATCH[1]}
+        [[ "$prefix" == [[:blank:]] ]] && prefix=""
+        line=${line/"$match"/"$prefix"}
+      done
+      line=$(append_java_opt "$line" "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=127.0.0.1:$FE_DEBUG_PORT")
+    fi
     printf '%s\n' "$line"
   done < <(awk '/^# >>> sr-deploy managed/{s=1} !s{print} /^# <<< sr-deploy managed/{s=0}' "$conf" 2>/dev/null \
            | grep -E '^[[:blank:]]*JAVA_OPTS[A-Z_0-9]*[[:blank:]]*=' | sed 's/^[[:blank:]]*//')
-  [ $out = 1 ] || printf 'JAVA_OPTS="-Xmx%s"\n' "$heap"; }
+  if [ "$out" = 0 ]; then
+    line="JAVA_OPTS=\"-Xmx$heap\""
+    [ "$debug" = 1 ] && line=$(append_java_opt "$line" "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=127.0.0.1:$FE_DEBUG_PORT")
+    printf '%s\n' "$line"
+  fi; }
 
 if [ "$WANT_BE" = 1 ]; then
   log "== 部署 BE"
@@ -195,11 +323,13 @@ if [ "$WANT_BE" = 1 ]; then
   seed_conf "$BE_SRC/conf" "$DEPLOY/be/conf"
   [ "$CLEAN_DATA" = 1 ] && rm -rf "$DEPLOY/be/storage"
   mkdir -p "$DEPLOY/be/storage" "$DEPLOY/be/log"
+  mapfile -t BEJ < <(fe_java_opts_lines "$DEPLOY/be/conf/be.conf" "$BE_HEAP")   # 必须在 write_managed 改写之前读
   write_managed "$DEPLOY/be/conf/be.conf" \
-    "be_port = $BE_PORT" "be_http_port = $BE_HTTP" "heartbeat_service_port = $BE_HB" "brpc_port = $BE_BRPC" \
+    "be_port = $BE_PORT" "be_http_port = $BE_HTTP" "heartbeat_service_port = $BE_HB" "brpc_port = $BE_BRPC" "starlet_port = $BE_STARLET" \
     "priority_networks = $HOSTIP/32" \
-    "storage_root_path = $DEPLOY/be/storage" "sys_log_dir = $DEPLOY/be/log"
-  log "   产物已换 · 数据目录保留$([ "$CLEAN_DATA" = 1 ] && echo '（--clean-data：已清空）')"
+    "storage_root_path = $DEPLOY/be/storage" "sys_log_dir = $DEPLOY/be/log" \
+    "# BE 内嵌 JVM 堆 -Xmx$BE_HEAP（sr deploy --be-heap 改）：以块外的 JAVA_OPTS 为底只换 -Xmx，后写的覆盖先写的" "${BEJ[@]}"
+  log "   产物已换 · 数据目录保留$([ "$CLEAN_DATA" = 1 ] && echo '（--clean-data：已清空）') · JVM 堆 -Xmx$BE_HEAP"
 fi
 
 if [ "$WANT_FE" = 1 ]; then
@@ -209,14 +339,17 @@ if [ "$WANT_FE" = 1 ]; then
   seed_conf "$FE_SRC/conf" "$DEPLOY/fe/conf"
   [ "$CLEAN_DATA" = 1 ] && rm -rf "$DEPLOY/fe/meta"
   mkdir -p "$DEPLOY/fe/meta" "$DEPLOY/fe/log"
-  mapfile -t FEJ < <(fe_java_opts_lines "$DEPLOY/fe/conf/fe.conf" "$FE_HEAP")   # 必须在 write_managed 改写之前读
+  mapfile -t FEJ < <(fe_java_opts_lines "$DEPLOY/fe/conf/fe.conf" "$FE_HEAP" 1)
   write_managed "$DEPLOY/fe/conf/fe.conf" \
     "http_port = $FE_HTTP" "rpc_port = $FE_RPC" "query_port = $FE_QUERY" "edit_log_port = $FE_EDIT" \
     "priority_networks = $HOSTIP/32" "meta_dir = $DEPLOY/fe/meta" \
     "# FE 堆 -Xmx$FE_HEAP（sr deploy --fe-heap 改）：以块外的 JAVA_OPTS 为底只换 -Xmx，后写的覆盖先写的" "${FEJ[@]}"
   log "   产物已换 · 元数据保留$([ "$CLEAN_DATA" = 1 ] && echo '（--clean-data：已清空）') · FE 堆 -Xmx$FE_HEAP"
+  printf '%s\n' "$FE_DEBUG_PORT" > "$DEPLOY/.fe-debug-port"
+  log "   FE 调试: 127.0.0.1:$FE_DEBUG_PORT（正常启动，不等待调试器）"
 fi
 
+printf '%s\n' "$PBASE" > "$DEPLOY/.port-base"
 printf '来源: %s\n提交: %s@%s\n时间: %s\n内容: %s\n' \
   "$SR" "$(git -C "$SR" rev-parse --short HEAD 2>/dev/null || echo ?)" \
   "$(git -C "$SR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo ?)" "$(date '+%F %T')" \
@@ -230,42 +363,57 @@ log "== 启动"
 if [ "$WANT_BE" = 1 ]; then
   # 9>&- 必须加：BE 是常驻进程，继承了源码树锁的 fd 就会把锁永久占住，这棵树以后再也编不了、
   # 打不了包、也部署不了（codex 复查#1；项目里 iceccd 踩过一模一样的坑）。
-  ( cd "$DEPLOY/be" && ./bin/start_be.sh --daemon ) >/dev/null 2>&1 9>&-
+  ( cd "$DEPLOY/be" && ./bin/start_be.sh --daemon ) >"$DEPLOY/be/log/sr-start.log" 2>&1 9>&- 8>&- 200>&- \
+    || { tail -20 "$DEPLOY/be/log/sr-start.log" >&2; die "BE 启动脚本失败"; }
   for i in $(seq 1 30); do sleep 1; [ -n "$(pids_of be)" ] && break; done
   [ -n "$(pids_of be)" ] && log "   BE 已起 (pid $(pids_of be | tr '\n' ' '))" \
-    || { log "   !! BE 没起来，看 $DEPLOY/be/log/be.out"; tail -5 "$DEPLOY/be/log/be.out" 2>/dev/null | sed 's/^/      /'; }
+    || { tail -20 "$DEPLOY/be/log/be.out" 2>/dev/null >&2; die "BE 没起来，看 $DEPLOY/be/log/be.out"; }
 fi
 if [ "$WANT_FE" = 1 ]; then
-  ( cd "$DEPLOY/fe" && ./bin/start_fe.sh --daemon ) >/dev/null 2>&1 9>&-   # 同上，FE 也是常驻
+  ( cd "$DEPLOY/fe" && ./bin/start_fe.sh --daemon ) >"$DEPLOY/fe/log/sr-start.log" 2>&1 9>&- 8>&- 200>&- \
+    || { tail -20 "$DEPLOY/fe/log/sr-start.log" >&2; die "FE 启动脚本失败"; }
   for i in $(seq 1 60); do sleep 1; [ -n "$(pids_of fe)" ] && break; done
   [ -n "$(pids_of fe)" ] && log "   FE 已起 (pid $(pids_of fe | tr '\n' ' '))" \
-    || { log "   !! FE 没起来，看 $DEPLOY/fe/log/fe.out"; tail -5 "$DEPLOY/fe/log/fe.out" 2>/dev/null | sed 's/^/      /'; }
+    || { tail -20 "$DEPLOY/fe/log/fe.out" 2>/dev/null >&2; die "FE 没起来，看 $DEPLOY/fe/log/fe.out"; }
 fi
 
 # ---- 首次：把 BE 注册进 FE ----
 # StarRocks 不会自动发现 BE，必须 ALTER SYSTEM ADD BACKEND 一次。已注册过就跳过（重复执行会报错但无害）。
-if [ "$WANT_FE" = 1 ] && [ "$WANT_BE" = 1 ] && [ -n "$(pids_of fe)" ]; then
+if [ "$WANT_FE" = 1 ]; then
   if command -v mysql >/dev/null 2>&1; then
     log "== 等 FE 可连接…"
     ok=0; for i in $(seq 1 60); do
       mysql -h "$HOSTIP" -P "$FE_QUERY" -u root -N -e "select 1" >/dev/null 2>&1 && { ok=1; break; }; sleep 2; done
     if [ "$ok" = 1 ]; then
-      if mysql -h "$HOSTIP" -P "$FE_QUERY" -u root -N -e "show backends" 2>/dev/null | grep -q "$HOSTIP"; then
+      if [ "$WANT_BE" = 1 ]; then
+      backends=$(mysql -h "$HOSTIP" -P "$FE_QUERY" -u root -N -e "show backends") || die "查询 BE 注册状态失败"
+      if awk -v host="$HOSTIP" -v port="$BE_HB" '$2==host && $3==port{found=1} END{exit !found}' <<< "$backends"; then
         log "   BE 已在集群里，无需注册"
       else
         log "   注册 BE 到 FE…"
-        mysql -h "$HOSTIP" -P "$FE_QUERY" -u root -e "ALTER SYSTEM ADD BACKEND \"$HOSTIP:$BE_HB\"" 2>&1 | sed 's/^/      /'
+        mysql -h "$HOSTIP" -P "$FE_QUERY" -u root -e "ALTER SYSTEM ADD BACKEND \"$HOSTIP:$BE_HB\"" || die "注册 BE 失败"
+      fi
       fi
     else
-      log "   !! 60s 内连不上 FE，跳过 BE 注册（看 $DEPLOY/fe/log/fe.log）"
+      die "等待 FE SQL 就绪超时（看 $DEPLOY/fe/log/fe.log）"
     fi
   else
-    log "   （容器里没有 mysql 客户端，跳过 BE 注册。sr image 重建镜像后会自带；也可手工执行：）"
-    log "   mysql -h $HOSTIP -P $FE_QUERY -u root -e 'ALTER SYSTEM ADD BACKEND \"$HOSTIP:$BE_HB\"'"
+    die "没有 mysql 客户端，无法验证部署和注册 BE；请更新工具镜像"
   fi
 fi
 
+if [ "$WANT_BE" = 1 ]; then
+  ok=0
+  for i in $(seq 1 30); do
+    [ -n "$(pids_of be)" ] || die "BE 启动后退出，请查看 $DEPLOY/be/log/be.out"
+    if timeout 2 bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$HOSTIP" "$BE_HB" 2>/dev/null; then ok=1; break; fi
+    sleep 1
+  done
+  [ "$ok" = 1 ] || die "等待 BE 心跳服务端口 $BE_HB 超时"
+fi
+
 log "=========================================================="
+touch "$DEPLOY/.ports-activated" || die '无法保存部署端口状态'
 log " 完成。连接: mysql -h $HOSTIP -P $FE_QUERY -u root"
 log " FE http $FE_HTTP · BE http $BE_HTTP · 日志 $DEPLOY/{fe,be}/log"
 log " 查看: sr deploy --status    停止: sr deploy --stop"

@@ -1,0 +1,62 @@
+#!/bin/bash
+# lldb-host —— 让 VSCode 的 lldb-dap（或命令行 lldb）跑进编译容器里，并且用和编译**完全相同**的依赖挂载与
+# run-be-ut.sh 同款的运行时环境。用法：软链成两个名字，按名字选进容器后执行什么：
+#   ln -sf ~/srdev/files/lldb-host ~/bin/lldb-dap   # VSCode lldb-dap 扩展的 debugAdapterExecutable / lldb-dap.executable-path
+#   ln -sf ~/srdev/files/lldb-host ~/bin/lldb       # 命令行：~/bin/lldb -- be/nj-dyn/ut_build_ASAN/test/exec/xxx_test --gtest_filter=...
+#
+# 为什么非进容器不可：测试二进制链接的是容器里的 gcc-toolset-14 libstdc++/libasan 和 /var/local/thirdparty 下按 digest
+# bind 进去的第三方 .so，宿主机上前者不存在、后者是空目录，进程在宿主机根本起不来；lldb 也只能在进程所在的
+# 命名空间里 ptrace。容器是 --net=host、privileged，所以不用额外开端口，DAP 走 docker exec 的 stdin/stdout 管道。
+#
+# 铁律（同 clangd-host）：绝不往 stdout 写任何东西——这条管道就是 DAP 协议本身，多一个字节 VSCode 就断开。
+# 所有自述一律走 stderr。
+set -uo pipefail
+ME=$(basename "$0"); say(){ printf '%s: %s\n' "$ME" "$*" >&2; }
+
+HERE=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)     # 仓库根
+CONF_FILE=${SR_CONF:-$HERE/srdev.conf}; [ -f "$CONF_FILE" ] && . "$CONF_FILE"
+BASE=${BASE:-$HOME}
+SR_USER=${SR_USER:-$(id -un)}
+NAME=${SR_CLANGD_CONTAINER:-${SR_USER}_farm}                 # 与 clangd 共用同一个容器名配置
+case "$ME" in lldb-dap*) BIN=${SR_LLDB_DAP_BIN:-lldb-dap-20}; TTY=();;
+             *)         BIN=${SR_LLDB_BIN:-lldb-20}; TTY=(); [ -t 0 ] && [ -t 1 ] && TTY=(-t);; esac   # 命令行 lldb 要 tty 才能交互
+
+# 找源码树：VSCode 以 workspaceFolder 作为 cwd 启动适配器；命令行就是当前目录
+find_root(){ local d=${1:-}
+  while [ -n "$d" ] && [ "$d" != / ] && [ "$d" != . ]; do
+    [ -f "$d/build.sh" ] && [ -d "$d/be/src" ] && { printf '%s\n' "$d"; return 0; }
+    d=$(dirname "$d"); done; return 1; }
+SR=$(find_root "$(pwd -P)" 2>/dev/null || true)
+
+# 这棵树钉住的依赖 digest —— 和 sr build / clangd-host 读同一份记录，运行时看到的第三方 .so 与编译时一致
+DG=""
+if [ -n "$SR" ]; then
+  BR=$(git -C "$SR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+  [ "$BR" = HEAD ] && BR=$(git -C "$SR" describe --tags --abbrev=0 2>/dev/null || echo HEAD)
+  KEY=$(printf %s "$SR@$BR" | md5sum | cut -c1-12)
+  DG=$(cut -d' ' -f2 "$BASE/farm/versions/$KEY" 2>/dev/null)
+  case "$DG" in ''|*[!0-9a-f]*) DG="";; esac
+fi
+
+if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" != true ]; then
+  say "容器 $NAME 没在跑，先 sr up"
+  "$HERE/sr" up >&2 2>&1 || { say "容器起不来，放弃"; exit 1; }
+fi
+
+# 透传给容器内 lldb-dap-env 的旋钮：SR_UT_TREE（用哪棵构建树的 .so）、SR_LLDB_ENV_DEBUG（把算出的环境打到 stderr）
+ENVS=(-e "STARROCKS_HOME=${SR:-$PWD}")
+for v in SR_UT_TREE SR_LLDB_ENV_DEBUG JAVA_HOME ASAN_OPTIONS LSAN_OPTIONS; do [ -n "${!v:-}" ] && ENVS+=(-e "$v=${!v}"); done
+
+if [ -n "$DG" ]; then
+  say "进容器 $NAME 跑 $BIN，依赖 digest ${DG:0:12}，源码树 $SR${SR_UT_TREE:+，构建树 $SR_UT_TREE}"
+  # sh -c 的参数：$0=digest，$1=BIN，$2..=BIN 的参数；lldb-dap-env 摆好环境后 exec "$@"
+  exec docker exec -i "${TTY[@]}" -w "${SR:-$PWD}" "${ENVS[@]}" "$NAME" \
+    unshare -m --propagation private sh -c \
+    'mount --bind "/tp/$0/installed" /var/local/thirdparty/installed \
+       || echo "lldb-host: 依赖挂载失败，第三方 .so 会找不到" >&2
+     exec lldb-dap-env "$@"' "$DG" "$BIN" "$@"
+else
+  [ -n "$SR" ] && say "找不到 $SR 的依赖版本记录（这棵树还没 sr build 过？），不挂 thirdparty，依赖第三方 .so 的二进制会起不来" \
+               || say "当前目录不在任何 StarRocks 源码树里，不挂 thirdparty、不设单测环境"
+  exec docker exec -i "${TTY[@]}" -w "${SR:-$PWD}" "${ENVS[@]}" "$NAME" lldb-dap-env "$BIN" "$@"
+fi

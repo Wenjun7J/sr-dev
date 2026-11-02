@@ -19,8 +19,7 @@ RUN if [ -n "$APT_MIRROR" ]; then \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
       ninja-build ccache icecc libiberty-dev binutils-dev procps bc util-linux sshpass iproute2 \
       mariadb-client \
-      clangd-18 \
-
+      mold time \
       gcc-11 g++-11 gcc-12 g++-12 gcc-13 g++-13 \
  && rm -rf /var/lib/apt/lists/*
 
@@ -46,7 +45,10 @@ COPY files/oss-ccache-proxy.py /usr/local/bin/oss-ccache-proxy.py
 COPY files/sr-build    /usr/local/bin/sr-build
 COPY files/sr-farm     /usr/local/bin/sr-farm
 COPY files/sr-deploy   /usr/local/bin/sr-deploy
+COPY files/sr-deploy-lock.py /usr/local/bin/sr-deploy-lock.py
 COPY files/cmake-linkpool /usr/local/bin/cmake-linkpool
+COPY files/dynlib-compat.cmake /usr/local/share/sr/dynlib-compat.cmake
+COPY files/lldb-dap-env /usr/local/bin/lldb-dap-env
 COPY files/linkgate    /usr/local/bin/linkgate
 COPY files/tspapi.py   /usr/local/bin/tspapi.py
 COPY files/node-setup.sh /usr/local/bin/node-setup.sh
@@ -66,12 +68,28 @@ RUN set -e; TS=$(ls -d /opt/gcc-toolset-* 2>/dev/null); [ -n "$TS" ] || { echo "
 
 # 挂载点：每次编译在私有 mount ns 里把 /tp/<digest>/installed bind 到这里（thirdparty 的规范路径）
 RUN mkdir -p /var/local/thirdparty/installed
-# clangd 给 VSCode 用（见 files/clangd-host）。装 clangd-18 而不是 clangd 元包：
-# 后者会连带升级 libc6，在编译容器里动 glibc 不值当（实测 --no-install-recommends 下
-# clangd-18 只新增 9 个包、不升级任何东西）。软链成固定名字，换版本时上层不用改。
-RUN ln -sf /usr/bin/clangd-18 /usr/local/bin/clangd
+# clangd / LLDB 使用 LLVM 20；clangd 18 在泛型 lambda 的约束检查中会崩溃。
+# libclang-rt-20-dev 提供 ASAN 配置需要的 sanitizer/*.h。
+# 工具运行库独立于 SR thirdparty 中的 LLVM；signed-by 将密钥限定于官方 LLVM 源。
+RUN set -e; . /etc/os-release; \
+    install -d -m 755 /usr/share/keyrings; \
+    curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 \
+      https://apt.llvm.org/llvm-snapshot.gpg.key -o /usr/share/keyrings/apt.llvm.org.asc; \
+    printf 'deb [signed-by=/usr/share/keyrings/apt.llvm.org.asc] https://apt.llvm.org/%s/ llvm-toolchain-%s-20 main\n' \
+      "$VERSION_CODENAME" "$VERSION_CODENAME" > /etc/apt/sources.list.d/llvm20.list; \
+    apt-get update -qq -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 lldb-20 clangd-20 libclang-rt-20-dev; \
+    rm -rf /var/lib/apt/lists/*; \
+    ln -sf /usr/bin/lldb-20 /usr/local/bin/lldb; \
+    ln -sf /usr/bin/lldb-dap-20 /usr/local/bin/lldb-dap; \
+    ln -sf /usr/bin/clangd-20 /usr/local/bin/clangd; \
+    lldb --version; lldb-dap --version; clangd --version
 
 RUN mkdir -p /opt/noninja && printf '#!/bin/sh\nexit 1\n' > /opt/noninja/ninja && chmod +x /opt/noninja/ninja
 RUN git config --global --add safe.directory '*'
-RUN chmod +x /usr/local/bin/cxxlaunch /usr/local/bin/ccache-pch /usr/local/bin/oss-ccache-proxy.py /usr/local/bin/sr-build /usr/local/bin/sr-farm /usr/local/bin/sr-deploy /usr/local/bin/cmake-linkpool /usr/local/bin/linkgate \
+ARG SR_IMAGE_ID=unversioned
+LABEL org.srdev.image-id=$SR_IMAGE_ID
+RUN mkdir -p /usr/local/share/sr && printf '%s\n' "$SR_IMAGE_ID" > /usr/local/share/sr/image-id
+RUN chmod +x /usr/local/bin/cxxlaunch /usr/local/bin/lldb-dap-env /usr/local/bin/ccache-pch /usr/local/bin/oss-ccache-proxy.py /usr/local/bin/sr-build /usr/local/bin/sr-farm /usr/local/bin/sr-deploy /usr/local/bin/cmake-linkpool /usr/local/bin/linkgate \
              /usr/local/bin/tspapi.py /usr/local/bin/node-setup.sh

@@ -1,6 +1,23 @@
 # 站点配置：registry 地址、节点账号密码等，只在本机
 srdev.conf
 registries.conf
+srdev.conf.*
+registries.conf.*
+!srdev.conf.example
+!registries.conf.example
+.env
+.env.*
+.tsp/
+.ossutilconfig
+farm/
+ccache/
+thirdparty/
+m2/
+pkg/
 *.log
 .DS_Store
 __pycache__/
+*.py[cod]
+*.swp
+*.swo
+*~

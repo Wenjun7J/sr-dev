@@ -20,7 +20,7 @@ CONF_FILE=${SR_CONF:-$HERE/srdev.conf}; [ -f "$CONF_FILE" ] && . "$CONF_FILE"
 BASE=${BASE:-$HOME}
 SR_USER=${SR_USER:-$(id -un)}
 NAME=${SR_CLANGD_CONTAINER:-${SR_USER}_farm}
-CLANGD=${SR_CLANGD_BIN:-clangd}
+CLANGD=${SR_CLANGD_BIN:-clangd-20}
 
 # 找源码树：VSCode 以 workspaceRoot 作为 cwd 启动 clangd；拿不到就从 --compile-commands-dir 里推
 find_root(){ local d=${1:-}
