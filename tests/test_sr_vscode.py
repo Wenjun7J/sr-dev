@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -127,6 +128,7 @@ class ConfigTest(unittest.TestCase):
 
 
 class DispatchTest(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('flock'), 'requires GNU flock')
     def test_deploy_dispatch(self):
         # Run the actual sr entry point with a Docker stand-in. No service starts.
         with tempfile.TemporaryDirectory() as temp:
@@ -140,6 +142,7 @@ class DispatchTest(unittest.TestCase):
             for name in ('clangd-host', 'lldb-host'):
                 (repo / 'files' / name).touch()
             (repo / 'files/sr-image-id.py').write_bytes((REPO / 'files/sr-image-id.py').read_bytes())
+            (repo / 'files/sr-tp-prune.py').write_bytes((REPO / 'files/sr-tp-prune.py').read_bytes())
             (repo / 'files/sr-vscode.py').write_text('import sys\nprint("GENERATOR", repr(sys.argv[1:]))\n')
             mockbin = base / 'bin'
             mockbin.mkdir()

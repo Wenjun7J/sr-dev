@@ -49,6 +49,8 @@ docker ps --filter name=<当前用户>_farm --format '{{.Names}} {{.Image}} {{.S
 - `sr be-ut` / `sr build --be-ut` 默认 **ASAN、动态模块、PCH，编完接着跑**；只编用 `--no-run`。
   `ut` / `--ut` 和用户级 `-j` 已移除。并发改 `SR_LOCAL_JOBS` / `SR_NODE_JOBS`，FE UT 可单独改 `SR_FE_UT_JOBS`。
 - 同一源码树的构建串行；并行任务用不同 worktree。不要删除锁文件或绕过 sr 直接运行上游 UT 脚本来规避锁。
+- 清理依赖使用 `sr tp prune` 预览，`--yes` 才删除；具体保护与升级要求见日常工作流的“依赖缓存清理”。
+  构建和 IDE 共用依赖目录读锁；实际清理需全机相关任务空闲及 sudo 权限，不凭 digest 年龄直接删除共享目录。
 - 不自动重试失败构建。先查当前错误、日志和内存压力；依赖变化导致的 clean 与用户主动 clean 都可能触发全量编译。
 - `sr deploy` 会替换该用户共用部署并停启本次涉及的组件。`--no-start` 仍会更新产物并可能停止已有组件，不是 dry-run。
   只有部署任务才执行部署；`--clean-data` 必须有删除数据的明确授权。

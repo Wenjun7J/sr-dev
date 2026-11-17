@@ -54,8 +54,9 @@ if [ -n "$DG" ]; then
   # sh -c 的参数：$0=digest，$1=clangd，$2..=clangd 的参数；exec "$@" 正好是 $1 带着 $2.. 起飞（不要 shift）
   exec docker exec -i -w "${SR:-$PWD}" "$NAME" \
     unshare -m --propagation private sh -c \
-    'mount --bind "/tp/$0/installed" /var/local/thirdparty/installed \
-       || echo "clangd-host: 依赖挂载失败，第三方头文件会找不到" >&2
+    'exec 6</tp; flock -s 6 || exit 1
+     mount --bind "/tp/$0/installed" /var/local/thirdparty/installed \
+       || { echo "clangd-host: 依赖挂载失败，请重新生成构建配置" >&2; exit 1; }
      exec "$@"' "$DG" "$CLANGD" "$@"
 else
   [ -n "$SR" ] && say "找不到 $SR 的依赖版本记录（这棵树还没 sr build 过？），不挂 thirdparty，第三方头文件会报找不到" \

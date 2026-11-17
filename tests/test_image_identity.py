@@ -18,7 +18,7 @@ class ImageIdentityTest(unittest.TestCase):
             (a / 'sr').write_text('host-entry')
             (a / 'files').mkdir()
             (a / 'files/tool').write_text('v1\n')
-            for name in ('clangd-host', 'lldb-host', 'sr-vscode.py', 'sr-image-id.py'):
+            for name in ('clangd-host', 'lldb-host', 'sr-vscode.py', 'sr-image-id.py', 'sr-tp-prune.py'):
                 (a / 'files' / name).write_text('test')
             shutil.copytree(a, b)
             def identity(path, image='base'):
@@ -30,6 +30,7 @@ class ImageIdentityTest(unittest.TestCase):
             (b / 'files/tool').write_text('v2\n')
             self.assertNotEqual(identity(a), identity(b))
 
+    @unittest.skipUnless(shutil.which('flock'), 'requires GNU flock')
     def test_old_container_rejects_new_work_but_allows_recovery(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)

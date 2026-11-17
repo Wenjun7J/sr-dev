@@ -38,7 +38,8 @@ class ConfigTests(unittest.TestCase):
         for name in ('farm', 'tp', 'ccache'):
             st = (self.root / name).stat()
             mounts.append(f'/{name} {st.st_dev}:{st.st_ino}')
-        self.env = dict(os.environ, BASE=str(self.root), CONF_FILE=str(self.conf),
+        self.env = dict(os.environ, HERE=str(Path(__file__).resolve().parents[1]),
+                        BASE=str(self.root), CONF_FILE=str(self.conf),
                         NAME='test-container', TPDIR=str(self.root / 'tp'),
                         DOCKER_LOG=str(self.root / 'docker.log'),
                         MOUNT_INFO='\n'.join(mounts))

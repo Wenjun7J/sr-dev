@@ -52,8 +52,9 @@ if [ -n "$DG" ]; then
   # sh -c 的参数：$0=digest，$1=BIN，$2..=BIN 的参数；lldb-dap-env 摆好环境后 exec "$@"
   exec docker exec -i "${TTY[@]}" -w "${SR:-$PWD}" "${ENVS[@]}" "$NAME" \
     unshare -m --propagation private sh -c \
-    'mount --bind "/tp/$0/installed" /var/local/thirdparty/installed \
-       || echo "lldb-host: 依赖挂载失败，第三方 .so 会找不到" >&2
+    'exec 6</tp; flock -s 6 || exit 1
+     mount --bind "/tp/$0/installed" /var/local/thirdparty/installed \
+       || { echo "lldb-host: 依赖挂载失败，请重新生成构建配置" >&2; exit 1; }
      exec lldb-dap-env "$@"' "$DG" "$BIN" "$@"
 else
   [ -n "$SR" ] && say "找不到 $SR 的依赖版本记录（这棵树还没 sr build 过？），不挂 thirdparty，依赖第三方 .so 的二进制会起不来" \

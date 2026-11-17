@@ -267,7 +267,15 @@ $out
 EOF
   return $fatal; }
 
+tp_read_lock(){
+  mkdir -p "$TPDIR" || return 1
+  { exec 6<"$TPDIR"; } && flock -s 6 || return 1
+  python3 "$HERE/files/sr-tp-prune.py" register --root "$TPDIR" --farm "$BASE/farm"
+}
+
 ensure_container(){
+  # fd 6 覆盖版本解析、依赖提取到 docker exec；容器内驱动另持同一目录的读锁。
+  tp_read_lock || return 1
   local version_policy=${1:-check}
   # 顺序要紧：先把 farm 目录收紧到 0700 再往里写配置——目录还开放时写固定路径会被预置的符号链接劫持（codex r8#3）。
   # 0700 迁移也必须在 running 短路之前，否则已在跑的老部署永远不会被修；改不动就拒绝，这是提权向量，不能带着跑。
@@ -552,13 +560,44 @@ PU
   fi
   ;;
 tp)
-  echo "依赖目录: $TPDIR $([ "$TPDIR" = "$SHARED_TP" ] && echo "（全机共享）" || echo "（个人）")"
-  printf "%-14s %-8s %-7s %s\n" DIGEST GCC 大小 状态
-  for d in $TPDIR/*/; do [ -d "$d" ] || continue; n=$(basename $d)
-    printf "%-14s %-8s %-7s %-6s %s\n" "${n:0:12}" "$(cat $d/.gccmajor 2>/dev/null || echo ?)" \
-      "$(du -sh $d 2>/dev/null|cut -f1)" "$([ -f $d/.ready ] && echo 就绪 || echo 不完整)" \
-      "$([ ${#n} -lt 64 ] && echo '(旧格式目录，确认无人使用后可删)' || cat $d/.image 2>/dev/null)"
-  done ;;
+  shift
+  case "${1:-}" in
+    prune)
+      shift
+      if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then exec "$0" tp --help; fi
+      for option in "$@"; do
+        case "$option" in --yes|-y|--dry-run) ;; *) echo "!! 未知 tp prune 参数：$option" >&2; exit 2;; esac
+      done
+      TP_REPOS=()
+      TP_NAMES=$(ns_list) || exit 1
+      for n in $TP_NAMES; do
+        u=$(ns_url "$n") || exit 1
+        [ -n "$u" ] && TP_REPOS+=(--repo "$u")
+      done
+      [ ${#TP_REPOS[@]} -gt 0 ] || { echo '!! 未配置依赖镜像仓库，无法判断旧 digest' >&2; exit 1; }
+      exec python3 "$HERE/files/sr-tp-prune.py" prune --root "$TPDIR" --farm "$BASE/farm" "${TP_REPOS[@]}" "$@" ;;
+    -h|--help)
+      cat <<'U'
+用法: sr tp
+      sr tp prune [--dry-run | --yes]
+  tp                 列出宿主机已提取的依赖目录
+  tp prune           查询来源 tag 当前 digest 并预览旧缓存；默认不删除
+  tp prune --yes     在构建、clangd、LLDB 空闲时删除，必要时通过 sudo 执行
+  保留当前 digest、所有已登记用户的版本/构建引用（含 12 位旧记录）及异常目录。
+  registry 或引用读取失败时中止；共享缓存的旧版容器须先升级（包括已停止的）。
+  仅删除完整的本地依赖缓存，不删 Docker 镜像、构建产物、.tmp/.stale 目录。
+U
+      ;;
+    "")
+      echo "依赖目录: $TPDIR $([ "$TPDIR" = "$SHARED_TP" ] && echo "（全机共享）" || echo "（个人）")"
+      printf "%-14s %-8s %-7s %s\n" DIGEST GCC 大小 状态
+      for d in "$TPDIR"/*/; do [ -d "$d" ] || continue; n=$(basename "$d")
+        printf "%-14s %-8s %-7s %-6s %s\n" "${n:0:12}" "$(cat "$d/.gccmajor" 2>/dev/null || echo ?)" \
+          "$(du -sh "$d" 2>/dev/null|cut -f1)" "$([ -f "$d/.ready" ] && echo 就绪 || echo 不完整)" \
+          "$([ ${#n} -lt 64 ] && echo '(旧格式目录，确认无人使用后可删)' || cat "$d/.image" 2>/dev/null)"
+      done ;;
+    *) echo "!! 未知 tp 子命令：$1（用 sr tp --help 查看）" >&2; exit 2 ;;
+  esac ;;
 versions)
   [ -n "${SR_TP_REPO:-}" ] && echo "(SR_TP_REPO 生效：忽略 registries.conf，一律用 $SR_TP_REPO)"
   for n in $(ns_list); do
@@ -583,6 +622,7 @@ versions)
                      不影响真实产物；完事把源码树根的软链接指过去。默认 Release，--debug/--asan 可改
   farm {init|status|usage [--watch [秒]]|rebalance|resume|suspend|down}
   tp                 列出已拉下来的各版本依赖（全机共享目录）
+  tp prune           预览旧依赖缓存；空闲时加 --yes 删除（需 sudo），详见 sr tp --help
   deploy [选项]      在项目下执行：用该项目的产物部署/替换唯一一套单节点集群（FE+BE，跑在容器里）
                      自动开启 FE JDWP、建立 BE LLDB 入口并补齐 FE/BE 调试配置
                      已有集群在跑就先停再换。--status 看状态，--stop 停，--clean-data 连数据一起重建，--fe-heap 改 FE 堆（默认 2g）

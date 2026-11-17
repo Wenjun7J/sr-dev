@@ -8,7 +8,7 @@ import sys
 repo = Path(sys.argv[1])
 digest = hashlib.sha256()
 names = {'Dockerfile', 'sr', 'files/sr-image-id.py', 'files/clangd-host',
-         'files/lldb-host', 'files/sr-vscode.py'}
+         'files/lldb-host', 'files/sr-vscode.py', 'files/sr-tp-prune.py'}
 for line in (repo / 'Dockerfile').read_text().splitlines():
     if line.startswith('COPY '):
         names.update(shlex.split(line)[1:-1])

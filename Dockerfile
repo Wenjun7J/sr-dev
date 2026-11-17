@@ -89,7 +89,7 @@ RUN set -e; . /etc/os-release; \
 RUN mkdir -p /opt/noninja && printf '#!/bin/sh\nexit 1\n' > /opt/noninja/ninja && chmod +x /opt/noninja/ninja
 RUN git config --global --add safe.directory '*'
 ARG SR_IMAGE_ID=unversioned
-LABEL org.srdev.image-id=$SR_IMAGE_ID
+LABEL org.srdev.image-id=$SR_IMAGE_ID org.srdev.tp-lock=1
 RUN mkdir -p /usr/local/share/sr && printf '%s\n' "$SR_IMAGE_ID" > /usr/local/share/sr/image-id
 RUN chmod +x /usr/local/bin/cxxlaunch /usr/local/bin/lldb-dap-env /usr/local/bin/ccache-pch /usr/local/bin/oss-ccache-proxy.py /usr/local/bin/sr-build /usr/local/bin/sr-farm /usr/local/bin/sr-deploy /usr/local/bin/cmake-linkpool /usr/local/bin/linkgate \
              /usr/local/bin/tspapi.py /usr/local/bin/node-setup.sh
