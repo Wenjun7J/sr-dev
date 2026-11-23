@@ -17,8 +17,11 @@ sr fe-ut --test <完整测试类名>
 ```
 
 正常 build 的参数用 `--` 透传给 `build.sh`；BE/FE UT 的未知参数直接透传上游 UT 脚本。
-测试名称和筛选语义以选定分支的脚本为准。帮助可用 `sr build --help`、`sr be-ut --help`；
-注意这些命令经过容器初始化，不是完全无副作用的预检。只读代码中 usage 可避开初始化。
+测试名称和筛选语义以选定分支的脚本为准。`sr build` / `be-ut` / `fe-ut` / `compdb` 带 `--help` / `--why` 时会在宿主机直接返回而不启动容器或锁定 `/tp`，纯 FE 目标（`sr build --fe` / `sr fe-ut`）也不拉取或锁定 BE thirdparty；而 `sr deploy` / `sr farm` 的子命令仍会先经过 `ensure_container` 初始化容器，并非无副作用的预检。只读代码中 usage 可避开初始化。
+
+`SR_LOCAL_JOBS`、`SR_FE_UT_JOBS`、`SR_LINK_JOBS`、`SR_LINK_MEM_GB` 支持单次覆盖：非空环境变量 > 配置文件 > 默认值；空值沿用配置。
+本地资源紧张时可用 `SR_LOCAL_JOBS=6 SR_LINK_JOBS=1 sr -v <版本> be-ut --dist off`，从日志核对实际并发后验证；不必改共享配置或重建容器。
+常驻 iceccd 的槽位不随单次覆盖调整，分布式本机上限仍受该 daemon 影响；链接覆盖也不会中断已有链接或限制使用其他配置的并发构建。
 
 - 普通默认树：`be/nj/build_Release`（Debug/ASAN 对应后缀）。
 - BE UT 默认动态树：`be/nj-dyn/ut_build_ASAN`；`--no-dynlib` 使用静态 `be/nj/ut_build_ASAN`。
@@ -80,7 +83,7 @@ FE HTTP/RPC/query/edit-log 为基址 +0/+1/+2/+3，BE 的四个服务端口为 +
 - 只处理完整的 64 位 digest 目录，保留本地缓存所记录来源 tag 的当前 digest，以及所有已发现用户的版本和构建引用，兼容 12 位记录。
 - 引用来自当前 BASE、`.sr-tp-ref-*` 登记、共享缓存容器的 `/farm` 挂载和系统用户默认 `~/farm`；旧版自定义 BASE 且容器已删除时，先用新版 `sr up` 登记。
 - 旧版本记录还供 clangd/LLDB 使用，不能为了多删缓存直接删除版本记录。损坏、不完整、未知来源、`.tmp`/`.stale` 目录保留。
-- registry、Docker 清单、引用读取失败则中止。需要时通过 sudo 读取其他用户引用或删除 root 属主文件；非交互要求免密 sudo。
+- 上游仓库已删除且 `tags/list` 可证实不在现存 tag 列表中的历史 tag 可按普通旧缓存清理；registry 不可达、仓库异常、Docker 清单或引用读取失败则中止。预览时跳过无权读取的其他用户 `farm` 路径并告警，不触发 sudo；实际 `--yes` 时通过 sudo 严格读取其他用户引用并删除 root 属主文件，非交互要求免密 sudo。
 - 所有共享缓存的安装/容器须支持目录锁；旧容器（含停止状态）会阻止删除。升级须等任务空闲，旧 IDE 会话也需重启。
 - 实际清理从扫描到删除全程持排他锁，构建、提取、clangd/LLDB 持读锁；繁忙时退出，不停止现有任务。
 - 不创建或重启编译容器，不删除 Docker 镜像、构建产物、源码或 OSS 数据。删除不可直接撤销，但镜像仍可访问时可重新提取。

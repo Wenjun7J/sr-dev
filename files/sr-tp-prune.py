@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from urllib.error import HTTPError
 import urllib.request
 
 DIGEST = re.compile(r'[0-9a-f]{64}')
@@ -105,45 +106,106 @@ def reference_farms(root, farm, containers, apply):
                     farms.add(path.resolve())
             except FileNotFoundError:
                 pass
+            except OSError as error:
+                if apply:
+                    raise
+                print(f'!! 预览跳过无法读取的用户 farm {path}: {error}', file=sys.stderr)
     for container in containers:
         mounts = {m['Destination']: m for m in container.get('Mounts', [])}
         tp = mounts.get('/tp')
-        if not tp or Path(tp['Source']).resolve() != root:
+        if not tp:
+            continue
+        try:
+            tp_src = Path(tp['Source']).resolve()
+        except OSError as error:
+            if apply:
+                raise
+            if os.path.normpath(tp['Source']) != str(root):
+                print(f'!! 预览跳过无法读取的容器缓存挂载 {tp["Source"]}: {error}', file=sys.stderr)
+                continue
+            tp_src = root
+        if tp_src != root:
             continue
         name = container.get('Name', container.get('Id', '?')).lstrip('/')
         if apply and (container.get('Config', {}).get('Labels') or {}).get(LABEL) != '1':
             raise RuntimeError(f'容器 {name} 尚不支持依赖锁；请先在空闲时升级共享此缓存的 srdev 容器（包括已停止的容器）')
         if '/farm' not in mounts:
             raise RuntimeError(f'无法确认容器 {name} 的 /farm 引用目录')
-        farms.add(Path(mounts['/farm']['Source']).resolve())
+        try:
+            farms.add(Path(mounts['/farm']['Source']).resolve())
+        except OSError as error:
+            if apply:
+                raise
+            print(f'!! 预览跳过无法读取的容器 farm 挂载 {mounts["/farm"]["Source"]}: {error}', file=sys.stderr)
     return farms
 
 
-def references(farms):
+def references(farms, strict=True):
     keep = set()
     for farm in sorted(farms):
         try:
-            farm.stat()
-        except FileNotFoundError:
+            st = farm.stat()
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as error:
+            if strict:
+                raise
+            print(f'!! 预览跳过无法读取的引用目录 {farm}: {error}', file=sys.stderr)
+            continue
+        if not stat.S_ISDIR(st.st_mode):
             continue
         # iterdir must succeed; permission failures must never mean "no references".
-        entries = list(farm.iterdir())
+        try:
+            entries = list(farm.iterdir())
+        except OSError as error:
+            if strict:
+                raise
+            print(f'!! 预览跳过无法读取的引用目录 {farm}: {error}', file=sys.stderr)
+            continue
         for directory in entries:
             if directory.name == 'versions':
                 if directory.is_symlink():
                     raise RuntimeError(f'引用目录不能是符号链接：{directory}')
-                for path in directory.iterdir():
+                try:
+                    paths = list(directory.iterdir())
+                except OSError as error:
+                    if strict:
+                        raise
+                    print(f'!! 预览跳过无法读取的版本目录 {directory}: {error}', file=sys.stderr)
+                    continue
+                for path in paths:
                     if path.name.startswith('.'):
                         continue
-                    fields = read_text(path).split()
+                    try:
+                        fields = read_text(path).split()
+                    except OSError as error:
+                        if strict:
+                            raise
+                        print(f'!! 预览跳过无法读取的引用 {path}: {error}', file=sys.stderr)
+                        continue
                     if len(fields) != 2 or not PREFIX.fullmatch(fields[1]):
-                        raise RuntimeError(f'版本记录无法解析：{path}')
+                        if strict:
+                            raise RuntimeError(f'版本记录无法解析：{path}')
+                        print(f'!! 预览跳过无法解析的版本记录：{path}', file=sys.stderr)
+                        continue
                     keep.add(fields[1])
             elif directory.name.startswith('sr-build.') and directory.name.endswith('.run'):
-                fields = read_text(directory).split('\t')
+                try:
+                    fields = read_text(directory).split('\t')
+                except OSError as error:
+                    if strict:
+                        raise
+                    print(f'!! 预览跳过无法读取的构建记录 {directory}: {error}', file=sys.stderr)
+                    continue
                 dg = fields[3].rsplit('/', 1)[-1] if len(fields) >= 4 else ''
+                tgt = fields[6] if len(fields) >= 7 else ''
+                if tgt in ('fe', 'fe-ut') and dg in ('-', '?'):
+                    continue
                 if not PREFIX.fullmatch(dg):
-                    raise RuntimeError(f'构建记录无法解析：{directory}')
+                    if strict:
+                        raise RuntimeError(f'构建记录无法解析：{directory}')
+                    print(f'!! 预览跳过无法解析的构建记录：{directory}', file=sys.stderr)
+                    continue
                 keep.add(dg)
     return keep
 
@@ -182,22 +244,45 @@ def current_digest(image):
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *args, **kwargs):
             return None
-    with urllib.request.build_opener(NoRedirect).open(request, timeout=10) as response:
-        value = response.headers.get('Docker-Content-Digest', '')
-        if response.status != 200 or not value.startswith('sha256:') or not DIGEST.fullmatch(value[7:]):
-            raise RuntimeError(f'registry 未返回有效 digest：{image}')
-        return value[7:]
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        with opener.open(request, timeout=10) as response:
+            value = response.headers.get('Docker-Content-Digest', '')
+            if response.status != 200 or not value.startswith('sha256:') or not DIGEST.fullmatch(value[7:]):
+                raise RuntimeError(f'registry 未返回有效 digest：{image}')
+            return value[7:]
+    except HTTPError as error:
+        if error.code == 404:
+            tags_req = urllib.request.Request(f'http://{host}/v2/{path}/tags/list')
+            try:
+                with opener.open(tags_req, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode('utf-8', 'replace'))
+                        if (isinstance(data, dict) and data.get('name') == path
+                                and isinstance(data.get('tags'), list)
+                                and len(data['tags']) > 0
+                                and tag not in data['tags']):
+                            return None
+            except Exception:
+                pass
+        raise
 
 
 def prune(root, farm, repos, apply=False, inventory=docker_inventory, lookup=current_digest):
     with cache_lock(root, exclusive=apply) as root_fd:
         farms = reference_farms(root, farm, inventory(), apply)
-        pinned = references(farms)
+        pinned = references(farms, strict=apply)
         entries = {p.name: metadata(p, repos) for p in sorted(root.iterdir())
                    if DIGEST.fullmatch(p.name)}
         # Resolve every recorded tag before deleting anything, including tags whose
         # own cache is pinned: they may currently point to a different local entry.
-        current = {lookup(image) for image in sorted(set(entries.values()) - {None})}
+        current = set()
+        for image in sorted(set(entries.values()) - {None}):
+            digest = lookup(image)
+            # registry 删除历史 tag 后，旧 digest 已不再是当前来源，
+            # 应按普通旧缓存参与候选判断；网络/5xx 等其他错误仍然中止。
+            if digest is not None:
+                current.add(digest)
         candidates = []
         for dg, image in entries.items():
             if image is None:
@@ -253,6 +338,9 @@ def main():
     except PermissionError as error:
         if os.geteuid() == 0 or args.command == 'register':
             print(f'!! 依赖维护中止：{error}', file=sys.stderr)
+            return 1
+        if not args.yes:
+            print(f'!! 预览无法读取其他用户的引用：{error}', file=sys.stderr)
             return 1
         print('需要读取其他用户的引用或删除 root 属主文件，通过 sudo 执行维护程序。', file=sys.stderr)
         sudo = ['sudo'] + ([] if sys.stdin.isatty() else ['-n'])

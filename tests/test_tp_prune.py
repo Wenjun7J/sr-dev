@@ -144,6 +144,129 @@ class PruneTests(unittest.TestCase):
             self.run_prune(True, fail)
         self.assertTrue((self.root / A).exists())
 
+    def test_deleted_source_tag_is_treated_as_old_cache(self):
+        (self.farm / 'versions/tree').write_text(f'main {B}\n')
+        self.assertEqual(self.run_prune(True, lambda image: None), [A])
+        self.assertFalse((self.root / A).exists())
+        self.assertTrue((self.root / B).exists())
+
+    def test_current_digest_verifies_404_with_tags_list(self):
+        from urllib.error import HTTPError
+        import email.message
+
+        def make_response(status, headers_dict=None, body=b''):
+            class Resp:
+                def __init__(self):
+                    self.status = status
+                    self.headers = email.message.Message()
+                    for k, v in (headers_dict or {}).items():
+                        self.headers[k] = v
+
+                def read(self):
+                    return body
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    pass
+
+            return Resp()
+
+        responses = []
+
+        class FakeOpener:
+            def open(self, req, timeout=10):
+                action = responses.pop(0)
+                if isinstance(action, Exception):
+                    raise action
+                return action
+
+        with patch('urllib.request.build_opener', return_value=FakeOpener()):
+            err404 = HTTPError('http://r/v2/dev-env/manifests/old', 404, 'Not Found', {}, io.BytesIO())
+            try:
+                responses.extend([
+                    err404,
+                    make_response(200, body=json.dumps({'name': 'dev-env', 'tags': ['latest']}).encode()),
+                ])
+                self.assertIsNone(tp.current_digest(f'{REPOSITORY}:old'))
+            finally:
+                err404.close()
+
+            for tag_action in [
+                HTTPError('http://r/v2/dev-env/tags/list', 404, 'Not Found', {}, io.BytesIO()),
+                HTTPError('http://r/v2/dev-env/tags/list', 501, 'Not Implemented', {}, io.BytesIO()),
+                make_response(200, body=json.dumps({'name': 'dev-env', 'tags': []}).encode()),
+                make_response(200, body=json.dumps({'name': 'dev-env', 'tags': ['old']}).encode()),
+            ]:
+                head_err = HTTPError('http://r/v2/dev-env/manifests/old', 404, 'Not Found', {}, io.BytesIO())
+                try:
+                    responses.clear()
+                    responses.extend([head_err, tag_action])
+                    with self.assertRaises(HTTPError):
+                        tp.current_digest(f'{REPOSITORY}:old')
+                finally:
+                    head_err.close()
+                    if isinstance(tag_action, HTTPError):
+                        tag_action.close()
+
+    def test_preview_skips_unreadable_reference_without_sudo(self):
+        (self.farm / 'versions/tree').write_text(f'main {A}\n')
+        original = tp.read_text
+
+        def read(path):
+            if path.name == 'tree':
+                raise PermissionError('not readable')
+            return original(path)
+
+        with patch.object(tp, 'read_text', side_effect=read):
+            self.assertEqual(self.run_prune(), [A])
+        self.assertTrue((self.root / A).exists())
+
+    def test_preview_skips_unreadable_registered_farm_and_container_mount(self):
+        unreadable_farm = self.base / 'private-user/farm'
+        reg_file = self.root / (tp.REGISTRATION + 'other')
+        reg_file.write_text(str(unreadable_farm) + '\n')
+        other_tp = self.base / 'private-user/thirdparty'
+        other_farm = self.base / 'private-user/other-farm'
+        self.containers = [{
+            'Name': '/other_farm',
+            'Config': {'Labels': {tp.LABEL: '1'}},
+            'State': {'Running': True},
+            'Mounts': [{'Destination': '/tp', 'Source': str(other_tp)},
+                       {'Destination': '/farm', 'Source': str(other_farm)}],
+        }, self.container(other_farm)]
+        orig_stat = Path.stat
+        orig_resolve = Path.resolve
+
+        def mock_stat(p, *args, **kwargs):
+            if p in (unreadable_farm, other_farm):
+                raise PermissionError('denied')
+            return orig_stat(p, *args, **kwargs)
+
+        def mock_resolve(p, *args, **kwargs):
+            if p in (other_tp, other_farm):
+                raise PermissionError('denied')
+            return orig_resolve(p, *args, **kwargs)
+
+        with patch.object(Path, 'stat', mock_stat), patch.object(Path, 'resolve', mock_resolve):
+            self.assertEqual(self.run_prune(False), [A])
+            with self.assertRaises(PermissionError):
+                self.run_prune(True)
+
+    def test_stale_registration_with_file_ancestor_is_skipped(self):
+        file_ancestor = self.base / 'now-a-file'
+        file_ancestor.write_text('not a directory')
+        reg_file = self.root / (tp.REGISTRATION + 'stale')
+        reg_file.write_text(str(file_ancestor / 'farm') + '\n')
+        self.assertEqual(self.run_prune(True), [A])
+
+    def test_pure_fe_run_sidecar_does_not_abort_prune(self):
+        (self.farm / 'sr-build.fe.run').write_text(
+            '11-22 21:00:00\tuser\ttree@main\t-/-\t本地\t?\tfe-ut\t123\t/tmp/o\t/tmp/a\t编译\n'
+        )
+        self.assertEqual(self.run_prune(True), [A])
+
     def test_corrupt_reference_aborts(self):
         (self.farm / 'versions/tree').write_text('main ?\n')
         with self.assertRaisesRegex(RuntimeError, '版本记录'):
@@ -261,7 +384,13 @@ class CliTests(unittest.TestCase):
                                          (['tp', 'prune', '--help'], 0, '--yes'),
                                          (['tp', 'typo'], 2, '未知'),
                                          (['tp', 'prune', '--root', '/'], 2, '未知'),
-                                         (['tp', 'prune', '--yes', '--dry-run'], 2, 'not allowed')]:
+                                         (['tp', 'prune', '--yes', '--dry-run'], 2, 'not allowed'),
+                                         (['-v'], 2, '需要一个版本参数'),
+                                         (['pack', '--name'], 2, '需要一个包名'),
+                                         (['pack', '--out'], 2, '需要一个目录'),
+                                         (['build', '--help'], 0, '用法: sr-build'),
+                                         (['be-ut', '--help'], 0, 'run-be-ut.sh'),
+                                         (['build', '--why'], 0, '实测依据')]:
                 with self.subTest(args=args):
                     run = subprocess.run(['bash', str(REPO / 'sr'), *args], env=env,
                                          capture_output=True, text=True)
@@ -278,8 +407,24 @@ class RegistryIntegrationTests(unittest.TestCase):
 
         class Handler(BaseHTTPRequestHandler):
             def do_HEAD(self):
+                if self.path.endswith('/manifests/old'):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
                 self.send_response(response['status'])
                 self.send_header('Docker-Content-Digest', 'sha256:' + response['digest'])
+                self.end_headers()
+
+            def do_GET(self):
+                if self.path.endswith('/tags/list') and response.get('tags_body') is not None:
+                    payload = json.dumps(response['tags_body']).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                self.send_response(501)
                 self.end_headers()
 
             def log_message(self, *args):
@@ -296,10 +441,10 @@ class RegistryIntegrationTests(unittest.TestCase):
                 cache.mkdir()
                 farm.mkdir()
                 repo = f'127.0.0.1:{server.server_port}/dev-env'
-                for dg in (A, B):
+                for dg, tag in ((A, 'old'), (B, 'latest')):
                     entry = cache / dg
                     (entry / 'installed').mkdir(parents=True)
-                    for name, data in {'.ready': '', '.gccmajor': '14', '.image': repo + ':latest',
+                    for name, data in {'.ready': '', '.gccmajor': '14', '.image': repo + ':' + tag,
                                        '.ref': repo + '@sha256:' + dg, '.digest': 'sha256:' + dg}.items():
                         (entry / name).write_text(data)
                 mockbin = root / 'bin'
@@ -313,14 +458,16 @@ class RegistryIntegrationTests(unittest.TestCase):
                            BASE=str(root), SR_TPDIR=str(cache), SR_CONF=str(root / 'missing'),
                            SR_REGISTRIES=str(registries), SR_TP_REPO='')
                 command = ['bash', str(REPO / 'sr'), 'tp', 'prune']
+                # When HEAD :old returns 404 and tags/list fails (501), abort without deleting anything.
                 for status, digest in ((503, B), (404, B), (200, 'invalid')):
-                    response.update(status=status, digest=digest)
+                    response.update(status=status, digest=digest, tags_body=None)
                     failed = subprocess.run(command + ['--yes'], env=env, text=True,
                                             capture_output=True, timeout=15)
                     self.assertNotEqual(failed.returncode, 0, failed.stdout)
                     self.assertTrue((cache / A).exists())
                     self.assertTrue((cache / B).exists())
-                response.update(status=200, digest=B)
+                # When tags/list confirms repo is live and :old is deleted, prune removes A and keeps B.
+                response.update(status=200, digest=B, tags_body={'name': 'dev-env', 'tags': ['latest']})
                 for args in ([], ['--yes']):
                     run = subprocess.run(command + args, env=env, text=True,
                                          capture_output=True, timeout=15)

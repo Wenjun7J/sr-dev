@@ -66,8 +66,8 @@ MODE=deploy; WANT_BE=1; WANT_FE=1; CLEAN_DATA=0; NO_START=0
 FE_HEAP=${SR_FE_HEAP:-2g}
 BE_HEAP=${SR_BE_HEAP:-2g}
 while [ $# -gt 0 ]; do case "$1" in
-  --fe-heap) FE_HEAP=$2; shift 2;;
-  --be-heap) BE_HEAP=$2; shift 2;;
+  --fe-heap) [ $# -ge 2 ] || die "--fe-heap 需要一个大小"; FE_HEAP=$2; shift 2;;
+  --be-heap) [ $# -ge 2 ] || die "--be-heap 需要一个大小"; BE_HEAP=$2; shift 2;;
   --be-only) WANT_FE=0; shift;;
   --fe-only) WANT_BE=0; shift;;
   --stop) MODE=stop; shift;;

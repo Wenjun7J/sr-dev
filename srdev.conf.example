@@ -19,7 +19,9 @@ SR_NODE_USER=sr                    # 节点上的 ssh 用户
 SR_NODE_PASSWORD=                  # 节点初始密码，仅首次铺 ssh 密钥用；之后全走专用密钥 ~/farm/ssh/id_farm
 WORKERS=5                          # 申请的机器总数（全部当 worker；平台自带的 1 台 FE 也算在内，写 5 就开 5 台）
 #SR_LOCAL_JOBS=8                   # 本机并发上限：既是常驻 iceccd 的 -m，也是 ninja 的本机份额（默认=容器 CPU 配额）。
-                                   # 全局、只在 daemon 启动时生效，改完要 sr down && sr up。用户级 -j 已移除。
+                                   # 本次 ninja 并发每次读取；常驻 iceccd 的 -m 只在 daemon 启动时生效。用户级 -j 已移除。
+                                   # SR_LOCAL_JOBS / SR_FE_UT_JOBS / SR_LINK_JOBS / SR_LINK_MEM_GB 支持非空环境变量临时覆盖，优先于本文件。
+                                   # 如 SR_LOCAL_JOBS=6 SR_LINK_JOBS=1 sr -v main be-ut --dist off；不修改配置、不重建容器。
 #SR_FE_UT_JOBS=8                   # FE 单测的 maven -T（默认跟 SR_LOCAL_JOBS）。控制的是 reactor 并发，
                                    # 实际测试 JVM 数还取决于 surefire 的 fork 配置，别当成 JVM 总数。
 #SR_DYNLIB_PCH=1                   # BE 单测 .so 模式下补挂 PCH（1，默认）还是只 -include vector（0）。实测本地编译 PCH 快约 5%，

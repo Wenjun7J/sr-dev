@@ -9,7 +9,14 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 # 站点相关的东西（registry、base 镜像、apt 源、公共依赖目录、节点账号）全在 srdev.conf 里，
 # 该文件不进仓库；容器内挂成 /etc/srdev.conf 给 sr-farm 用。模板见 srdev.conf.example。
+# 单次构建的非空并发覆盖优先于站点配置；不改配置文件，也不覆盖容器/农场身份。
+SR_BUILD_OVERRIDES=()
+for sr_build_var in SR_LOCAL_JOBS SR_FE_UT_JOBS SR_LINK_JOBS SR_LINK_MEM_GB; do
+  [ -z "${!sr_build_var:-}" ] || SR_BUILD_OVERRIDES+=("$sr_build_var=${!sr_build_var}")
+done
 CONF_FILE=${SR_CONF:-$HERE/srdev.conf}; [ -f "$CONF_FILE" ] && . "$CONF_FILE"
+for sr_build_override in ${SR_BUILD_OVERRIDES[@]+"${SR_BUILD_OVERRIDES[@]}"}; do export "$sr_build_override"; done
+unset SR_BUILD_OVERRIDES sr_build_var sr_build_override
 CONF=${SR_REGISTRIES:-$HERE/registries.conf}
 BASE=${BASE:-$HOME}
 WORK=${WORK:-$HOME}
@@ -22,13 +29,33 @@ IMG=${IMG:-}   # 默认为构建输入的内容标识，见 image_identity
 # 依赖按 digest 存，内容不可变、与用户无关——放公共目录全机共享，别人拉过的你不用再拉。
 # 公共目录不可写时退回自己 $HOME 下。
 SHARED_TP=${SR_TPDIR:-/srv/srdev/thirdparty}
-if mkdir -p "$SHARED_TP" 2>/dev/null && [ -w "$SHARED_TP" ]; then TPDIR=$SHARED_TP; else TPDIR=$BASE/thirdparty; fi
+if [ -z "${SR_TPDIR:-}" ] && [ ! -e "$SHARED_TP" ]; then
+  ( umask 000; mkdir -p "$SHARED_TP" && chmod 1777 "$SHARED_TP" ) 2>/dev/null || true
+else
+  mkdir -p "$SHARED_TP" 2>/dev/null || true
+fi
+TP_FALLBACK_NOTE=""
+if [ -d "$SHARED_TP" ] && [ -w "$SHARED_TP" ]; then
+  TPDIR=$SHARED_TP
+else
+  TPDIR=$BASE/thirdparty
+  if [ -d "$SHARED_TP" ] && [ ! -w "$SHARED_TP" ]; then
+    TP_FALLBACK_NOTE="   (提示：公共依赖目录 $SHARED_TP 不可写，已退回个人目录 ${TPDIR}；多用户共享请由管理员设为 1777 或组可写)"
+  fi
+fi
 
-SPEC=""; ARGS=()
+# 只解析子命令之前的全局版本选项。子命令之后的 -v 是 sr-build 自己的
+# verbose 选项，不能被宿主入口吞掉；缺少参数时也要给出正常错误，而不是
+# 在 set -u 下报 unbound variable。
+SPEC=""
 while [ $# -gt 0 ]; do
-  case "$1" in -v|--version|-p|--profile) SPEC=$2; shift 2;; *) ARGS+=("$1"); shift;; esac
+  case "$1" in
+    -v|--version|-p|--profile)
+      [ $# -ge 2 ] || { echo "!! $1 需要一个版本参数" >&2; exit 2; }
+      SPEC=$2; shift 2;;
+    *) break;;
+  esac
 done
-set -- ${ARGS[@]+"${ARGS[@]}"}
 
 # SR_TP_REPO（srdev.conf）非空时：忽略 registries.conf 的命名空间，一律用它解析依赖镜像。
 # 用途：某个命名空间的发布断了（例如某个来源暂时没有所需的依赖更新），先临时切到别处；
@@ -267,6 +294,11 @@ $out
 EOF
   return $fatal; }
 
+tp_register(){
+  mkdir -p "$TPDIR" || return 1
+  python3 "$HERE/files/sr-tp-prune.py" register --root "$TPDIR" --farm "$BASE/farm"
+}
+
 tp_read_lock(){
   mkdir -p "$TPDIR" || return 1
   { exec 6<"$TPDIR"; } && flock -s 6 || return 1
@@ -274,13 +306,11 @@ tp_read_lock(){
 }
 
 ensure_container(){
-  # fd 6 覆盖版本解析、依赖提取到 docker exec；容器内驱动另持同一目录的读锁。
-  tp_read_lock || return 1
   local version_policy=${1:-check}
   # 顺序要紧：先把 farm 目录收紧到 0700 再往里写配置——目录还开放时写固定路径会被预置的符号链接劫持（codex r8#3）。
   # 0700 迁移也必须在 running 短路之前，否则已在跑的老部署永远不会被修；改不动就拒绝，这是提权向量，不能带着跑。
   mkdir -p "$BASE/farm" 2>/dev/null
-  if [ -d "$BASE/farm" ] && [ "$(stat -c %a "$BASE/farm" 2>/dev/null)" != 700 ]; then
+  if [ -d "$BASE/farm" ] && [ "$(stat -L -c %a "$BASE/farm" 2>/dev/null)" != 700 ]; then
     chmod 700 "$BASE/farm" 2>/dev/null || { echo "!! 无法把 $BASE/farm 设为 0700（其他用户可替换 state.env 提权），请先手动 chmod 700 后重试"; return 1; }
     echo "   (已把 $BASE/farm 收紧为 0700)"
   fi
@@ -340,11 +370,15 @@ ensure_tp(){
   local img=$1 dg=$2 tagname=${3:-$1}
   local d=$TPDIR/$dg
   if [ -f "$d/.ready" ]; then echo "$dg"; return 0; fi
+  [ -n "${TP_FALLBACK_NOTE:-}" ] && echo "$TP_FALLBACK_NOTE" >&2
   echo "== 首次使用该镜像的依赖，拉取中（约 7 秒，6~8G）…" >&2
   docker image inspect "$img" >/dev/null 2>&1 || { echo "   拉镜像 $img …" >&2; docker pull -q "$img" >/dev/null 2>&1; }
   # 多用户可能同时拉同一 digest：flock 串行，先拷到 .tmp 再原子 mv，别人永远看不到半成品
-  # 锁文件要能被所有用户打开：A 建的 644 文件 B 打不开写就 flock 不了。建成 666，打不开写就以只读 fd 上锁
-  local lk="$TPDIR/.lock.$dg"; ( umask 000; : >>"$lk" ) 2>/dev/null; chmod 666 "$lk" 2>/dev/null
+  # 锁文件要能被所有用户打开：A 建的 644 文件 B 打不开写就 flock 不了；sticky 目录(1777)下带 O_CREAT 打开别人文件会 EACCES，故用只读 fd 上锁。
+  local lk="$TPDIR/.lock.$dg"
+  [ -e "$lk" ] || ( umask 000; : >>"$lk" ) 2>/dev/null
+  chmod 666 "$lk" 2>/dev/null || true
+  [ ! -L "$lk" ] || { echo "!! 依赖锁文件异常（符号链接）：$lk" >&2; return 1; }
   # 提取放进子 shell 持锁：子 shell 一退锁就放（review extra#3：原来 exec 7 在主 shell 拿锁不放，B 要等 A 整轮编译结束
   # 才能用已经就绪的依赖）。里面任何一步失败都不发布半成品（review extra#1：原来元数据写失败仍 mv、探测不到 gcc 就默认 14）。
   (
@@ -368,10 +402,11 @@ ensure_tp(){
     # 发布前完整性自检：.ready 与数字 .gccmajor 都必须在
     { [ -f "$t/.ready" ] && grep -qE '^[0-9]+$' "$t/.gccmajor" 2>/dev/null; } \
       || { echo "!! 依赖目录完整性检查未过（缺 .ready 或 .gccmajor 非数字），已中止" >&2; rm -rf "$t"; exit 1; }
-    # 发布：$d 若还在（含删不动的 root 属主 installed），先重命名让路——developer 拥有父目录 $TPDIR，rename 只看父目录写权限、
-    # 不受 $d 内容属主影响，所以一定成功；这样 mv 目标必不存在，绝不会嵌套。只有 .ready 缺失（不完整）的目录才会走到这里，不会误动在用的依赖。
+    # 发布：$d 若还在（含删不动的 root 属主 installed），先重命名让路——普通用户拥有父目录 $TPDIR 时 rename 直接成功；
+    # 若 $TPDIR 带 sticky(1777) 且残留目录属主是他人或 root，退回容器 root 移走，这样 mv 目标必不存在，绝不会嵌套。
     if [ -e "$d" ]; then
-      mv -f "$d" "$d.stale.$$" 2>/dev/null
+      mv -f "$d" "$d.stale.$$" 2>/dev/null \
+        || docker run --rm -v "$TPDIR":/tp "$img" sh -c 'mv -f "/tp/$1" "/tp/$1.stale.$2"' _ "$dg" "$$" >/dev/null 2>&1
       [ -e "$d" ] && { echo "!! 无法移开旧依赖目录 $d，中止，不做嵌套发布" >&2; rm -rf "$t"; exit 1; }
     fi
     mv "$t" "$d" || { echo "!! 发布依赖目录失败" >&2; rm -rf "$t"; exit 1; }
@@ -383,7 +418,7 @@ ensure_tp(){
         || echo "   (提示：旧目录残留 $d.stale.$$ 未能清理，可稍后手工删；不影响本次依赖)" >&2
     fi
     exit 0
-  ) 9<>"$lk"
+  ) 9<"$lk"
   local rc=$?
   [ $rc = 0 ] && [ -f "$d/.ready" ] && { echo "$dg"; return 0; }
   return 1; }
@@ -391,7 +426,7 @@ ensure_tp(){
 case "${1:-}" in
 image)   build_image ;;   # 显式重建（改了 Dockerfile 之后）；平时 sr up / sr build 发现没镜像会自动构建
 ide)     python3 "$HERE/files/sr-vscode.py" "$PWD" "$HERE" /farm/deploy --ide-only ;;
-up)      ensure_container ;;
+up)      ensure_container && tp_register ;;
 down)    docker rm -f $NAME >/dev/null 2>&1; echo "容器已删除（挂载卷保留）" ;;
 shell)   ensure_container allow-old && docker exec -it $NAME bash -l ;;
 history|log)
@@ -461,8 +496,8 @@ pack)
   while [ $# -gt 0 ]; do case "$1" in
     --upload) P_UP=1; shift;;
     --force)  P_FORCE=1; shift;;
-    --name)   P_NAME=$2; shift 2;;
-    --out)    P_OUT=$2; shift 2;;
+    --name)   [ $# -ge 2 ] || { echo "!! --name 需要一个包名" >&2; exit 2; }; P_NAME=$2; shift 2;;
+    --out)    [ $# -ge 2 ] || { echo "!! --out 需要一个目录" >&2; exit 2; }; P_OUT=$2; shift 2;;
     -h|--help) cat <<'PU'
 用法: sr pack [源码目录] [选项]      （不给目录就从当前目录上溯找源码树）
   把该树的 output/ 打成 <树名>-<短sha>[-dirty].tar.gz，布局与官方日构建包一致
@@ -589,6 +624,7 @@ tp)
 U
       ;;
     "")
+      [ -n "${TP_FALLBACK_NOTE:-}" ] && echo "$TP_FALLBACK_NOTE" >&2
       echo "依赖目录: $TPDIR $([ "$TPDIR" = "$SHARED_TP" ] && echo "（全机共享）" || echo "（个人）")"
       printf "%-14s %-8s %-7s %s\n" DIGEST GCC 大小 状态
       for d in "$TPDIR"/*/; do [ -d "$d" ] || continue; n=$(basename "$d")
@@ -637,8 +673,30 @@ digest 变了会提示（若报依赖相关错误，先 rebase 代码）。换�
 U
 ;;
 *)
+  # 帮助和默认解释不需要容器、registry 或 thirdparty。这样在新机器、
+  # 非源码目录及无网络环境中也能立即回答。遇 -- 或选项值停止/跳过，避免把 `-- --help` 当宿主预览。
+  case "$1" in
+    build|be-ut|fe-ut|compdb|ccdb)
+      PREVIEW_ARGS=("$@")
+      case "$1" in
+        build) PREVIEW_ARGS=("${PREVIEW_ARGS[@]:1}");;
+        be-ut) PREVIEW_ARGS=(--be-ut "${PREVIEW_ARGS[@]:1}");;
+        fe-ut) PREVIEW_ARGS=(--fe-ut "${PREVIEW_ARGS[@]:1}");;
+        compdb|ccdb) PREVIEW_ARGS=(--compdb "${PREVIEW_ARGS[@]:1}");;
+      esac
+      skipv=0
+      for a in "${PREVIEW_ARGS[@]}"; do
+        [ $skipv = 1 ] && { skipv=0; continue; }
+        case "$a" in
+          --) break;;
+          --build-prefix|--dist) skipv=1;;
+          -h|--help|--why) exec "$HERE/files/sr-build" "${PREVIEW_ARGS[@]}";;
+        esac
+      done
+      ;;
+  esac
   VERSION_POLICY=check
-  case "$1:${2:-}" in deploy:--status|deploy:--stop|farm:status|farm:down|farm:suspend) VERSION_POLICY=allow-old;; esac
+  case "$1:${2:-}" in deploy:--status|deploy:--stop|deploy:--help|deploy:-h|farm:status|farm:down|farm:suspend|farm:--help|farm:-h|farm:help) VERSION_POLICY=allow-old;; esac
   ensure_container "$VERSION_POLICY" || exit 1
   sub=$1; shift
   # sr be-ut [选项] [-- run-be-ut.sh 参数] = sr build --be-ut …：编 BE 单测（走农场）然后接着跑。
@@ -650,8 +708,23 @@ U
   case "$sub" in compdb|ccdb) sub=build; set -- --compdb "$@";; esac
   case "$sub" in
     build)
+      # 判断构建目标：纯 FE（--fe / --fe-ut）不读取、不解析、也不锁定 BE thirdparty。
+      HOST_TARGET=all; skipv=0
+      for a in "$@"; do
+        [ $skipv = 1 ] && { skipv=0; continue; }
+        case "$a" in
+          --) break;;
+          --build-prefix|--dist) skipv=1;;
+          --be) HOST_TARGET=be;;
+          --fe|--fe-ut) HOST_TARGET=fe;;
+          --all) HOST_TARGET=all;;
+          --be-ut) HOST_TARGET=ut;;
+          --compdb) HOST_TARGET=compdb;;
+        esac
+      done
+      NEED_TP=1; [ "$HOST_TARGET" = fe ] && NEED_TP=0
       # 版本记忆：按「源码树 + 分支」记，切分支要重新指定
-      # 与容器内 sr-build 同一规则找源码目录（review #7）：遇 -- 停；--dist 跳过其值；其余 -* 跳过；
+      # 与容器内 sr-build 同一规则找源码目录（review #7）：遇 -- 停；--dist/--build-prefix 跳过其值；其余 -* 跳过；
       # 第一个存在的目录型位置参数就是源码根（必须是根本身，不上溯）；没给时才从 $PWD 上溯。
       # 不能"扫所有参数里的现存目录"：-- 后面透传给 build.sh 的目录会被误认。
       # 单测模式下 sr 不认识的参数会整段透传，它们的值是裸词（--module storage 的 storage）。
@@ -663,31 +736,26 @@ U
       TSTART=""; skipv=0
       for a in "$@"; do
         [ $skipv = 1 ] && { skipv=0; continue; }
-        case "$a" in --) break;; --dist) skipv=1;; -*) ;;
+        case "$a" in --) break;; --dist|--build-prefix) skipv=1;; -*) ;;
           *) if [ -d "$a" ] && { [ "$UTM" = 0 ] || [ -f "$a/build.sh" ]; }; then TSTART=$(cd "$a" && pwd -P); break; fi;;   # pwd -P：软链接与真路径同一个 key（review latest#1）
         esac
-      done
-      # review#7：只有会真用农场的 BE 编译才值得预唤醒——--fe 纯 Java 不碰农场，--dist off 明确禁分布式，都不该把整套农场叫醒
-      # codex r14#13：--fe-ut 也是纯 maven，不碰农场。原来只认 --fe，于是 sr fe-ut 在农场休眠时
-      # 还会把 4 台 worker 叫醒，白白占资源。
-      WANTS_FARM=1; prevd=""
-      for a in "$@"; do
-        [ "$a" = -- ] && break
-        # --compdb 只做 cmake configure，一个 TU 都不编，同样不该把农场叫醒（和 --fe/--fe-ut 一个道理）
-        case "$a" in --fe|--fe-ut|--compdb) WANTS_FARM=0;; esac
-        [ "$prevd" = --dist ] && [ "$a" = off ] && WANTS_FARM=0
-        prevd=$a
       done
       root_of(){ local d
           if [ -n "$TSTART" ]; then [ -f "$TSTART/build.sh" ] && [ -d "$TSTART/be/src" ] && { echo "$TSTART"; return 0; }; return 1; fi
           d=$(pwd -P); while [ "$d" != / ]; do   # 物理路径：软链接进来也算同一棵树（review latest#1）
           [ -f "$d/build.sh" ] && [ -d "$d/be/src" ] && { echo "$d"; return 0; }; d=$(dirname "$d"); done; return 1; }
-      WROOT=$(root_of || true); PDIR=$BASE/farm/versions; KEY=""
+      WROOT=$(root_of || true); PDIR=$BASE/farm/versions; KEY=""; BR="?"
       if [ -n "$WROOT" ]; then
         BR=$(git -C "$WROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo ?)
         [ "$BR" = HEAD ] && BR=$(git -C "$WROOT" describe --tags --abbrev=0 2>/dev/null || echo HEAD)
         KEY=$(printf %s "$WROOT@$BR" | md5sum | cut -c1-12)
       fi
+      if [ "$NEED_TP" = 0 ]; then
+        XENV=(); for v in CCACHE_REMOTE_STORAGE SR_CCACHE_DIR SR_EXPLAIN MAVEN_OPTS SR_LOCAL_OK SR_DRYRUN FARM_STATE SR_FE_UT_JOBS SR_LOCAL_JOBS SR_LINK_JOBS SR_LINK_MEM_GB SR_BUILD_PREFIX SR_EXTRA_CMAKE_ARGS SR_DYNLIB_PCH; do [ -n "${!v:-}" ] && XENV+=(-e "$v"); done
+        exec docker exec -w "$PWD" -e SR_TPDIGEST=- -e SR_VER=- -e SR_BRANCH="${BR:-?}" \
+          ${XENV[@]+"${XENV[@]}"} ${TTY[@]+"${TTY[@]}"} $NAME sr-build "$@"
+      fi
+      tp_read_lock || exit 1
       if [ -z "$SPEC" ] && [ -n "$KEY" ] && [ -f "$PDIR/$KEY" ]; then
         SPEC=$(cut -d' ' -f1 "$PDIR/$KEY")
         echo "(依赖=$SPEC · $(basename "${WROOT:-?}")@${BR:-?}，你之前指定过；换用 -v)" >&2
@@ -714,12 +782,6 @@ U
       DG=${DGFULL#sha256:}; DGS=${DG:0:12}       # 目录名用完整 digest，显示用 12 位
       REF="${PBASE%:*}@$DGFULL"                 # 按 digest 引用镜像（%:* 去掉的是最后的 :tag，registry 的 :5000 不受影响）
       echo "   依赖镜像 $PBASE  digest=$DGS$([ -n "${SR_TP_REPO:-}" ] && echo "  (SR_TP_REPO 强制，忽略 ee/os 命名空间)")"
-      # 要拉依赖 = 这个 digest 第一次用 = 必然全量重编 = 必然要农场。农场若在睡，
-      # 现在就后台唤醒（29s），和拉依赖（7s）+ configure 并行，不用等到编译开始再叫醒它。
-      if [ "$WANTS_FARM" = 1 ] && [ ! -f "$TPDIR/$DG/.ready" ] && grep -q '^FARM_STATUS=suspended' "$BASE/farm/state.env" 2>/dev/null; then
-        echo "   农场休眠中且需拉依赖 → 后台先唤醒，与拉取并行"
-        docker exec -d $NAME sr-farm resume >/dev/null 2>&1
-      fi
       # 自动跟随上游最新镜像（加依赖不会破坏老代码）；但 digest 变了要提醒——
       # 如果是依赖升级而你的代码还没 rebase，编译可能会挂，这时该 rebase 而不是怪工具
       if [ -n "$KEY" ] && [ -f "$PDIR/$KEY" ]; then
@@ -760,14 +822,14 @@ U
       if [ "$CDB" = 1 ] && docker exec $NAME test -d "$TPDIR/$DG/installed" 2>/dev/null; then
         exec docker exec -w "$PWD" \
           -e STARROCKS_THIRDPARTY="$TPDIR/$DG" -e STARROCKS_GCC_HOME="$GHOME" -e SR_TPDIGEST="$DGS" -e SR_VER="$SPEC" -e SR_BRANCH="${BR:-?}" \
-          "${XENV[@]}" "${TTY[@]}" $NAME sr-build "$@"
+          ${XENV[@]+"${XENV[@]}"} ${TTY[@]+"${TTY[@]}"} $NAME sr-build "$@"
       fi
       [ "$CDB" = 1 ] && echo "   (容器里看不到 $TPDIR，compdb 退回 bind 挂载：跳转到第三方头文件时 VSCode 会打开宿主机上那份旧拷贝。空闲时 sr down && sr up 重建容器即可修好)"
       docker exec -w "$PWD" \
         -e STARROCKS_THIRDPARTY=/var/local/thirdparty -e STARROCKS_GCC_HOME="$GHOME" -e SR_TPDIGEST="$DGS" -e SR_VER="$SPEC" -e SR_BRANCH="${BR:-?}" \
-        "${XENV[@]}" "${TTY[@]}" $NAME unshare -m --propagation private sh -c \
+        ${XENV[@]+"${XENV[@]}"} ${TTY[@]+"${TTY[@]}"} $NAME unshare -m --propagation private sh -c \
           'mount --bind "/tp/$0/installed" /var/local/thirdparty/installed && exec sr-build "$@"' "$DG" "$@" ;;
-    farm) docker exec "${TTY[@]}" $NAME sr-farm "$@" ;;
+    farm) docker exec ${TTY[@]+"${TTY[@]}"} $NAME sr-farm "$@" ;;
     # deploy 必须带 -w "$PWD"：它要从当前目录上溯找源码树，用这棵树的产物部署（通用转发分支不带工作目录）
     deploy)
       docker exec -w "$PWD" -e SR_UID="$(id -u)" -e SR_DEPLOY_DIR="${SR_DEPLOY_DIR:-/farm/deploy}" \
@@ -792,7 +854,7 @@ U
           || echo '!! 产物部署已完成，但 VS Code 调试配置未就绪，请检查上方错误。' >&2
       fi ;;
     *) if docker exec $NAME sh -c "command -v \"\$1\"" _ "$sub" >/dev/null 2>&1; then
-         docker exec "${TTY[@]}" $NAME "$sub" "$@"
+         docker exec ${TTY[@]+"${TTY[@]}"} $NAME "$sub" "$@"
        else echo "未知子命令: $sub"; exec "$0" --help; fi ;;
   esac ;;
 esac

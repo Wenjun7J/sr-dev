@@ -4,16 +4,6 @@
 #   所有默认值来自 2026-09 的实测，见 --why。
 set -uo pipefail
 
-# 锁住整个依赖目录，覆盖构建和测试；即使宿主 docker 客户端退出，容器内仍持锁。
-# fd 6 由实际构建子进程继承，常驻服务必须关闭它。
-if [ -d /tp ]; then
-  { exec 6</tp; } && flock -s 6 || { echo '!! 无法锁定依赖目录'; exit 1; }
-  if [ -n "${SR_TPDIGEST_FULL:-}" ]; then
-    [[ "$SR_TPDIGEST_FULL" =~ ^[0-9a-f]{64}$ ]] && [ -f "/tp/$SR_TPDIGEST_FULL/.ready" ] \
-      || { echo '!! 依赖缓存不可用，请通过宿主 sr 重新解析并提取'; exit 1; }
-  fi
-fi
-
 # 源码树跟着当前目录走：从 $PWD 逐级上溯找 StarRocks 根（build.sh + env.sh + be/src）。
 # 这台机上有 20+ 个 worktree，写死一个路径等于每次都编错仓库。
 find_root(){ local d; d=$(pwd -P)   # 物理路径：软链接进来与真路径算同一棵树、同一把锁（review latest#1）
@@ -30,7 +20,7 @@ LOCK=""   # 源码树定下来之后才能算，见下
 
 # 本机并发默认跟容器 CPU 配额走（cgroup v2 cpu.max = "配额 周期"，如 "800000 100000" = 8 核；"max" = 不限，退回 nproc）。
 # 原来写死 16 只因当时容器就是 16 核；容器改成 8c24g 后若仍放 16 个 cc1plus，Release 16×1.6G 就撞 24G 上限（2026-09-17）。
-quota_cores(){ local q p; read -r q p < /sys/fs/cgroup/cpu.max 2>/dev/null || { nproc 2>/dev/null; return; }
+quota_cores(){ local q p; [ -r /sys/fs/cgroup/cpu.max ] && read -r q p < /sys/fs/cgroup/cpu.max 2>/dev/null || { nproc 2>/dev/null; return; }
   [ "$q" = max ] && { nproc 2>/dev/null; return; }; echo $(( (q + p - 1) / p )); }
 JDEF=$(quota_cores); case "$JDEF" in ''|*[!0-9]*|0) JDEF=16;; esac
 BT=Release ; DIST=auto ; JAVAEXT=1 ; CLEAN=0 ; GEN=ninja ; JLOCAL=$JDEF ; VERBOSE=0 ; CACHE=1   # JLOCAL 读完配置后按 SR_LOCAL_JOBS 重定
@@ -109,7 +99,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --be) TARGET=be; shift;; --fe) TARGET=fe; shift;; --all) TARGET=all; shift;;
   --be-ut) TARGET=ut; shift;;
   --compdb) TARGET=compdb; shift;;
-  --build-prefix) BPFX=$2; shift 2;;
+  --build-prefix) [ $# -ge 2 ] || { echo "!! --build-prefix 需要一个目录" >&2; exit 2; }; BPFX=$2; shift 2;;
   --dynlib) DYNLIB=1; shift;; --no-dynlib) DYNLIB=0; shift;;
   --dynlib-pch) DYNPCH=1; shift;; --no-dynlib-pch) DYNPCH=0; shift;;
   --run) RUN=1; RUNSET=1; shift;; --no-run) RUN=0; RUNSET=1; shift;;
@@ -117,12 +107,12 @@ while [ $# -gt 0 ]; do case "$1" in
   # 只把驱动的脚本换成 run-fe-ut.sh，并按 FEUT 走自己的参数与收尾。
   --fe-ut) TARGET=fe; FEUT=1; shift;;
   --debug) BT=Debug; BTSET=1; shift;; --release) BT=Release; BTSET=1; shift;; --asan) BT=ASAN; BTSET=1; shift;;
-  --dist) DIST=$2; shift 2;; --no-java-ext) JAVAEXT=0; shift;;
+  --dist) [ $# -ge 2 ] || { echo "!! --dist 需要 auto、on 或 off" >&2; exit 2; }; DIST=$2; case "$DIST" in auto|on|off) ;; *) echo "!! --dist 只接受 auto、on 或 off（收到: ${DIST}）" >&2; exit 2;; esac; shift 2;; --no-java-ext) JAVAEXT=0; shift;;
   --clean) CLEAN=1; shift;; --make) GEN=make; shift;; --no-ccache) CACHE=0; shift;;
   # -j 已移除。分布式下它只影响 ninja 的在途总数，派几个回本机是 scheduler 决定的（上限 iceccd -m），
   # 它控制不了真正吃本机内存的那部分；本地模式/FE 也统一由 SR_LOCAL_JOBS 与上游默认决定，少一个会骗人的旋钮。
   -j|-j[0-9]*) echo "!! -j 已移除：分布式下它管不了本机并发（派几个回本机由 scheduler 决定，上限是 iceccd -m）。"
-       echo "   本机并发改 srdev.conf 的 SR_LOCAL_JOBS，节点槽数改 SR_NODE_JOBS，然后 sr down && sr up。"; exit 1;;
+       echo "   本次本地构建可用 SR_LOCAL_JOBS=<并发> sr ... --dist off；常驻 iceccd/worker 槽位需在空闲时另行调整。"; exit 1;;
   --why) why; exit 0;;
   -h|--help) usage
     # 单测模式再补一段上游脚本的选项：sr 不认识的参数全都原样交给它，只印 sr 自己的等于没回答"能传什么"。
@@ -135,7 +125,7 @@ while [ $# -gt 0 ]; do case "$1" in
         ( cd "$HR" && ./"$UTS" --help 2>&1 | sed -n '/^Usage:/,$p' | sed 's/^/  /' )
       else
         echo ""
-        echo "（当前目录不在源码树里，或树中没有 $UTS，无法列出它的选项）"
+        echo "（当前目录不在源码树里，或树中没有 ${UTS}，无法列出它的选项）"
       fi
     fi
     exit 0;;
@@ -151,6 +141,16 @@ esac; done
 # --be-ut 的默认是"编完接着跑"，没显式写 --run/--no-run 时在这里补上。
 # 必须用 RUNSET 而不是 RUN 判断下面那两处"搭配错误"，否则默认值会把 --fe-ut 和普通构建全部误伤成参数错误。
 [ "$TARGET" = ut ] && [ $RUNSET = 0 ] && RUN=1
+
+# 锁住整个依赖目录，覆盖构建和测试；即使宿主 docker 客户端退出，容器内仍持锁。
+# fd 6 由实际构建子进程继承，常驻服务必须关闭它。纯 FE 不使用 thirdparty。
+if [ "$TARGET" != fe ] && [ -d /tp ]; then
+  { exec 6</tp; } && flock -s 6 || { echo '!! 无法锁定依赖目录'; exit 1; }
+  if [ -n "${SR_TPDIGEST_FULL:-}" ]; then
+    [[ "$SR_TPDIGEST_FULL" =~ ^[0-9a-f]{64}$ ]] && [ -f "/tp/$SR_TPDIGEST_FULL/.ready" ] \
+      || { echo '!! 依赖缓存不可用，请通过宿主 sr 重新解析并提取'; exit 1; }
+  fi
+fi
 
 # 指定了目录就用它，否则从 $PWD 上溯
 if [ -n "$SRARG" ]; then
@@ -250,8 +250,15 @@ export CCACHE_BASEDIR=$SR
 # 空本地 + 已填充远端 1m51s（对照本地全命中 1m32s、真编 8~11 分钟）；一份 Debug 基线约 3.2 GB / 3244 个对象。
 # 站点配置：优先读宿主机每次调用同步进来的 /farm/srdev.conf（目录挂载，改了立刻可见）；/etc/srdev.conf 是旧的单文件挂载，
 # 钉在容器创建时的 inode 上、编辑器保存后就过期，只作为老容器的兼容回退
+# 宿主入口传来的非空并发覆盖要跨过这次 source，否则又会被配置文件改回去。
+SR_BUILD_OVERRIDES=()
+for sr_build_var in SR_LOCAL_JOBS SR_FE_UT_JOBS SR_LINK_JOBS SR_LINK_MEM_GB; do
+  [ -z "${!sr_build_var:-}" ] || SR_BUILD_OVERRIDES+=("$sr_build_var=${!sr_build_var}")
+done
 SRCONF=/farm/srdev.conf; [ -f "$SRCONF" ] || SRCONF=/etc/srdev.conf
 [ -f "$SRCONF" ] && { set -a; . "$SRCONF"; set +a; }
+for sr_build_override in ${SR_BUILD_OVERRIDES[@]+"${SR_BUILD_OVERRIDES[@]}"}; do export "$sr_build_override"; done
+unset SR_BUILD_OVERRIDES sr_build_var sr_build_override
 # 常驻本机 iceccd 的并发上限（全局、只在它首次启动时生效，不随单次 -j 变——不能为了某一次构建重启别的构建也在用的 daemon）。
 # 必须在读完配置之后算，否则 srdev.conf 的 SR_LOCAL_JOBS 不生效（codex r8#5）。非正整数一律回退 16。
 # 本机 ninja 并发（JLOCAL）也跟这个值走：本地模式就是 ninja -j$LOCALCAP，分布式时是"农场容量 + LOCALCAP"里的本机份额。
@@ -578,7 +585,33 @@ fi
 # review r7#6：本地 iceccd 两种模式共用（原来只在农场分支里起，本地模式直连编译器、无跨树并发闸门）。起不来返回 1。
 # 必须排除僵尸：pgrep 会匹配 <defunct> 的 iceccd；端口全机唯一，多 profile 容器只有第一个能 bind，其余共用同一 daemon。
 iceccd_alive(){ local p st; for p in $(pgrep -x iceccd 2>/dev/null); do st=$(awk '{print $3}' /proc/$p/stat 2>/dev/null); [ "$st" != Z ] && return 0; done; return 1; }
-port_taken(){ [ -n "$(ss -ltnH "sport = :${DPORT:-10245}" 2>/dev/null)" ]; }
+# 容器使用 host network 但仍有独立 PID namespace。只把当前 namespace
+# 能看到且属于 iceccd 的监听视为本容器的 daemon；宿主机或其他用户容器占用
+# 同端口时必须区分兄弟容器共享与端口撞车，不能误以为是自己的进程。
+port_ours(){ local line pid
+  line=$(ss -ltnpH "sport = :${DPORT:-10245}" 2>/dev/null)
+  case "$line" in *users:*) ;; *) return 1;; esac
+  for pid in $(printf '%s\n' "$line" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+    case "$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)" in *iceccd*) return 0;; esac
+  done; return 1; }
+port_any(){ [ -n "$(ss -ltnH "sport = :${DPORT:-10245}" 2>/dev/null)" ]; }
+sched_ours(){ local sp=${SPORT:-8765} line pid myip qout=""
+  myip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  case "${SCHED:-}" in 127.0.0.1|localhost|"${myip}") ;; *) return 0;; esac
+  line=$(ss -ltnpH "sport = :$sp" 2>/dev/null)
+  case "$line" in
+    *users:*)
+      for pid in $(printf '%s\n' "$line" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+        case "$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)" in *icecc-scheduler*) return 0;; esac
+      done;;
+  esac
+  if exec 3<>"/dev/tcp/127.0.0.1/$((sp+1))" 2>/dev/null; then
+    printf 'listcs\nquit\n' >&3
+    qout=$(timeout 2 cat <&3 2>/dev/null)
+    exec 3>&-
+  fi
+  [ -n "${NETNAME:-}" ] && printf '%s\n' "$qout" | grep -q "^200-ICECC ${NETNAME}:" && return 0
+  return 1; }
 # 客户端真的连得上吗：进程在、端口占着，都不等于 icecc 客户端能用。
 # icecc 连的是编译期写死的 unix socket（/var/run/icecc/iceccd.socket）；容器重建后常见
 # "socket 文件还在、daemon 进程没了"，此时 icecc 只在 debug 日志里写一行 no local daemon found，
@@ -613,7 +646,7 @@ ensure_local_daemon(){ local sopt=() p cl ru wu dm
   SPORT=${SPORT:-$(( 18700 + 2 * (${SR_UID:-0} % 250) ))}
   DPORT=${DPORT:-$(( 19700 + ${SR_UID:-0} % 500 ))}
   NETNAME=${NETNAME:-${SR_USER:-u}_farm}
-  if { iceccd_alive || port_taken; }; then
+  if { iceccd_alive || port_ours; }; then
     # daemon 已在：核对它启动时的 -n/-s 是否就是本次期望的配置。不一致只警告不重启——别的构建可能正在用它（重启由 sr down/up 完成）
     for p in $(pgrep -x iceccd 2>/dev/null); do
       cl="$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null) "
@@ -643,6 +676,10 @@ ensure_local_daemon(){ local sopt=() p cl ru wu dm
     daemon_connectable && return 0
     echo "!! 检测到 iceccd 进程/端口，但客户端连不上 $ICESOCK —— 多半是容器重建后的残留 socket。"
     echo "   继续下去 icecc 会静默退回本地编译（农场白开）。请 sr down && sr up 重建容器。"
+    return 1
+  elif port_any; then
+    daemon_connectable && return 0
+    echo "!! 本机 iceccd 端口 ${DPORT:-10245} 已被宿主机其他进程/用户占用（uid%500 撞车？），请在 srdev.conf 中设置 DPORT=<空闲端口> 后 sr down && sr up" >&2
     return 1
   fi
   [ -n "${SCHED:-}" ] && sopt=(-s "$SCHED:$SPORT")
@@ -685,7 +722,12 @@ if [ "$DIST" != off ]; then
         FARM_NOTE="分布式 (农场休眠中，已开工并后台评估是否唤醒)"
       fi
     elif timeout 4 bash -c "echo > /dev/tcp/${SCHED}/${SPORT:-8765}" 2>/dev/null; then
-      USE_FARM=1; FARM_NOTE="分布式 (scheduler ${SCHED}, ${WORKERS:-?} 台 worker)"
+      if sched_ours; then
+        USE_FARM=1; FARM_NOTE="分布式 (scheduler ${SCHED}, ${WORKERS:-?} 台 worker)"
+      else
+        echo "!! scheduler 端口 ${SPORT:-8765} 已被其他进程/用户占用（非 ${NETNAME:-本农场}），已降级为本地 -j$JLOCAL" >&2
+        FARM_NOTE="本地（scheduler 端口 ${SPORT:-8765} 被其他进程占用，已降级）"
+      fi
     else
       FARM_NOTE="本地（农场 ${SCHED} 连不上，已降级）"
     fi
@@ -707,26 +749,8 @@ if [ $USE_FARM = 1 ]; then
   # 传错版本的包，worker 上就用错编译器编，产物 ABI 不一致且不报错。
   export ICECC_VERSION=$TOOLCHAIN     # 配对检查已在农场决策前做过，走到这里一定存在
   [ $CACHE = 1 ] && export CCACHE_PREFIX=icecc     # ccache 未命中时才外发，命中直接取 .o
-  # 必须排除僵尸：pgrep 会匹配到 <defunct> 的 iceccd，让人误以为 daemon 还活着。
-  # 后果很重：客户端连不上本地 daemon 时，icecc 会「无限制地」退回本地编译，
-  # -j56 就变成 56 个 cc1plus 并发，48G 容器必被 OOM 杀（踩过，cgroup oom 计数 34）。
-  iceccd_alive(){ local p st; for p in $(pgrep -x iceccd 2>/dev/null); do
-      st=$(awk '{print $3}' /proc/$p/stat 2>/dev/null); [ "$st" != Z ] && return 0; done; return 1; }
-  # 端口是全机唯一的：多 profile 容器各起一个 daemon，只有第一个能 bind 10245，
-  # 后面的静默失败，客户端连不上就无限制本地并发 → OOM（踩过）。
-  # 共享 /var/run/icecc 之后，所有容器的客户端都连同一个 daemon。
-  port_taken(){ [ -n "$(ss -ltnH "sport = :${DPORT:-10245}" 2>/dev/null)" ]; }
-  { iceccd_alive || port_taken; } || {
-    mkdir -p /var/run/icecc
-    # 9>&- 必须加：daemon 会继承持有构建锁的 fd 9，它常驻就把锁永久占住（踩过，
-    # 症状是编译结束后再也拿不到锁、报「已有构建在进行」而 ps 里根本没有 sr-build）
-    /usr/sbin/iceccd -d -s "$SCHED:${SPORT:-8765}" -n "${NETNAME:-srfarm}" -m $LOCALCAP \
-      -p "${DPORT:-10245}" -N "$(hostname)-${SR_USER:-u}" -u "$(icecc_user)" -l /tmp/iceccd.log </dev/null >/dev/null 2>&1 6>&- 9>&-
-    sleep 3; }
   # 兜底：daemon 连不上就绝不能用远端级别的并发，否则全落本地把容器撑爆。
-  # 判据是"客户端能否 connect 到 socket"，不是"有没有进程/端口" —— 后者会把
-  # "socket 残留但 daemon 已死" 误判成可用，结果 icecc 静默全本地编译（见 daemon_connectable 注释）。
-  daemon_connectable || { echo "!! 本地 iceccd 连不上（socket $ICESOCK），农场任务会静默退回本地编译，已降级为本地 -j$JLOCAL"; \
+  ensure_local_daemon || { echo "!! 本地 iceccd 连不上（socket $ICESOCK 或端口 ${DPORT:-10245} 冲突），农场任务会静默退回本地编译，已降级为本地 -j$JLOCAL"; \
                     USE_FARM=0; export USE_ICECC=0; J=$JLOCAL; ASYNC_WAKE=0; FARM_NOTE="本地（本地 iceccd 起不来，已降级）"; unset CCACHE_PREFIX ICECC_VERSION 2>/dev/null || true; }
 else
   J=$JLOCAL
@@ -884,7 +908,7 @@ if [ "${ASYNC_WAKE:-0}" = 1 ]; then
   ( if [ "${FRESH:-0}" = 1 ]; then
       # 全新构建树：不必等 miss，立刻唤醒，让 29 秒藏进 configure 阶段
       echo "   [农场] 全新构建树，必有大量真编译 -> 立即唤醒（与 configure 并行）"
-      sr-farm resume 6>&- >/dev/null 2>&1
+      sr-farm resume 6>&- >>/farm/watchdog.log 2>&1
       exit 0
     fi
     M0=$(misses); M0=${M0:-0}
@@ -894,7 +918,7 @@ if [ "${ASYNC_WAKE:-0}" = 1 ]; then
       if [ $CACHE = 0 ]; then D=99999; else M1=$(misses); D=$(( ${M1:-0} - M0 )); fi
       if [ "$D" -ge "$MISS_MIN" ]; then
         echo "   [农场] 已累计 ${D} 次 ccache miss，确属真编译 -> 唤醒农场"
-        sr-farm resume 6>&- >/dev/null 2>&1
+        sr-farm resume 6>&- >>/farm/watchdog.log 2>&1
         exit 0
       fi
     done
@@ -959,7 +983,8 @@ if [ $RC -ne 0 ] && { [ "${OOM1:-0}" -gt "${OOM0:-0}" ] || [ "${KILLED:-0}" -gt 
     echo "   下手，先 SIGTERM 再 SIGKILL），但也可能是别的 kill；要坐实得拿宿主机日志对上 PID 和时间。"
   fi
   echo "   不自动重试。ninja 是增量的，直接重跑同一条命令只会补没编完的部分；"
-  echo "   要降本机压力就改 srdev.conf 的 SR_LOCAL_JOBS（本机并发）或 SR_LINK_JOBS（同时链接数），再 sr down && sr up。"
+  echo "   本地构建可用 SR_LOCAL_JOBS=<较小并发> SR_LINK_JOBS=1 临时覆盖后重跑，无需重建容器。"
+  echo "   分布式的本机上限还受常驻 iceccd 槽位影响；不要为单次构建重启正在使用的容器。"
 fi
 # 依赖戳写入（review r7#1 定案）：RC=0 写；失败时只有“本次强制 clean 且探针已被清掉且生成器构建文件重新存在”才写——
 # 这证明目录真的被清并重新配置过、树里已是新依赖的产物。写成功即删 pending。其它情况保留旧戳/pending，下次照样强制 clean（多清不漏清）。

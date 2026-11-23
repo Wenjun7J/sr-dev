@@ -100,8 +100,21 @@ port_is_ours(){ local line pid
   for pid in $(printf '%s\n' "$line" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
     case "$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)" in *"$2"*) return 0;; esac
   done; return 1; }
-sched_ensure(){ [ -n "$(ss -ltnH "sport = :$SPORT" 2>/dev/null)" ] || \
-  /usr/sbin/icecc-scheduler -n "$NETNAME" -p "$SPORT" -d -l /tmp/icecc-scheduler.log $([ -n "${SR_SCHED_VERBOSE:-}" ] && echo "-v -v -v") >/dev/null 2>&1 6>&- 8>&- 9>&-; }   # 8>&- 生命周期锁；6>&- 看门狗单例锁——scheduler 是常驻进程，继承了就把锁永久占住（codex r15 复查#1）
+# scheduler 的文本管理口（端口 = SPORT+1，icecream 自带）。
+sched_q(){ exec 3<>/dev/tcp/127.0.0.1/$((SPORT+1)) 2>/dev/null || return 1; printf '%s\nquit\n' "$1" >&3; timeout 2 cat <&3; exec 3>&-; }
+sched_ensure(){
+  if port_is_ours "$SPORT" icecc-scheduler; then return 0; fi
+  if [ -n "$(ss -ltnH "sport = :$SPORT" 2>/dev/null)" ]; then
+    if sched_q listcs 2>/dev/null | grep -q "^200-ICECC ${NETNAME}:"; then return 0; fi
+    echo "!! scheduler 端口 $SPORT 已被其他用户或进程占用（非 ${NETNAME}），请在 srdev.conf 中设置 SPORT= 错开" >&2
+    return 1
+  fi
+  if [ -n "$(ss -ltnH "sport = :$((SPORT+1))" 2>/dev/null)" ] && ! port_is_ours "$((SPORT+1))" icecc-scheduler; then
+    echo "!! scheduler 管理端口 $((SPORT+1)) 已被其他用户或进程占用，请在 srdev.conf 中设置 SPORT= 错开" >&2
+    return 1
+  fi
+  /usr/sbin/icecc-scheduler -n "$NETNAME" -p "$SPORT" -d -l /tmp/icecc-scheduler.log $([ -n "${SR_SCHED_VERBOSE:-}" ] && echo "-v -v -v") >/dev/null 2>&1 6>&- 8>&- 9>&-
+}   # 8>&- 生命周期锁；6>&- 看门狗单例锁——scheduler 是常驻进程，继承了就把锁永久占住（codex r15 复查#1）
 # --network host 让容器和宿主机共享 netns，本地就能数出连上来的 daemon
 # grep -c 计数为 0 时退出码是 1，用 || echo 0 会多打一行；必须吃掉退出码
 # 按 NODES 里的远端 IP 逐个判"有没有到 scheduler 端口的已建立连接"。不能数所有含端口的连接：
@@ -115,7 +128,7 @@ dcount(){ local n=0 ip
 # 仍保留调用方的 worker 连接检查作为第二道——两者互相独立，一个查"部署脚本怎么说"，一个查"实际连上没有"。
 provision_nodes(){ local first=${1:-0} ip p bad="" pids=() ips=()
   for ip in $NODES; do
-    ( [ "$first" = 1 ] && sshpass -p "$NODEPW" ssh-copy-id -i $KEY.pub $SSHO $NUSER@$ip >/dev/null 2>&1
+    ( [ "$first" = 1 ] && SSHPASS="$NODEPW" sshpass -e ssh-copy-id -i $KEY.pub $SSHO $NUSER@$ip >/dev/null 2>&1
       scp -q -i $KEY $SSHO /usr/local/bin/node-setup.sh $NUSER@$ip:/tmp/ 2>/dev/null || exit 1
       ssh -n -i $KEY $SSHO $NUSER@$ip "bash /tmp/node-setup.sh $SCHED worker ${SR_NODE_JOBS:-auto} $NETNAME $SPORT ${SR_APT_MIRROR:-}" ) &
     pids+=($!); ips+=("$ip")
@@ -133,8 +146,6 @@ busy(){ local f
     ( exec 8>>"$f"; flock -n 8 ) >/dev/null 2>&1 || return 0
   done; return 1; }
 wait_workers(){ local i; for i in $(seq 1 "$1"); do sleep 2; [ "$(dcount)" -ge "$WORKERS" ] && return 0; done; return 1; }
-# scheduler 的文本管理口（端口 = SPORT+1，icecream 自带）。原来只在 usage 分支里定义，预热也要用，提到全局。
-sched_q(){ exec 3<>/dev/tcp/127.0.0.1/$((SPORT+1)) 2>/dev/null || return 1; printf '%s\nquit\n' "$1" >&3; timeout 2 cat <&3; exec 3>&-; }
 # ---- worker 预热 ----
 # icecc 的 pick_server 对「从没编过、又没有 env」的 worker 只当 bestui，永远输给任何已有评分的 best；于是 scheduler 每次
 # 重启后，重连较晚的那台会永久零任务（192.0.2.10 与 192.0.2.11 各实测复现过一次，农场白白少一台）。
@@ -165,9 +176,13 @@ warm_if_starving(){
     case "${sp:-}" in 0|0.0|0.00) need=1; break;; esac    # 没注册（取不到）不算，那是另一回事
   done
   [ "$need" = 1 ] || return 0
-  echo "$now" > "$FARM/.last-warm"
   echo "$(date '+%F %T') 发现评分为 0 的 worker，自动预热" >>"$LOGF"
-  warm_workers >>"$LOGF" 2>&1; }
+  warm_workers >>"$LOGF" 2>&1
+  rc=$?
+  # 返回 2 表示本机 iceccd 尚未启动，本轮只是跳过；不能因此推迟
+  # 下一次真正的预热。
+  [ "$rc" != 2 ] && echo "$now" > "$FARM/.last-warm"
+  return "$rc"; }
 
 warm_workers(){
   command -v icecc >/dev/null 2>&1 || return 0
@@ -300,7 +315,7 @@ EOF
   fi
   [ "${WORKERS:-0}" -ge 1 ] 2>/dev/null || { echo "!! WORKERS 必须是 ≥1 的整数（现为 '${WORKERS:-}'）"; exit 1; }
   [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N "" -f "$KEY" -C sr-farm   # 专用密钥，不碰你个人的 ~/.ssh
-  sched_ensure
+  sched_ensure || exit 1
   # review extra2#3：WORKERS 就是要申请的机器总数（用户按它估费用）。平台每个集群必带 1 台 FE，全部当 worker，
   # 所以 BE 台数 = WORKERS-1，总数正好 = WORKERS（原来传 WORKERS 台 BE 再加 1 台 FE，写 5 实际开 6 台）。
   # 绝不认领同名集群：创建前先查平台上有没有同名的。有就停下——本地没有 state.env 时 sr farm down 也释放不了它，
@@ -498,7 +513,7 @@ resume|up)
   # initializing 由 init 自己认领续做（codex r15 复查#3）：resume 处理不了"还没拿到节点"的阶段
   [ "${FARM_STATUS:-}" = initializing ] && { echo "!! 上次 sr farm init 未完成（状态 initializing）。再跑一次 sr farm init 会从断点继续，不会重新申请机器；确定不要了就 sr farm down 回收"; exit 1; }
   [ "${FARM_STATUS:-}" = releasing ] && { echo "!! 农场正在释放（上次 sr farm down 未确认完成），先 sr farm down 清理后再 init"; exit 1; }
-  sched_ensure
+  sched_ensure || exit 1
   pstate(){ $API row "$CLUSTER" 2>/dev/null | cut -d'|' -f1; }
   # 平台还在 Updating（上一次 suspend 没落定）时发 start 会被静默丢掉（踩过：4 分钟后仍 Suspended）。
   # 先等它落定，再 start，再轮询到 Running——每一步都实测，不猜。
@@ -595,7 +610,7 @@ down|release)
 # 重启后统计清零，前几轮随机分派，顺带把 env 装到所有主机。进行中的编译会短暂回退本地（软降级），几秒后恢复。
 rebalance)
   lifecycle_lock; [ -f "$STATE" ] || { echo "当前无农场"; exit 1; }; { load_state || exit 1; }
-  pkill -x icecc-scheduler 2>/dev/null; sleep 1; sched_ensure
+  pkill -x icecc-scheduler 2>/dev/null; sleep 1; sched_ensure || exit 1
   echo "scheduler 已重启（:$SPORT）。worker 在 1~3 分钟内重连…"
   { exec 8>&-; } 2>/dev/null; warm_workers   # 重启 scheduler 正是"重连晚的那台被饿死"的高发时刻，直接预热掉
   echo "完成。sr farm usage 里各台 speed 应都 > 0" ;;
