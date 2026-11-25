@@ -1,387 +1,263 @@
-# srdev — StarRocks BE 编译加速工具链
+# srdev
 
-在一台多人共享的 Linux 开发机上，用**一个容器**编译多个 StarRocks 版本：
-ninja + ccache + 按需唤醒的 icecc 云端编译农场，并统一 FE/BE 单测、本地部署、clangd 和调试入口。
-可用版本取决于 registry 中的依赖镜像、镜像内的编译器和目标分支脚本；历史使用范围包括 3.3 到 main。
-`sr build --why` 能打印历史调优依据，本文的实测数字不代表新环境的耗时保证。
+**One persistent container. Every StarRocks version (`3.3` → `main`). From 46-minute full builds down to 99 seconds.**
 
-AI 使用入口：[通用 srdev skill](skills/srdev/SKILL.md)。维护仓库与运行测试见 [开发说明](docs/development.md)。
+`srdev` (`sr`) is a unified Linux development toolkit for StarRocks engineers working across multiple branches and worktrees on shared hosts. Instead of rebuilding or juggling multi-gigabyte `dev-env` containers per branch, you run **one persistent container** that pairs the right `thirdparty` snapshot and GCC toolchain on every command—combining **PCH-aware two-tier caching (`ccache` + OSS)**, an **on-demand elastic `icecc` compile farm**, **fast `.so` ASAN unit tests**, **per-user local FE/BE deployment**, and **zero-config containerized `clangd 20` / `LLDB 20` / Java JDWP debugging**.
 
+---
+
+## Measured Impact
+
+Benchmarked on StarRocks `main` inside a 16-core / 64 GB capped container paired with an elastic `5 × 8c32g` `icecc` worker farm (run `sr build --why` to inspect the empirical basis behind every default):
+
+| Workflow | Baseline | With `srdev` | Speedup / Gain |
+|---|---|---|---|
+| **Full BE build (cold → farm → warm)** | `2768s` (~46m, `make`) / `1308s` (local Ninja) | **`678s`** (5-worker farm) → **`99s`** (warm branch switch, incl. link & `java-extensions`) | **4.1×** cold / **28×** warm |
+| **Branch switch / `--clean` rebuild (`WITH_PCH=ON`)** | `1825s` (78.4% of TUs bypass stock `ccache`; **0%** hit after `--clean`) | **`392s`** (`sloppiness`) → **`94s`** (`.gch.sum` deterministic PCH checksum, **99.9%** hit) | **19×** faster `--clean` rebuild |
+| **First build on a brand-new machine / fresh clone** | `11m 40s` (empty local cache, full Debug compile) | **`1m 51s`** (97% remote hit from shared OSS cache; vs. `1m 32s` local SSD hit) | **6.3×** faster onboarding |
+| **BE ASAN unit-test linking (56 targets)** | `408s` wall / **`38.0 GB`** anon RAM (static link; OOMs at high `-j`) | **`121s`** wall / **`7.6 GB`** anon RAM (`.so` dynamic UT + auto-injected PCH + `linkgate`) | **3.36×** faster, **5×** less RAM |
+| **Multi-branch container footprint** | One ~14 GB `dev-env` container per branch | **1 persistent container** (~2.56 GB `toolchains` base) + ~7s digest-addressed `thirdparty` mount | **0** container rebuilds |
+| **IDE C++ navigation on a fresh clone** | Full BE build required before `clangd` works | **`sr compdb` in ~14s** (isolated tree + Thrift/Proto codegen + per-branch host header jumps) | Ready in **14s** |
+
+> *Timings above reflect measured baselines on the reference development host and are not cross-environment guarantees. Supported branches depend on the dependency images in your registry, bundled GCC versions, and upstream build scripts.*
+
+---
+
+## 60-Second Tour
+
+```bash
+sr -v main build            # Build main (BE+FE Release): pulls thirdparty in ~7s once, then remembers per worktree+branch
+sr -v 3.5.20 build --be     # Build 3.5 in the SAME container: auto-switches to gcc11 + matching thirdparty
+sr be-ut --module storage   # Build & run BE unit tests (ASAN + shared libs + PCH by default; --no-run to compile only)
+sr fe-ut --test DemoTest    # Run FE unit tests in-container (JDK 21 + Maven + shared ~/.m2 + worktree lock)
+sr farm init                # Provision elastic cloud workers; large builds burst remotely, warm builds let it sleep
+sr compdb && sr ide         # Generate compile_commands.json in ~14s and wire containerized clangd 20 into VS Code
+sr deploy                   # Deploy current output/ to your personal FE+BE cluster & configure LLDB + JDWP attach
+sr history                  # Live progress & build history: duration, edges, cache hit rate, peak anon memory
 ```
-sr -v main build          # 编 main：首次拉该版本的官方依赖（~7s），之后记住
-sr -v 3.5.20 build        # 同一个容器编 3.5，自动换 gcc11 + 对应 thirdparty，不重建容器
-sr farm init              # 申请 5 台 8c32g 当 worker，编译够大时自动外发
-sr history                # 每次编译的概况：耗时、边数、命中率、内存峰值
-```
 
-## 实测收益（main，16 核封顶开发机）
+- **AI Agent Skill**: [`skills/srdev/SKILL.md`](skills/srdev/SKILL.md) (drop-in skill for Codex / Claude / Cursor / Antigravity)
+- **Contributor & Test Guide**: [`docs/development.md`](docs/development.md)
 
-| 手段 | 场景 | 结果 |
-|---|---|---|
-| make → ninja | 全量 | 2768s → 1933s（1.43×），CPU 利用率 56% → 84% |
-| ccache `sloppiness=pch_defines,time_macros` | 回退 / 切分支 | 1825s → 392s（4.66×）；默认配置下 78.4% 的编译因 PCH 绕过缓存 |
-| icecc 农场 5×8c32g | 全量 | 1308s → 678s（1.93×）；只在重编规模够大时兑现 |
-| 三者叠加，全命中 | 切分支再切回 | 99s（含链接与 java-extensions） |
+---
 
-## 组成
+## Why `srdev` Exists
 
-```
-sr                      宿主机唯一入口：起容器、解析版本、拉依赖、转发到容器内
-Dockerfile              单镜像：toolchains base（提供 gcc14）+ gcc 11/12/13 + ninja/ccache/icecc + LLVM 20
-files/sr-build          容器内编译驱动：ninja/ccache/icecc 编排、异步唤醒农场、失败诊断、编译记录；不自动重试
-files/sr-deploy         用当前源码树的 output/ 部署个人 FE/BE，保留数据、检查端口并启用调试
-files/sr-vscode.py      合并工作区 JSONC，安装个人 clangd/LLDB 入口
-files/sr-farm           农场生命周期：申请、下发 icecc、续约看门狗、闲置休眠、resume 校验/修复/降级
-files/node-setup.sh     在 worker 节点上执行：清掉预装服务、装 icecc、写配置并回读校验
-files/tspapi.py         云平台（TSP）的极简客户端，标准库实现；换平台只需重写这一个文件
-files/cxxlaunch         CMAKE_CXX_COMPILER_LAUNCHER，绕过 ccache 做纯计时时用
-files/ccache.conf       PCH sloppiness、75G 上限、zstd 1 级
-files/oss-ccache-proxy.py  ccache 的 http 远端 → 阿里云 OSS 的签名代理（ccache 无 S3/OSS 后端）；conf 配桶名即启用
-docs/sr_flowchart.svg   早期构建流程的历史图，部分策略已变更
-```
+Building StarRocks C++/Java at scale on shared multi-developer Linux hosts hits five recurring bottlenecks—each solved directly in `srdev`:
+
+1. **Multi-Version Isolation Without Container Sprawl**
+   Official `dev-env` images bundle a specific GCC and `/var/local/thirdparty` per branch (`3.3` needs GCC 11 for `rapidjson`; `main` needs GCC 14). `sr` resolves tags via a ~50 ms HTTP `HEAD`, extracts `thirdparty` once into a host-shared content-addressed cache (`$SR_TPDIR/<sha256>/installed/`), and bind-mounts it inside a **per-command private mount namespace** onto `/var/local/thirdparty` while pointing `STARROCKS_GCC_HOME` to GCC `11 / 12 / 13 / 14`. Multiple worktrees across different versions compile concurrently in one container without `CMakeCache.txt` path drift.
+2. **Deterministic Precompiled Header (PCH) & Shared OSS Caching**
+   GCC `.gch` precompiled headers are non-reproducible byte-for-byte, and CMake passes `-include cmake_pch.hxx` while building the PCH itself—causing stock `ccache` to reject or miss every TU whenever a PCH is rebuilt. `files/ccache-pch` computes a deterministic `v5` SHA-256 over `-E -fdirectives-only` output with GCC-accurate `-ffile-prefix-map` normalization (`.gch.sum`) plus `CCACHE_BASEDIR` path relativization. Paired with `files/oss-ccache-proxy.py`, cache hits are shared across directories, worktrees, and teammates via Alibaba Cloud OSS.
+3. **Wake-on-Miss Elastic `icecc` Build Farm**
+   `icecc-scheduler` runs inside the developer's container (`3.2 MB` RAM, `0.5%` CPU), turning 100% of cloud VMs into compile workers. Sleeping farms never block build startup: `sr-build` starts immediately against local `iceccd` slots and only wakes the cloud farm in the background once cumulative `ccache` misses reach threshold (`8`), auto-suspending after 15 minutes of idle time and renewing leases via a dead-man's-switch watchdog.
+4. **OOM-Proof Linking & Fast Dynamic BE Unit Tests**
+   Upstream StarRocks sets no Ninja link job pool, so `-j80` distributed builds can spawn dozens of `3–15 GB` `ld.lld` processes on the local host at once. `srdev` injects both per-Ninja `CMAKE_JOB_POOL_LINK` and a container-wide `flock` semaphore (`files/linkgate`), and defaults `sr be-ut` to `.so` dynamic linking while re-attaching upstream's missing PCH via `CMAKE_PROJECT_INCLUDE` (`files/dynlib-compat.cmake`)—without touching a single line of StarRocks source.
+5. **Container-Native IDE Navigation & Debugging**
+   Host `clangd` and `lldb` cannot resolve `/opt/gcc-toolset-14` headers or container-mounted thirdparty `.so` libraries. `files/clangd-host` and `files/lldb-host` enter the container's private mount namespace transparently over stdio (LSP / DAP), while `sr compdb` uses an isolated tree with host-identical `$SR_TPDIR/<digest>` paths so VS Code **Go to Definition** opens the exact branch-matched thirdparty header.
+
+---
+
+## Architecture & Repository Layout
 
 ```mermaid
 flowchart LR
-    A[宿主 sr：配置与版本] --> B[个人构建容器]
-    B --> C[sr-build]
-    C --> D[BE：Ninja → ccache → icecc]
-    D --> E[本机或远端 worker 编译]
-    C --> F[FE：Maven]
-    C --> G[本机链接与 output 产物]
-    G --> H[sr deploy：个人 FE/BE]
-    A --> I[clangd / LLDB / Java 调试入口]
+    A["Host sr: config & version"] --> B["Per-user container (<user>_farm)"]
+    B --> C["sr-build"]
+    C --> D["BE: Ninja -> ccache-pch -> icecc"]
+    D --> E["Local iceccd / Elastic cloud workers"]
+    D -. "miss read-through" .-> O["oss-ccache-proxy -> OSS"]
+    C --> F["FE: Maven (shared ~/.m2)"]
+    C --> G["Local linkgate & output/"]
+    G --> H["sr deploy: personal FE+BE"]
+    A --> I["clangd-host / lldb-host / JDWP"]
 ```
 
-[早期详细流程图](docs/sr_flowchart.svg) 仅作历史参考，其中的自动重试、固定并发和部分版本策略已不适用。
+```text
+sr                        Host entrypoint: container lifecycle, version resolution, thirdparty extraction, dispatch
+Dockerfile                Single image: toolchains base (GCC 14) + GCC 11/12/13 + Ninja/ccache/icecc + LLVM 20
+files/sr-build            In-container build driver: Ninja/ccache/icecc orchestration, async farm wake, OOM diagnostics
+files/ccache-pch          Compiler launcher generating deterministic .gch.sum checksums for cross-machine PCH hits
+files/ccache.conf         PCH sloppiness, external checksums, hash_dir=false, 75 GB cap, zstd level 1
+files/oss-ccache-proxy.py Local HTTP -> Alibaba Cloud OSS V1 signing proxy with per-user Bearer auth
+files/cmake-linkpool      CMake wrapper injecting Ninja link pools and container-wide linkgate without editing SR source
+files/linkgate            Container-wide flock semaphore capping concurrent ld.lld memory pressure across worktrees
+files/dynlib-compat.cmake CMake DEFER hook restoring PCH support for dynamic (.so) BE unit-test builds
+files/sr-farm             Elastic farm manager: provisioning, icecc rollout, dead-man's-switch watchdog, auto-suspend, warmup
+files/node-setup.sh       Worker bootstrap: stops preinstalled services/unattended-upgrades, installs & verifies iceccd
+files/tspapi.py           Zero-dependency Python stdlib cloud adapter (swap cloud providers by replacing this one file)
+files/sr-tp-prune.py      Safe host-wide thirdparty cache garbage collector with inode read/write locking
+files/sr-deploy           Per-user single-node FE+BE deployer with UID port allocation, data retention & JDWP setup
+files/sr-vscode.py        Comment-preserving JSONC merger for .vscode/settings.json and .vscode/launch.json
+files/clangd-host         Host LSP wrapper running clangd 20 inside the container with branch-matched thirdparty mounts
+files/lldb-host           Host DAP/CLI wrapper running lldb-dap-20 / lldb-20 in-container with isolated runtime libraries
+```
 
-## 快速开始
+---
 
-前提：Linux、Bash、GNU coreutils、flock、Python 3、curl、git，以及当前用户可以访问的 Docker daemon；一个能匿名访问 v2 API 的内网 registry，里面镜像了 `starrocks/toolchains-ubuntu` 与各版本 `starrocks/dev-env-ubuntu`；
-要用农场的话，宿主机上有云平台凭据 `~/.tsp/config.json`。
+## Quick Start
+
+### Prerequisites
+- **Host**: Linux `x86_64`, Bash, GNU coreutils (`readlink`, `stat`, `md5sum`), `flock`, Python 3, `curl`, `git`, and Docker access.
+- **Registry**: An internal registry supporting anonymous HTTP v2 `tags/list` and `HEAD manifests` mirroring `starrocks/toolchains-ubuntu` and `starrocks/dev-env-ubuntu` tags.
+- **Optional Cloud Features**: `~/.tsp/config.json` on the host for elastic `sr farm`, and `~/.ossutilconfig` (`ossutil`) for remote `ccache` / `sr pack --upload`.
+
+### Installation & First Local Build
 
 ```bash
-git clone <this repo> ~/srdev && cd ~/srdev
-./install.sh                              # 检查依赖、创建个人入口、补齐配置模板和 PATH；保留已有配置
-source ~/.config/srdev/env                 # 当前终端加载 PATH；新终端会自动加载
-# 编辑 srdev.conf 和 registries.conf：填写 registry、base 镜像等站点信息
+git clone https://github.com/Wenjun7J/sr-dev.git ~/srdev && cd ~/srdev
+./install.sh                              # Verify host deps, install ~/bin/{sr,clangd,lldb,lldb-dap}, seed config templates
+source ~/.config/srdev/env                # Load PATH in current shell (added automatically to shell profile)
+
+# Edit srdev.conf and registries.conf with your registry host and base toolchains image
 cd /path/to/starrocks
-sr -v main build --be --dist off           # 首次先完成本机 BE 构建；版本按目标分支明确选择
-sr build --all --dist off                  # 构建 BE+FE，默认 Release；复用该树该分支的版本选择
-sr be-ut --dist off --no-run               # 编译 BE 单测，默认 ASAN + 动态链接 + PCH；去掉 --no-run 即编完接着跑
+sr -v main build --be --dist off          # First non-interactive build requires -v; --dist off runs purely locally
+sr build --all --dist off                 # Build BE+FE (Release by default), reusing remembered version for this worktree+branch
+sr be-ut --dist off --no-run              # Build BE unit tests (ASAN + .so + PCH by default; omit --no-run to execute)
 ```
 
-首次非交互执行必须显式指定 `-v`。`--dist off` 明确选择本地编译，不需要 TSP 或 OSS 凭据；
-仍会使用 Docker、依赖镜像和本地 ccache。要使用农场，再配置节点参数和 TSP 凭据后执行 `sr farm init`，
-随后构建可省略 `--dist off`。`farm init` 会申请云资源，不是首次上手的必选步骤。
-源码树必须位于容器可见的挂载路径内（默认用户 HOME）；`~/srdev` 本身不是待编译的 StarRocks 源码树。
+- **No cloud credentials needed to start**: `--dist off` uses Docker, extracted `thirdparty`, and local `ccache` without TSP or OSS configuration. When ready for distributed builds, configure worker settings and run `sr farm init` (which provisions cloud VMs), then omit `--dist off`.
+- **Mount visibility**: StarRocks worktrees must reside under the container's mounted workspace (`$WORK`, defaulting to `$HOME`). `~/srdev` is the tooling checkout, not a StarRocks worktree.
+- **Content-addressed tool image**: `sr` hashes `Dockerfile`, helper scripts, and build args (`files/sr-image-id.py`). If a running container has an older image ID, `sr up/build/deploy` stops safely and prompts you to run `sr image` and switch via `sr down && sr up` when active builds/services are idle—never silently killing a working container.
 
-`sr farm usage`（可 `--watch 5`）看农场资源：scheduler 的各 worker 槽位与负载、每台机器的 loadavg/内存/编译进程、本容器 CPU/内存。`sr help` 列出全部子命令；`sr build --help` / `sr build --why` 看编译选项与默认值依据。
+---
 
-工具镜像按 Dockerfile、工具文件和构建参数生成内容标识，相同版本可以共享，不同版本使用不同标签。
-`sr up/build/deploy` 会检查运行容器的工具版本；发现不一致时会停止本次操作并提示升级。先 `sr image` 构建对应镜像，待现有构建和服务空闲后再 `sr down && sr up` 切换；不会自动删除正在工作的容器。
+## How Multi-Version Isolation Works
 
-### 同机多人部署
+Version differences across StarRocks releases come down to two things—both solved by indirection so the container never needs rebuilding:
 
-每个用户默认有自己的容器和部署目录；同一用户的所有 worktree 共用一套部署。部署目录锁会阻止并发的 deploy/stop 互相覆盖。
-新部署的端口基址默认 `24000 + (uid % 300) * 20`，已有部署保留原端口。FE 使用基址 +0..3，BE 使用 +4..7，JDWP 使用 +8，starlet 使用 +9。
-新部署会自动避让被占用的端口段，并保存选择结果；同机 sr 部署通过网络命名空间中的锁协调端口分配。另一条部署进行中时会提示稍后重试，编译不受此锁影响。
-已有数据或已启动过的部署保持原端口，发生冲突时在停止旧服务前报错。也可在 `srdev.conf` 中显式配置 `SR_PORT_BASE`。启用 Arrow Flight 时也检查其配置端口。
-FE/BE 启动、SQL 就绪或注册失败时 deploy 返回非零，并保留启动日志。
+- **`thirdparty` by SHA-256 Digest**: `-v 4.1` resolves through `registries.conf` to a `dev-env` tag and fetches its manifest digest via `HEAD /v2/.../manifests/<tag>` (~50 ms, no image pull). On first sight, `/var/local/thirdparty/installed` is extracted atomically (`flock` + temp dir + `mv`) to `$SR_TPDIR/<digest>/installed/`, shared read-only across all users on the host. Each build enters a private mount namespace (`unshare -m`) and bind-mounts that digest to `/var/local/thirdparty`, keeping `CMakeCache.txt` paths constant while allowing different branches to build side by side.
+- **Paired GCC & `icecc` Toolchains**: Extraction records the image's major GCC version (`.gccmajor`). Builds set `STARROCKS_GCC_HOME` (`/opt/gcc11`, `/opt/gcc12`, `/opt/gcc13`, or `/opt/gcc-toolset-14`) and pair the matching prebuilt `/opt/icecc/<gcc>/*.tar.gz` archive so remote workers compile with the exact same compiler ABI.
 
-## 版本是怎么处理的
+Versions are remembered per **`(worktree, branch)`** and automatically track the latest digest of the chosen tag. When an upstream tag advances to a new digest, `sr` notifies you and forces a clean reconfigure on affected BE trees so stale objects never mix with updated headers/libraries.
 
-版本差异只有两样，都用「指路」解决，容器永不因换版本而重建：
-
-- **thirdparty**：`-v 4.1` 经 `registries.conf` 解析成官方 dev-env 镜像 tag，`HEAD /v2/.../manifests/<tag>` 拿到 content digest（~50ms，不 pull）。
-  该 digest 首次出现时把镜像里的 `/var/local/thirdparty/installed` 拷到公共目录 `$SR_TPDIR/<digest>/installed/`（flock + 临时目录 + 原子 mv，多人同时拉不冲突），
-  全机共享、按内容寻址、永不改写。编译时在私有 mount namespace 里把它 bind 到规范路径 `/var/local/thirdparty`
-  ——CMakeCache 会把首次 configure 找到的绝对路径缓存起来，路径必须恒定；私有 ns 让不同版本能并发。
-- **编译器**：拉依赖时记下该镜像的 gcc 大版本（`.gccmajor`），编译时用 `STARROCKS_GCC_HOME=/opt/gccNN` 指过去；icecc 工具链包也按 gcc 分别打好。
-  gcc 是决定性变量：gcc14 编不过 3.3 的 rapidjson，gcc11 可以。
-
-版本按「源码树 + 分支」记住（首次交互选择或 `-v` 指定），切分支要重新选/指定。之后**自动跟随**该版本 tag 的最新依赖镜像，并非固定 digest。
-digest 变化会提示，已有 BE 构建树必要时强制 clean，防止旧依赖的产物被误用。
-若出现依赖错误，先核对源码提交与依赖镜像是否匹配，再决定是否更新代码；不要自动 rebase 用户的工作分支。
-
-### 清理旧依赖缓存
+### Pruning Old Dependency Caches
 
 ```bash
-sr tp                      # 已提取到宿主机的依赖目录
-sr tp prune                # 默认只预览，也可显式加 --dry-run
-sr tp prune --yes          # 实际清理；构建、clangd、LLDB 必须空闲
-sr tp --help
+sr tp                      # List extracted thirdparty digests on the host
+sr tp prune                # Preview reclaimable digests (dry-run by default; never invokes sudo)
+sr tp prune --yes          # Delete unreferenced digests when builds/clangd/LLDB are idle (uses sudo as needed)
 ```
 
-仅完整的 64 位 digest 目录参与清理。命令查询本地缓存记录的来源 tag，保留这些 tag 当前指向的 digest，
-以及各用户 `farm/versions` 和构建 `.run` 记录引用的 digest（兼容 12 位旧记录）。版本记录也供 IDE 使用，
-所以记录中的旧 digest 不会仅因 tag 更新而被删除。如果某个历史 tag 已被上游仓库删除（`tags/list` 确认仓库仍有效且已不含该 tag），其旧缓存可按正常候选清理；若仓库本身不可达或状态异常则仍中止。未知来源、损坏或不完整目录及 `.tmp`/`.stale` 残留保留。
-registry、Docker 清单或引用读取失败时中止。实际删除前重新扫描，整个扫描和删除过程持有依赖目录的排他锁。
+Only complete 64-hex digest directories from configured registries are considered. `sr tp prune` retains every tag's current registry digest plus all digests pinned by any user's `farm/versions` or active `.run` build records (including custom `BASE` paths registered via `.sr-tp-ref-*`), and holds an exclusive inode `flock` across scan and removal while builds and IDE wrappers hold shared read locks.
 
-构建、依赖提取、clangd 和 LLDB 共用该目录的读锁；清理不能取得排他锁时直接退出。
-用户的自定义 `BASE/farm` 会登记到依赖目录下的 `.sr-tp-ref-*`，容器删除后仍能找到引用；
-也扫描共享该缓存的现有容器 `/farm` 挂载和系统用户默认 `~/farm`。已删除旧版容器且使用过自定义 BASE 的用户，
-首次清理前需用新版 `sr up` 登记其目录。预览（不带 `--yes`）会跳过当前用户无权读取的他用户 `farm` 路径并提示告警，不会触发 `sudo`；执行 `--yes` 或需要严格读取其他用户引用并删除 `root` 属主文件时，通过 `sudo` 运行宿主维护程序，
-不会启动编译容器。非交互环境要求已具备免密 sudo 权限。
+---
 
-首次使用实际清理前，所有共享该缓存的 srdev 安装及容器都要升级到支持依赖锁的版本，并重启旧的 IDE 会话。
-命令会拒绝仍挂载该缓存、但没有锁协议标识的旧容器（包括已停止的）。按正常升级流程在空闲时切换，
-不会自动重启服务。删除的缓存无法直接撤销，但对应镜像仍可访问时可重新提取。
-本命令不删除 Docker 镜像、源码、构建产物或 OSS 数据；也不会自动清理。
+## Build, Unit Test & Concurrency Controls
 
-## FE（maven）
-
-`sr build --fe` 走 build.sh 的 maven 流程，农场与 ccache 不参与。实测（16 核）：冷编译 3m45s，其中 fe-core 的 checkstyle 105s（含测试共 5567 个文件；
-它的缓存在 `target/checkstyle-cachefile` 里，不 `--clean` 时只要 0–1s）、javac 45s、测试编译 30s。无改动重跑也要 83s：thrift/proto 每次重新生成源码，
-maven-compiler-plugin 3.1 据此判定「Changes detected」整模块重编 4670 文件。汇报里的「javac 重编 N 个模块」按各模块输出目录归属统计，`-T` 并行下也准。
-
-## BE 单测
-
-`sr build --be-ut` 驱动上游 `run-be-ut.sh`：它和 build.sh 一样认 `$CCACHE`、`CMAKE_BUILD_PREFIX`、`BUILD_TYPE`、`STARROCKS_GCC_HOME` 和 `-j`，
-所以农场、ccache、按 digest 挂依赖整套机制原样适用；默认动态构建树是 `be/nj-dyn/ut_build_<类型>`，静态模式为 `be/nj/ut_build_<类型>`，边数约为主程序的两倍（src+test 都编）。
-类型默认跟上游一样是 ASAN（`--debug` / `--release` 可改），与 `sr build` 的 Release 树互不干扰，ccache 条目也互不覆盖。
-
-上游脚本没有"只编不跑"的开关，`--dry-run` 正好是"全部编完、只打印要跑的测试"，就拿它当只编。`sr be-ut`
-分两阶段：先按上面的方式编完，再调一次 `run-be-ut.sh` 跑测试。带 `--be-ut` 时 sr 不认识的参数会原样交给 `run-be-ut.sh`，
-不用写 `--`：`sr be-ut --test CompactionUtilsTest`、`sr be-ut --gtest_filter 'A*:B*'`、`sr be-ut --module storage`。
-BE 单测默认编成 .so（链接快 3.36 倍、内存 1/5），并给各模块补挂上游 .so 分支漏掉的 PCH（本地编译快约 5%，分布式无收益）；
-`--no-dynlib` 回静态链接，`--no-dynlib-pch`（或 `SR_DYNLIB_PCH=0`）退回只补 `-include vector`。两者都不改源码树。
-（旧名 `ut` / `--ut` 已删除，会明确报未知参数。）
-第二阶段会再过一遍 maven/gensrc/cmake（约 1 分钟），ninja 应无事可做；跑测试期间不再打农场心跳，农场按空闲正常休眠。
-
-两点上游行为要知道：`--clean` 除了删单测树还会删 `be/output/`（BE 主程序产物）；上游每次调用都无条件对 `test/starrocks_test` 做 objcopy
-拆分调试符号，二进制没重新链接时再拆会把上一次完整的 `.debuginfo` 覆盖成空壳，所以 sr 把拆分收回来自己做，只拆本次重新链接出来的。
-别绕过 sr 直接跑 `./run-be-ut.sh`：它会用另一套 launcher/构建目录重新 configure，等于从头本地全编一遍。
-
-链接有两道并发闸门，都由 `files/cmake-linkpool` 在 configure 时经上游 `CUSTOM_CMAKE` 钩子注入：ninja 的 `CMAKE_JOB_POOL_LINK` 管住单次构建，
-`files/linkgate`（`CMAKE_CXX_LINKER_LAUNCHER`，flock 抢槽）管住整个容器。只有前者不够：容器里可以同时有几棵树在编，每棵都按整个容器的内存算槽数，加起来照样撞上限。
-闸门是共享的、槽位不带内存权重。默认并发取 CPU 和内存估算的较小值：
-`min(floor(CPU配额/5), floor((内存GiB-5)/SR_LINK_MEM_GB))`，最后限制在 1..8。
-`SR_LINK_MEM_GB` 默认 15，来自历史最坏链接的采样；这是估值，不是内存安全上界。
-预算连一条都放不下时仍会串行执行并告警，需要结合实际内存压力调整。
-闸门只是内存保护，任何一步不顺（没有 flock、槽目录建不了、槽文件打不开）都直接放行并在 stderr 说明，不让它成为构建失败的新原因。
-上游没有任何 JOB_POOL，链接并发等于编译并发，而链接不经 icecc：ASAN 单测上百个 ld.lld 各 2~4G，实测 `-j80` 时 35 个同时跑撞上限被杀，
-`-j8` 时 8 个也把 24G 容器顶在 memory.max 上反复回收、进度停在 thrift 检查之后不动。`SR_LINK_JOBS` 可覆盖默认并发。
-
-`SR_LOCAL_JOBS`、`SR_FE_UT_JOBS`、`SR_LINK_JOBS`、`SR_LINK_MEM_GB` 的优先级是：非空环境变量 > `srdev.conf` > 默认值。
-例如 `SR_LOCAL_JOBS=6 SR_LINK_JOBS=1 sr -v main be-ut --dist off` 只调整本次构建，不修改站点配置，也不需要重建容器。
-未传或传空值时沿用配置。常驻 iceccd 的槽位不会随单次覆盖改变；分布式构建的本机执行上限仍受该 daemon 影响。
-共享链接闸门也不会中断已经运行的链接任务；临时调低只约束采用该值的构建，不能限制其他并发构建。
-
-## FE 单测
-
-`sr fe-ut` 驱动上游 `run-fe-ut.sh`，纯 maven，农场和 ccache 都不参与（所以头部也不再打 ccache 那几行，
-也不会为它启动 OSS 代理）。仍然走容器，为的是同一套 JDK 21 / maven 3.8.7 / 共享 `~/.m2`，
-以及和编译共用同一把源码树锁——同一棵树不会一边编一边跑测试。日志和 `sr history` 一并记，模式列写 `FEUT`。
+### BE Unit Tests (`sr be-ut`)
+`sr be-ut` drives upstream `run-be-ut.sh` in two phases: first compiling with `--dry-run` (using `ccache` + `icecc` + digest-mounted `thirdparty`), then running tests while letting the compile farm idle-suspend normally:
 
 ```bash
-sr fe-ut                                       # 全部
-sr fe-ut --test com.starrocks.utframe.Demo     # 单个类
-sr fe-ut --filter com.starrocks.X#Test0        # 跳过某些
-sr fe-ut --dry-run                             # 只准备环境不跑
+sr be-ut --test CompactionUtilsTest
+sr be-ut --gtest_filter 'Tablet*:Rowset*'
+sr be-ut --module storage --no-run        # Compile only
 ```
 
-并发由 `SR_FE_UT_JOBS` 控制，未配置时跟随 `SR_LOCAL_JOBS`，后者默认取容器 CPU 配额。
-它控制 Maven reactor 的 `-T`，实际测试 JVM 数还受 surefire fork 配置影响，内存紧张时单独调低。
-用户级 `-j` 已移除，BE 和 FE 均通过配置或上述环境变量调整。
+- **Dynamic `.so` + PCH by default**: Builds into `be/nj-dyn/ut_build_ASAN` (`3.36×` faster linking, `1/5` memory) and re-attaches PCH via `files/dynlib-compat.cmake`. Pass `--no-dynlib` for static linking (`be/nj/ut_build_ASAN`) or `--no-dynlib-pch` (`SR_DYNLIB_PCH=0`) to fall back to `-include vector`.
+- **Idempotent debug-symbol splitting**: Upstream `run-be-ut.sh` unconditionally runs `objcopy` on `starrocks_test`, which can clobber `.debuginfo` when the binary was not relinked. `sr-build` disables upstream splitting and splits symbols on a temporary copy only when `.gnu_debuglink` is absent.
+- **Upstream `--clean` note**: `run-be-ut.sh --clean` also removes `be/output/`.
 
-## lldb 调试（VSCode / 命令行，都在容器里）
+### Two-Tier Linker Gate & Per-Invocation Overrides
+Linker jobs run locally and can consume up to ~`14.7 GB` anon memory per ASAN target (`starrocks_dw_test`). `srdev` enforces both per-Ninja `CMAKE_JOB_POOL_LINK` and container-wide `files/linkgate`, defaulting to:
 
-进程只能在编译容器里跑（链的是容器里的 gcc-toolset-14 运行库和按 digest 挂进去的 thirdparty），所以 lldb 也必须进容器：
-`files/lldb-host` 与 clangd-host 同一套路，从 cwd 上溯找源码树、挂好同一份 thirdparty，再起 `lldb-dap-20`（VSCode）或 `lldb-20`（命令行）。
-镜像通过 [LLVM 官方软件源](https://apt.llvm.org/) 安装 LLDB 20；`sr image` 固化版本，宿主入口仍为 `~/bin/lldb-dap` / `~/bin/lldb`。
-它绝不往 stdout 写东西——那条管道就是 DAP 协议。
+```text
+min(floor(CPU_quota / 5), floor((Mem_GiB - 5) / SR_LINK_MEM_GB))   # clamped to 1..8, SR_LINK_MEM_GB=15
+```
+
+Concurrency knobs follow **`non-empty env var > srdev.conf > default`** without editing config files or restarting containers:
 
 ```bash
-ln -sf ~/srdev/files/lldb-host ~/bin/lldb-dap   # VSCode 的 lldb-dap 扩展（llvm-vs-code-extensions.lldb-dap）用这个
-ln -sf ~/srdev/files/lldb-host ~/bin/lldb       # 命令行：cd 源码树; ~/bin/lldb -- be/nj-dyn/ut_build_ASAN/test/exec/xxx_test --gtest_filter=...
+SR_LOCAL_JOBS=6 SR_LINK_JOBS=1 sr -v main be-ut --dist off
+SR_FE_UT_JOBS=4 sr fe-ut --test com.starrocks.utframe.Demo
 ```
 
-`sr deploy` 部署后自动创建或补齐当前源码树的 `.vscode/launch.json`。
-部署 BE 时建立宿主用户的 `~/bin/lldb-dap` 软链接和 LLDB 附加配置；部署 FE 时启用 JDWP 并生成 Java 附加配置。
-`--be-only` / `--fe-only` 只处理对应组件；被跳过的组件保持原状态。部署命令不提供 `--debug` / `--release` 开关，也不改变 `sr build` 的编译类型。
-VS Code Remote SSH 中安装 `llvm-vs-code-extensions.lldb-dap` 扩展，打开该 worktree，选择「附加到 sr deploy 起的 starrocks_be（lldb）」即可。
-配置使用 `"debugAdapterExecutable": "${env:HOME}/bin/lldb-dap"`，由 VS Code 按远端用户展开，其他用户无需替换绝对路径；不需要额外写 `settings.json`。
-源码映射使用 `${workspaceFolder}`，目标路径跟随 `SR_DEPLOY_DIR`（默认 `/farm/deploy`）。宿主机需要 Python 3，生成器只使用标准库。
-已有 JSONC 注释和其他配置保留；同名 BE 配置仅更新适配器和部署产物路径，同名 FE 配置仅更新连接地址和端口，其他自定义字段保留。重复部署不会重复添加。
-`--no-start` 也会生成配置；`--status`、`--stop`、帮助和失败的部署不生成。没有对应产物而被跳过的组件不生成。
-已有文件解析失败或 `~/bin/lldb-dap` 被其他程序占用时会提示，不覆盖原文件。
+### FE Builds & Unit Tests (`sr build --fe` / `sr fe-ut`)
+Pure FE workflows run Maven inside the container (JDK 21, Maven 3.8.7, shared `~/.m2`) under the worktree lock without touching BE `thirdparty`, `ccache`, or the `icecc` farm. `sr-build` summarizes per-module Reactor timings and exact `javac` recompiled module counts.
 
-### FE Java 调试
+---
 
-FE JVM 使用 `-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=127.0.0.1:<端口>`。
-端口默认部署端口基址 +8，可在 srdev.conf 中设 `SR_FE_DEBUG_PORT`；生成的 launch.json 读取实际部署端口。
-启动前检查端口占用，发生冲突时在停止现有 FE 之前报错。容器使用 host 网络，VS Code Remote SSH 直接连接开发机的回环地址。
-远端安装 `vscjava.vscode-java-debug`（及其 Java 语言支持依赖）并导入当前工作区的 FE Maven 项目，然后选择「附加到 sr deploy 起的 FE（Java）」。
+## Local Cluster Deployment & Packaging
 
-工具按同机开发者互相信任来设计，允许其他本机用户连接容器中的服务和调试端口。各用户有自己的容器、部署目录和端口；部署锁与端口避让负责避免相互干扰。FE 调试仍监听 `127.0.0.1`，VS Code Remote SSH 可直接连接，同机其他用户也可连接；sr 不按 UID 限制访问，不管理宿主机防火墙，也无需配置访问模式。
-默认 `projectName` 为 `fe-core`；已有配置中自行设置的项目名保留。
-
-`suspend=n` 保证启动时不等待调试器，但启用调试 agent 仍可能影响运行性能，断点和单步会改变线程执行；本工具没有对 FE 的性能影响给出百分比保证。
-部署脚本会同时处理旧分支的 `JAVA_OPTS_FOR_JDK_*`，替换旧 JDWP 参数，避免重复加载 agent；BE 的 JVM 参数不加 JDWP。
-
-### BE LLDB 调试
-
-- **附加到 `sr deploy` 起的 BE**：`"request": "attach", "program": "/farm/deploy/be/lib/starrocks_be", "waitFor": false`——按进程名附加
-  （容器里只有一个 starrocks_be 时才唯一；也可用数字 `pid` 精确指定进程）。附加期间 BE 暂停，
-  FE 心跳会超时，别挂太久。调试符号在旁边的 `starrocks_be.debuginfo`（`.gnu_debuglink`），lldb 自动找到。
-- **BE 单测**（.so 树的二进制没有 RPATH）：适配器进程里给 `debugAdapterEnv.SR_UT_TREE` 指定构建树，`lldb-dap-env` 会把
-  run-be-ut.sh 同款的 LD_LIBRARY_PATH 写成 `<构建树>/.sr-lldb-env`，launch 配置用 `initCommands: ["command source <构建树>/.sr-lldb-env"]`
-  只交给被调试进程。**调试器自己不能沾这份路径**：此前 LLDB 18 曾误载 SR 自带的同名 libLLVM，
-  报 `undefined symbol: LLVMInitializeAArch64TargetInfo`，因此升级后仍保留运行库隔离。ASAN 二进制加 `"disableASLR": false`。
-  调试入口默认加 `ASAN_OPTIONS=...:detect_leaks=0`，因为 LSan 不支持 ptrace，测试通过后仍会报 fatal error；
-  普通 `sr be-ut` 的泄漏检查不受影响。若自行设置 `ASAN_OPTIONS`，也需带上 `detect_leaks=0`。
-  LLDB 20 已用动态链接的 `types_test` 验证源码断点、单步、局部变量、`p t` 和正常退出；DAP 附加到临时进程也通过。
-
-## clangd
-
-每次 BE 或单测构建完，`sr` 会在源码树根建一个指向本次构建树的 `compile_commands.json` 软链接：
-
-```
-compile_commands.json -> be/nj/build_Release/compile_commands.json
-```
-
-这样 clangd 永远在项目根找到它，不必因为切构建类型去改配置。语义是"最后编的那棵树赢"，
-所以 `sr build --be-ut` 之后它指向 `ut_build_ASAN`，编辑测试代码时补全和跳转也是对的。
-目标写成相对路径，源码树整个搬走仍然有效。这个文件名上游 `.gitignore` 里已经有了，不污染 `git status`。
-
-根目录若已存在一个**真实文件**（不是软链接），`sr` 不会动它，只提示一句。要彻底关掉：`srdev.conf` 里设 `SR_CC_LINK=0`。
-
-不想为了 clangd 编一整轮的话，用 `sr compdb`：
+### Per-User Single-Node Cluster (`sr deploy`)
 
 ```bash
-sr compdb            # 只生成 compile_commands.json，实测 14 秒（新克隆、从没编译过的树也是这个数）
-sr compdb --asan     # 要 ASAN 的编译参数
+sr deploy                  # Stop existing personal cluster, swap binaries from current output/, keep meta/storage
+sr deploy --be-only        # Replace BE only; leave FE untouched
+sr deploy --clean-data     # Wipe FE meta & BE storage before starting
+sr deploy --status         # Show source commit, PIDs, ports, JDWP endpoint, and MySQL command
+sr deploy --stop
 ```
 
-它走 `build.sh --configure-only`，只做 cmake configure，再跑一遍 thrift/proto 代码生成
-（否则 `gen_cpp/*.h` 不存在，clangd 会满屏报找不到头文件），然后把根目录软链接指过去。
+- Each user gets an isolated deployment in `~/farm/deploy` (`/farm/deploy` in-container).
+- New deployments pick a 10-port block starting at `24000 + (uid % 300) * 20` (`+0..3` FE, `+4..7` BE, `+8` FE JDWP, `+9` starlet), coordinated across users via an abstract Unix socket lock (`files/sr-deploy-lock.py`) and persisted once activated so existing metadata never breaks BE identity.
+- Automatically registers BE into FE via `ALTER SYSTEM ADD BACKEND` and caps FE/BE JVM heaps at `2g` by default (`--fe-heap` / `--be-heap`).
 
-**用的是独立构建树 `be/nj-compdb/`（约 32M），不碰真实产物。** 这一点不能省：`--configure-only` 会强制
-`WITH_PCH=OFF` 并写进 CMakeCache，在真实构建树里跑一次，下次编译所有 TU 的命令行都变了，
-等于全量重编加 ccache 全 miss。顺带一个好处是生成的数据库里没有 PCH 相关标志，clangd 更干净。
+### Release-Compatible Artifact Packaging (`sr pack`)
 
-只覆盖 BE 主程序的源码（`MAKE_TEST=OFF`）。要让 clangd 认识 `be/test/` 下的测试代码，
-跑一次 `sr build --be-ut`，它的 `compile_commands.json` 包含测试文件。
+```bash
+sr pack                    # Create ~/pkg/<tree>-<short-sha>[-dirty].tar.gz matching official daily-build layout
+sr pack --name custom-pkg  # Override archive and top-level directory name
+sr pack --upload           # Validate bucket/prefix/collisions up front, compress with pigz, and upload to OSS
+```
 
-### clangd 必须跑在容器里
+---
 
-`compile_commands.json` 里的编译器是 `/opt/gcc-toolset-14/bin/g++`，头文件路径里有 `/var/local/thirdparty/installed/...`。
-宿主机上前者根本不存在，`--query-driver` 问不出系统头路径，clangd 只能退回用发行版自带的 clang 头文件。
-更隐蔽的是**容器默认命名空间里 `/var/local/thirdparty/installed` 也是空的**——真正的依赖是每次编译时按 digest
-bind 进去的。所以 clangd 必须和编译用同一套挂载。
+## Containerized IDE & Debugging (`clangd 20`, `LLDB 20`, Java JDWP)
 
-`files/clangd-host` 就是干这个的：从当前目录上溯找到源码树，读出这棵树钉住的依赖 digest，
-然后 `docker exec -i` 进容器、在私有挂载命名空间里把依赖挂好再起 clangd。它绝不往 stdout 写任何东西，
-因为那条管道就是 LSP 协议本身。
+### Instant `clangd` Setup (`sr compdb` + `sr ide`)
 
 ```bash
 cd /path/to/worktree
-sr ide  # 自动安装 ~/bin/clangd，并向本 worktree 的 .vscode/settings.json 补齐当前用户的路径
+sr compdb                  # ~14s: cmake --configure-only + Thrift/Proto codegen in isolated be/nj-compdb/
+sr ide                     # Install ~/bin/clangd wrapper and merge clangd.path into .vscode/settings.json
 ```
 
-`sr deploy` 也会完成这一步。已有自定义 clangd.path 和其他设置会保留；配置采用 JSONC 合并，注释也会保留。远端需要安装 `llvm-vs-code-extensions.vscode-clangd` 扩展。
-容器中的 clangd 使用 20.1.x，避免 clangd 18 在某些 C++ 泛型 lambda 上的崩溃。VS Code 因连续崩溃停止自动重启后，执行命令 `clangd: Restart language server`。
+- **Why an isolated `be/nj-compdb/` tree?** Upstream `--configure-only` writes `WITH_PCH=OFF` into `CMakeCache.txt`; running it in your real build tree would invalidate every TU and cause 100% `ccache` misses on the next build.
+- **Accurate multi-version header jumps**: While real builds bind-mount `thirdparty` to `/var/local/thirdparty`, `sr compdb` points `STARROCKS_THIRDPARTY` directly at `$SR_TPDIR/<digest>`—a path identical on both host and container—so VS Code **Go to Definition** opens the exact header version pinned by each worktree.
+- Every BE / BE-UT build also updates a relative `compile_commands.json` symlink at the worktree root ("last built tree wins"; disable with `SR_CC_LINK=0`).
 
-VSCode 侧：
+### One-Click FE (Java JDWP) & BE (`LLDB 20`) Debugging
+`sr deploy` automatically merges attach configurations into `.vscode/launch.json` (preserving comments and custom entries):
 
-```jsonc
-// clangd.path 由 sr ide 自动生成当前用户的绝对路径
-"clangd.arguments": [
-  "--compile-commands-dir=${workspaceRoot}",
-  "--query-driver=/opt/gcc*/bin/*",   // 一个 glob 覆盖镜像里全部四个 gcc（11/12/13/14）
-  "--background-index", "--clang-tidy", "--header-insertion=never",
-  "--all-scopes-completion", "--completion-style=detailed",
-  "--j=8"                             // 容器是 16 核，开 32 个索引线程只会互相挤
-]
-```
+- **FE Java Attach**: Enables `-agentlib:jdwp=...,server=y,suspend=n,address=127.0.0.1:<port>` on FE (never on BE's embedded JNI JVM) for VS Code's *Debugger for Java*.
+- **BE `starrocks_be` & Dynamic Unit-Test Debugging**: Installs `~/bin/lldb-dap` and `~/bin/lldb` (`files/lldb-host`), which enter the container with matching `thirdparty` mounts and invoke LLVM 20's `lldb-dap-20` / `lldb-20` from [apt.llvm.org](https://apt.llvm.org/). For `.so` unit tests without `RPATH`, `files/lldb-dap-env` writes `LD_LIBRARY_PATH` into `<ut_tree>/.sr-lldb-env` via `target.env-vars` so the debuggee finds StarRocks `.so` libraries **without** polluting `lldb-dap` with StarRocks's bundled `libLLVM`, and sets `detect_leaks=0` because LSan is incompatible with `ptrace`.
 
-### 多版本并行开发
+---
 
-每棵源码树各自钉一个依赖 digest，`clangd-host` 从当前目录上溯找到树、读出它的 digest，所以**每个 VSCode 窗口拿到的是各自那套依赖**。
-示例（digest 为占位值）：`starrocks@branch-3.5.20` 解析到 `aaaaaaaa`（gcc11），`sample-worktree` 解析到 `bbbbbbbb`（gcc14），互不串。
+## Elastic Compile Farm & Shared OSS Cache
 
-跳转到第三方头文件要额外一层保证。clangd 把跳转解析成 `compile_commands.json` 里那个绝对路径，而 **VSCode 是在宿主机上打开它的**。
-真实编译用的是 bind 到固定路径 `/var/local/thirdparty`——宿主机上那个位置只有一份共用的旧拷贝，两棵树会跳到同一份，
-而且和各自钉住的依赖对不上（实测 gcc14 那份多出一整棵 `benchgen/` 头文件树，宿主机那份没有）。
+### Farm Lifecycle (`sr farm`)
 
-所以 `sr compdb` 不做 bind，直接把 `STARROCKS_THIRDPARTY` 指向依赖在**宿主机上的真实路径** `$SR_TPDIR/<digest>`，
-容器也按同名路径多挂一份，于是那条路径在容器内外指的是同一个东西，跳转落到各自版本的头文件上。
-真实编译仍走 bind，因为 CMakeCache 会把首次 configure 的绝对路径缓存死，那条路径必须恒定、不能跟着 digest 变。
+| Command | Purpose |
+|---|---|
+| `sr farm init` | Check port collisions, provision worker VMs, install `iceccd`, start watchdog, and warm workers |
+| `sr farm status` / `usage [--watch 5]` | Inspect cloud state, lease expiry, scheduler slots, per-node load/RAM/`cc1plus`, and container cgroups |
+| `sr farm resume` / `suspend` | Manually wake (~29s) or suspend worker VMs |
+| `sr farm rebalance` | Restart `icecc-scheduler` and pre-warm workers so zero-score hosts receive jobs |
+| `sr farm down` | Release cloud VMs (verified via 3-state `exists` check) and stop the watchdog |
 
-这意味着：**给 clangd 用的数据库要用 `sr compdb` 生成**（14 秒）。跑过 `sr build --be` 之后根目录软链接会指向真实构建树，
-那份数据库里的第三方路径只在容器内成立；想恢复精确跳转，再跑一次 `sr compdb` 即可。
+- **UID-isolated ports**: Scheduler (`18700 + 2*(uid%250)` and `+1`), local `iceccd` (`19700 + uid%500`), and OSS proxy (`20700 + uid%500`) isolate users on shared hosts, with explicit `SPORT` / `DPORT` / `SR_CCACHE_PROXY_PORT` overrides if modulo collisions occur.
+- **Starvation self-healing**: `icecc-scheduler` stops trying uncalibrated hosts (`speed=0`) once other workers have stats (e.g., after daemon restarts). Both `rebalance` and the periodic watchdog (`warm_if_starving`) send a synthetic compile job to any `speed=0` worker so all nodes stay active.
 
-实测对比同一个文件：宿主机那份 clangd 的 stderr 里是
-`driver execution failed - '/opt/gcc-toolset-14/bin/g++' doesn't exist`，并且会报一条
-"protoc 版本比生成代码新"的假警告（它读到的是宿主机上一份过期的 thirdparty）；走容器之后这条假警告消失。
+### Shared Remote `ccache` on OSS
+Set `SR_CCACHE_REMOTE_BUCKET` in `srdev.conf` (using credentials in `~/.ossutilconfig`). `sr-build` launches `files/oss-ccache-proxy.py` on loopback, verifies PID-namespace ownership and config SHA-256 before sending the per-user Bearer token, and enables read-through/write-back caching across worktrees and users:
 
-## 打包产物
-
-`sr pack` 把当前源码树的 `output/` 打成与官方日构建同构的 tar.gz：包名与包内顶层目录同名，都是 `<树名>-<短sha>[-dirty]`，
-里面就是 `be/`、`fe/`（构建时带上的话还有 `apache_hdfs_broker/`）和 `LICENSE.txt`/`NOTICE.txt`，不额外塞任何东西。
-树里有未提交改动时包名会带 `-dirty`——官方包都来自干净的 CI 构建，拿一个带未提交改动的包去部署而不自知很难查。
-
-```bash
-sr pack                      # 只打包，落在 ~/pkg（或 SR_PKG_DIR）
-sr pack --upload             # 打完传到 srdev.conf 里配的 SR_PKG_BUCKET/SR_PKG_PREFIX
-sr pack --name my-build-1    # 自定义包名（同时决定包内顶层目录名）
-```
-
-上传必须显式加 `--upload`：往共享桶里推 4G+ 的对象是对外动作。桶名与前缀是站点信息，只从不入库的 `srdev.conf` 读
-（`SR_PKG_BUCKET` + `SR_PKG_PREFIX`，前缀要以 `/` 结尾），目标就是 `oss://<桶>/<前缀><包名>.tar.gz`；凭据同样只用各人自己的
-`~/.ossutilconfig`。没配桶、前缀格式不对、远端已有同名对象（需 `--force`）这几项都在压缩**之前**查完——压四分钟再报错没意义。
-压缩走 `pigz`（默认 16 线程、级别 6），6G 产物压出来约 4.4G。
-
-## 农场
-
-- scheduler 跑在客户端容器里（实测 3.2MB / 0.5% CPU，纯中介，源码和产物 client↔worker 直连），申请到的机器全部当 worker。
-- 端口与 netname 按 uid 推导，共享机上每个用户一套互不串台；容器 `--network host --init --privileged`，cgroup slice 限额。
-  取模不是绝对隔离：`SPORT=18700+2*(uid%250)`、`DPORT=19700+uid%500`、代理 `20700+uid%500`，uid 相差 250/500 的两个人会撞。
-  `sr farm init` 会在申请机器之前检出撞车并要求在 `srdev.conf` 里显式设 `SPORT`/`DPORT`/`SR_CCACHE_PROXY_PORT` 错开。
-- 续约是**死人开关**：看门狗每 15 分钟把到期时间重置为 3 小时后；容器一死，续约停止，农场自我了断。闲置 15 分钟休眠，`resume` 约 29 秒。
-- 编译不等唤醒：按满并发直接开工，后台轮询累计 ccache miss，攒够 8 次才叫醒农场（全命中的编译不吵醒它）。
-- `resume` 后实测 worker 连接数，不够就重新下发配置，仍不够标 `degraded`，`sr build` 拒绝开工而不是静默全落本地把容器 OOM 掉。
-- 远端任何故障都是软降级（icecc 回退本地）；真正致命的是本机 iceccd 静默失效，因此 `sr-build` 开工前会读 `/proc/<pid>/stat` 排除僵尸。
-- `sr farm usage` 里某台 worker `speed=0` 且从不接任务：icecc scheduler 有了其它主机的统计后不再尝试没统计的主机（env 缓存空的节点会一直饿着）。`sr farm rebalance` 重启 scheduler 让统计清零即可，实测修好过一台 5 天零任务的 worker。
-
-## 多用户
-
-每个用户一个容器 `<user>_farm`、一个 cgroup slice、一套端口；ccache 在各自 `~/ccache`（同一目录内 Debug/Release/ASAN 互不干扰）；
-thirdparty 走公共目录全机共享；`~/farm/builds.tsv` 与 `~/farm/logs/` 记录每次编译。
-
-## ccache 远端上 OSS
-
-ccache 4.x 的远端只有 http / redis / file。`files/oss-ccache-proxy.py` 在容器里监听，把 ccache 的 GET/HEAD/PUT/DELETE 转成 OSS V1 签名请求，
-凭据只从各人自己的 `~/.ossutilconfig` 读。`srdev.conf` 里配上桶名即启用，`sr build` 自动起代理、自动接上：
-
-```
-SR_CCACHE_REMOTE_BUCKET=<桶名>
-SR_CCACHE_REMOTE_PREFIX=ccache/
-```
-
-两级读穿：本地命中不走网，本地 miss 才查远端并回填本地。缓存 key 与目录无关（以源码树根为 `CCACHE_BASEDIR`、`hash_dir=false`），
-同一份代码放在谁的哪个目录都命中同一批对象。实测 main Debug 全量（5 worker 农场）：
-
-| 场景 | 用时 | 命中 |
+| Scenario (`main` Debug full build, 5-worker farm) | Wall Time | Cache Hit Rate |
 |---|---|---|
-| 空本地 + 空远端（真编 + 上传 3.2 GB / 3244 对象） | 11m40s | 0 |
-| **空本地 + 已填充远端**（新人 / 新机器首次编） | **1m51s** | 远端 97% |
-| 本地全命中（对照） | 1m32s | 本地 99.9% |
+| Empty local + empty remote (full compile + upload `3.2 GB` / `3244` objects) | `11m 40s` | `0%` |
+| **Empty local + populated remote** (new developer / fresh machine) | **`1m 51s`** | **`97%` remote** |
+| Warm local SSD cache (reference) | `1m 32s` | `99.9%` local |
 
-远端命中比本地只慢约 20 秒。能跨机共享的前提是 PCH 走 `.sum` 哈希（见 `files/ccache-pch`），否则用了 PCH 的 TU 一个也命中不了。
+### Swapping the Cloud Provider (`files/tspapi.py`)
+`files/tspapi.py` is the **only** cloud-platform-specific file. Re-implement its 7 subcommands (`create`, `cid`, `nodes`, `spec`, `row`, `op`, `exists`) to target AWS EC2, Alibaba Cloud ECS, Kubernetes, or static SSH hosts.
 
-## 换掉云平台
+> **Critical contract for `exists`**: `sr farm down` relies on a **3-state exit code**—`0` (exists), `1` (confirmed absent), `2` (query/auth/network failure, **including unknown subcommands**). Returning `1` on an unknown subcommand or transient error would trick `sr farm down` into deleting local state and stopping lease cleanup while cloud instances keep billing.
 
-`files/tspapi.py` 是唯一和平台耦合的地方。`sr-farm` 用它的 **七个**子命令：`create / cid / nodes / spec / row / op / exists`
-（申请、查 id、查节点 IP、查规格、查到期时间、续约启停释放、判存在）。按同样的输出格式重写即可接别的平台。
+---
 
-`exists` 最容易被漏掉，而漏掉的后果是真金白银：`sr farm down` 先用它判断集群还在不在，**退出码有三态**——
-`0`=存在（同时把状态打到 stdout）、`1`=确认不存在、`2`=查询失败。只实现前六个的话，新客户端遇到 `exists` 会按
-"未知命令"返回 1，`down` 就把它当成"平台上已经没有了"，直接删本地记录、停看门狗，**根本不发释放请求**，
-而用户看到的是"已释放"——集群还在平台上继续计费。所以：未知命令必须返回 2（查询失败），不能返回 1。
+## Security & Git Hygiene
 
-## 不要提交的东西
-
-`srdev.conf`、`registries.conf` 及其备份、`~/.tsp/`、`~/.ossutilconfig`、`~/farm/`（含 ssh 私钥与状态）。
-站点配置以 Shell 代码加载；只编辑可信配置，不要把实际值复制到示例、日志报告或 skill 中。
-源码、分支名、提交信息及共享产物中不得包含客户信息；示例统一使用匿名数据。
+Never commit site configuration, credentials, runtime state, or customer/production identifiers:
+- Ignored local files: `srdev.conf`, `registries.conf` (and backups), `~/.tsp/`, `~/.ossutilconfig`, `~/farm/` (SSH keys, tokens, logs, deployments).
+- `srdev.conf` is sourced as shell code—edit only trusted local files and keep examples strictly anonymous.
