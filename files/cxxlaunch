@@ -1,10 +1,11 @@
 #!/bin/bash
-# CMAKE_CXX_COMPILER_LAUNCHER（--no-ccache 时用它代替 ccache-pch）。USE_ICECC=1 时把编译外发给 icecc 农场。
+# CMAKE_CXX_COMPILER_LAUNCHER used instead of ccache-pch with --no-ccache.
+# USE_ICECC=1 sends compilations to the icecc farm.
 #
-# 生成 PCH 前必须删掉同名 .sum：ccache-pch 开了 pch_external_checksum，ccache 是按 <gch>.sum 而不是 .gch 字节来判
-# PCH 是否变化的。本 launcher 不写 .sum，若它重建了 .gch 却留着旧 .sum，之后再切回 ccache 就会拿旧校验和当新 PCH 的
-# 身份，命中一批其实不该命中的 TU——属于"悄悄用错产物"，比编译失败危险得多（codex r13#7）。
-# 删不掉就直接失败：继续编下去等于明知会留下错误的 .sum（codex r14#7）。
+# Delete the matching .sum before regenerating PCH. With pch_external_checksum,
+# ccache identifies PCH by <gch>.sum rather than .gch bytes. This launcher does not
+# write checksums; retaining an old one could silently reuse invalid objects when
+# ccache is enabled again. Abort if removal fails.
 out=""; prev=""
 for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
 case " $* " in

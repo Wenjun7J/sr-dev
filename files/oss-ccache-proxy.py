@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""ccache http-storage -> 阿里云 OSS 的本地签名代理。
+"""Local signing proxy from ccache HTTP storage to Alibaba Cloud OSS.
 
-ccache 4.x 的远端后端只有 http / redis / file 三种，没有 S3/OSS。这个代理监听本机端口，
-把 ccache 发来的 GET/HEAD/PUT/DELETE 原样转成带 OSS V1 签名的请求，ccache 无感。
+ccache 4.x supports HTTP, Redis, and file storage, but no native S3/OSS backend.
+Translate GET/HEAD/PUT/DELETE requests into OSS V1-signed requests.
 
-用法:
-  oss-ccache-proxy.py --bucket <桶名> [--prefix ccache/] [--listen 127.0.0.1:8384]
+Usage:
+  oss-ccache-proxy.py --bucket <bucket> [--prefix ccache/] [--listen 127.0.0.1:8384]
                       [--config ~/.ossutilconfig] [--log FILE]
-ccache 侧:
-  CCACHE_REMOTE_STORAGE=http://127.0.0.1:8384/            # 读写
-  CCACHE_REMOTE_STORAGE=http://127.0.0.1:8384/|read-only   # 只读（普通用户）
+ccache configuration:
+  CCACHE_REMOTE_STORAGE=http://127.0.0.1:8384/            # Read/write.
+  CCACHE_REMOTE_STORAGE=http://127.0.0.1:8384/|read-only   # Read-only sharing.
 
-凭据只从 ossutil 的配置文件读取（accessKeyID / accessKeySecret / endpoint），不接受命令行传入，
-避免出现在 ps 和 shell 历史里。GET /_stats 返回运行计数（JSON）。
-"""
+Read accessKeyID, accessKeySecret, and endpoint only from ossutil configuration,
+never command-line arguments that could appear in process listings or shell history.
+GET /_stats returns JSON counters."""
 import argparse, base64, configparser, hashlib, hmac, http.client, json, os, sys, threading, time
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,14 +25,14 @@ def load_cfg(path):
     cp.read(os.path.expanduser(path))
     d = cp["default"]
     raw = d["endpoint"].strip().rstrip("/")
-    # review r7 存疑2：显式 https:// 必须遵守（原来一律剥成 HTTP）；无协议保持 http，兼容现网内网端点
+    # Honor explicit https:// endpoints; preserve HTTP for endpoints without a scheme.
     scheme = "https" if raw.lower().startswith("https://") else "http"
     ep = raw.split("://", 1)[-1]
     return d["accessKeyID"].strip(), d["accessKeySecret"].strip(), ep, scheme
 
 
 class OSS:
-    """每线程复用一条到 OSS 的长连接；失败重连一次。"""
+    """Reuse one persistent OSS connection per thread; reconnect once on failure."""
 
     def __init__(self, ak, sk, endpoint, bucket, scheme="http"):
         self.ak, self.sk, self.host, self.bucket = ak, sk, f"{bucket}.{endpoint}", bucket
@@ -55,7 +55,7 @@ class OSS:
 
     def request(self, method, key, body=None, ctype=""):
         date = formatdate(usegmt=True)
-        # OSS V1 签名: VERB \n Content-MD5 \n Content-Type \n Date \n [x-oss-*] CanonicalizedResource
+        # OSS V1 signature: VERB \n Content-MD5 \n Content-Type \n Date \n [x-oss-*] CanonicalizedResource.
         sts = f"{method}\n\n{ctype}\n{date}\n/{self.bucket}/{key}"
         sig = base64.b64encode(hmac.new(self.sk.encode(), sts.encode(), hashlib.sha1).digest()).decode()
         hdrs = {"Date": date, "Authorization": f"OSS {self.ak}:{sig}"}
@@ -68,7 +68,7 @@ class OSS:
             try:
                 c.request(method, "/" + quote(key, safe="/"), body=body, headers=hdrs)
                 r = c.getresponse()
-                data = r.read()  # 非 GET 也要读完，连接才能复用
+                data = r.read()  # Consume non-GET responses too so the connection can be reused.
                 return r.status, data
             except (http.client.HTTPException, OSError):
                 self._drop()
@@ -88,38 +88,38 @@ def bump(method, ok, nbytes, ms):
         s["ms"] += ms
 
 
-# PUT body 上限。ccache 的对象最大是 PCH 结果，实测约 100MB 量级；256MB 留足余量又不至于让
-# 未授权/畸形请求把容器内存吃光（codex r13#4）。
+# Limit PUT bodies to 256 MB. Typical large PCH cache objects are around 100 MB;
+# allow headroom without permitting malformed requests to exhaust container memory.
 MAX_BODY = 256 * 1024 * 1024
 
 
 class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"  # ccache 默认 keep-alive；Python 会自动应答 Expect: 100-continue
-    # 读超时：没有它，声明了大 Content-Length 却不发数据的连接会把线程永久占住（codex r13#4）。
-    # StreamRequestHandler.setup() 会把它设到 socket 上。
-    timeout = 30       # codex r15#10：每次 socket 读的上限。原来 120 秒，慢发送能长期占住线程；
-                       # 回环上 100MB 的 PUT 也远用不到 30 秒。
+    protocol_version = "HTTP/1.1"  # ccache uses keep-alive; Python handles Expect: 100-continue automatically.
+    # Bound reads so a client cannot reserve a thread forever by declaring a large
+    # Content-Length and withholding the body. StreamRequestHandler applies this to the socket.
+    timeout = 30       # Per-read timeout bounds thread occupancy by slow senders.
+                       # Even a 100 MB loopback PUT should fit comfortably within 30 seconds.
     oss = None
     prefix = ""
     logf = None
-    token = None   # review r7#4：每用户随机 Bearer 令牌；None 仅供无鉴权测试
+    token = None   # Random per-user Bearer token; None is reserved for unauthenticated tests.
 
     def _authed(self):
-        # review r7#4(P1)：容器 --network host，监听 127.0.0.1 挡不住本机其他用户；无鉴权时任何人都能用所有者凭据
-        # PUT 污染 / DELETE 清空共享缓存前缀。所有方法（含 GET、/_stats）都校验 Authorization: Bearer <token>。
+        # Host networking means loopback is accessible to other local users. Authenticate
+        # every method, including GET and /_stats, so another user cannot alter or delete
+        # shared cache objects using the owner's credentials.
         if self.token is None:
             return True
-        # 自查：== 是内容相关的短路比较，同机任何用户都能对着它反复打，理论上可按字节试探令牌。
-        # hmac.compare_digest 是常量时间的，代价为零，没有理由不用。
+        # Use a constant-time comparison to avoid exposing token bytes through timing differences.
         if hmac.compare_digest(self.headers.get("Authorization", ""), f"Bearer {self.token}"):
             return True
         self._reply(401, b"unauthorized\n")
         self._log(401, 0, 0.0)
         return False
 
-    # 自查：ccache 只会请求形如 /<两位>/<哈希> 的键，但这个端口同机谁都连得上。
-    # unquote 之后若含 ".." 或以 "/" 开头，拼出来的对象名就可能指向配置前缀之外——
-    # 这是拿所有者的 OSS 凭据去访问共享桶，护栏不该省。返回 None 表示拒绝。
+    # ccache requests keys shaped like /<two characters>/<hash>, but any local user
+    # can connect. Reject decoded paths containing '..' or starting with '/' to keep
+    # requests within the configured object prefix. None denotes rejection.
     def _key(self):
         raw = unquote(self.path.split("?", 1)[0]).lstrip("/")
         if not raw or raw.startswith("/") or "\\" in raw:
@@ -151,9 +151,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             st, data = self.oss.request(method, key, body, ctype)
-        except Exception as e:  # OSS 不可达：对 ccache 来说等同 miss，它会退回本地编译
-            # 自查：原来把 str(e) 回给客户端，会把内部 endpoint 和主机名泄给同机其他用户。
-            # 详情只写自己的日志，回给客户端的是一句无信息的 502。
+        except Exception as e:  # An unavailable OSS backend becomes a cache miss and falls back to local compilation.
+            # Keep endpoint and hostname details in the owner's log; return only a generic 502 to clients.
             self._reply(502, b"upstream error\n")
             bump(method, False, 0, (time.time() - t0) * 1000)
             self._log(502, 0, (time.time() - t0) * 1000)
@@ -196,9 +195,9 @@ class Handler(BaseHTTPRequestHandler):
         self._forward("HEAD")
 
     def do_PUT(self):
-        # 先鉴权再读 body：原来为了 keep-alive 不错位而先读完 body，等于让未授权的人按自报 Content-Length
-        # 把任意大小读进内存、或声明大长度后不发数据占住线程（codex r13#4）。
-        # 现在未授权一律 401 并关闭连接——连接关了就不存在"残留 body 被当成下一条请求"的问题。
+        # Authenticate before reading a request body. Otherwise an unauthorized client
+        # can consume memory or hold a thread through its declared Content-Length.
+        # Close rejected connections so unread body bytes cannot become another request.
         if not self._authed():
             self.close_connection = True
             return
@@ -211,7 +210,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         body = self.rfile.read(n) if n else b""
-        if len(body) != n:                      # 读不满说明连接中断，别把半截对象写进 OSS
+        if len(body) != n:                      # An incomplete read means the connection ended; never upload a partial object.
             self.close_connection = True
             return
         self._forward("PUT", body, "application/octet-stream")
@@ -221,15 +220,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._forward("DELETE")
 
-    def log_message(self, *a):  # 关掉默认的 stderr 访问日志，用 _log
+    def log_message(self, *a):  # Use _log instead of the default stderr access log.
         pass
 
 
 class BoundedHTTPServer(ThreadingHTTPServer):
-    """codex r15#10：ThreadingHTTPServer 在跑到 _authed() 之前就为每个连接开线程，而且没有上限。
-    同机用户建一堆连接、慢慢发（甚至不发）请求头，就能在鉴权之前把线程和内存吃光——
-    在这台常年内存吃紧、跑着 earlyoom 的共享机上，足以把代理或同容器的构建拖死。
-    这里在**开线程之前**卡住并发数，超出的连接直接关掉。"""
+    """Bound connection concurrency before creating request threads.
+    ThreadingHTTPServer creates threads before authentication, allowing slow or
+    silent clients to exhaust resources. Close excess connections immediately."""
 
     max_conns = 64
 
@@ -239,7 +237,7 @@ class BoundedHTTPServer(ThreadingHTTPServer):
 
     def process_request(self, request, client_address):
         if not self._slots.acquire(blocking=False):
-            self.close_request(request)      # 没拿到槽就没开线程，也就不需要 release
+            self.close_request(request)      # No acquired slot means no thread was started and no release is needed.
             return
         super().process_request(request, client_address)
 
@@ -274,7 +272,7 @@ def main():
     Handler.prefix = a.prefix
     Handler.logf = open(a.log, "a") if a.log else None
     host, port = a.listen.rsplit(":", 1)
-    # 默认 backlog 只有 5：-j56 的 ccache 同时连上来会丢 SYN，客户端 100ms connect-timeout 直接算 miss（实测 35/1640）
+    # The default backlog of 5 can drop bursts from parallel ccache clients, turning short connection timeouts into misses.
     BoundedHTTPServer.request_queue_size = 256
     BoundedHTTPServer.max_conns = max(1, a.max_conns)
     srv = BoundedHTTPServer((host, int(port)), Handler)

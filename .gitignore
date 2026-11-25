@@ -1,4 +1,4 @@
-# 站点配置：registry 地址、节点账号密码等，只在本机
+# Keep site-specific registry addresses and node credentials local.
 srdev.conf
 registries.conf
 srdev.conf.*

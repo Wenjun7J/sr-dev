@@ -9,8 +9,8 @@ import unittest
 
 SOURCE = (Path(__file__).resolve().parents[1] / 'sr').read_text()
 FUNCTIONS = (
-    SOURCE[SOURCE.index('sync_conf(){'):SOURCE.index('# "64g"')]
-    + SOURCE[SOURCE.index('check_mounts(){'):SOURCE.index('# 把某个官方镜像')]
+    SOURCE[SOURCE.index('sync_conf(){'):SOURCE.index('mem_bytes(){')]
+    + SOURCE[SOURCE.index('check_mounts(){'):SOURCE.index('ensure_tp(){')]
 )
 MOCKS = r'''
 running(){ return 0; }

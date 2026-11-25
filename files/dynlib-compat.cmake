@@ -1,26 +1,26 @@
-# sr-build 在 --dynlib（BE 单测的 .so 模式）下自动注入，经 -DCMAKE_PROJECT_INCLUDE 传入；不改源码树。
+# sr-build injects this through CMAKE_PROJECT_INCLUDE for BE unit tests in
+# --dynlib mode, without modifying the source tree.
 #
-# 为什么需要：上游 be/CMakeLists.txt 的 ADD_BE_LIB 只给 STATIC 分支挂了 StarRocksPCH，SHARED 分支漏了。
-# 于是 ENABLE_MULTI_DYNAMIC_LIBS=ON 时每个 TU 都不带 -include cmake_pch.hxx，那些"靠 PCH 间接可见"的
-# 标准库头全部失效。已知一例 be/src/storage_primitive/predicate_tree/predicate_tree_fwd.h 用 std::vector
-# 只 include <variant>：error: 'vector' in namespace 'std' does not name a template type
+# Upstream ADD_BE_LIB attaches StarRocksPCH to STATIC targets but omits SHARED
+# targets. With ENABLE_MULTI_DYNAMIC_LIBS=ON, transitive standard headers may
+# therefore disappear; predicate_tree_fwd.h, for example, uses std::vector while
+# including only <variant>.
 #
-# 两种补法，由 -DSR_DYNLIB_PCH 选（sr-build 传入；默认见 sr-build）：
-#   ON  —— 给 .so 模式的目标补上上游漏挂的 PCH（与 STATIC 模式同一份 starrocks_pch.h），顺带拿到 PCH 的编译加速。
-#   OFF —— 只强制包含缺失的 <vector>（-include vector），不预编译；最小干预，零额外产物。
-# 上游 WITH_PCH=OFF、或树里没有 starrocks_pch.h 时，无论选哪种都退回 -include vector。
+# SR_DYNLIB_PCH selects the fix: ON attaches the upstream starrocks_pch.h to shared
+# targets; OFF only forces -include vector, without generating additional files.
+# WITH_PCH=OFF or a missing PCH header always falls back to -include vector.
 #
-# 机制：CMAKE_PROJECT_INCLUDE 在 project() 末尾被 include，此时子目录都还没进；用 cmake_language(DEFER)
-# 预约一个递归函数在顶层目录处理完（所有 add_subdirectory 跑完）后执行，那时整棵目录树已建好，可以逐个
-# target_precompile_headers。不能直接 DEFER 到子目录（那时它还不存在，报 "may not be scheduled in directory"）。
-# -include vector 走 add_compile_options：它写目录属性，be/CMakeLists.txt 随后 SET(CMAKE_CXX_FLAGS ...) 整个
-# 覆写编译标志也冲不掉（最小工程实测）。SHELL: 保持分组不被 CMake 去重拆散（codex）。
+# CMAKE_PROJECT_INCLUDE runs before subdirectories exist. Defer the recursive
+# walk until top-level configuration finishes, then attach PCH to existing targets.
+# Deferring directly into a not-yet-created subdirectory is invalid.
+# Use add_compile_options so later CMAKE_CXX_FLAGS assignments cannot erase the
+# forced include; SHELL: keeps its arguments grouped during CMake deduplication.
 
 option(SR_DYNLIB_PCH "sr: .so 模式下给目标补挂 PCH（OFF 则只 -include vector）" OFF)
 
-# CMAKE_PROJECT_INCLUDE 在【每次】project() 之后都会被 include，这棵树有两处 project()（顶层 + 一个子工程），
-# 不设防就会预约两次 DEFER（实测：先在子工程结束时挂 15 个、再在顶层结束挂 109 个，结果对但重复跑）、
-# -include vector 也加两遍。只认第一次——它总是顶层的 project()，DEFER 到顶层结束正是我们要的时机。
+# CMAKE_PROJECT_INCLUDE runs after every project(), including nested projects.
+# Register the deferred walk and forced include only once, from the top-level
+# project, to avoid duplicate execution and repeated options.
 get_property(_sr_dynlib_done GLOBAL PROPERTY SR_DYNLIB_COMPAT_DONE)
 if(_sr_dynlib_done)
   return()
@@ -43,14 +43,11 @@ if(NOT EXISTS "${_sr_pch}")
   return()
 endif()
 
-# 只挂在会真正编 C++ 的普通目标上；跳过：
-#   - 非 BE 编译目标（IMPORTED / INTERFACE / UTILITY 等，TYPE 不在白名单里）
-#   - 已经有自己 PCH 的（如上游给 ExecJoinCore 单独挂的 join_hash_map 那组），重复挂会让 .gch 内容变
-#   - 已经通过链接 StarRocksPCH 拿到 INTERFACE PCH 的（test/ 里的 starrocks_test_objs 等）
-#   - 显式 DISABLE_PRECOMPILE_HEADERS 的
-# 头只对 C++ 源生效：Gutil/mockjvm/Script 有 .c 源，不加语言限定 CMake 会为 C 也各生成一份 cmake_pch.h(.gch)。
-# 不至于编错（starrocks_pch.h 整体在 #ifdef __cplusplus 里，C 侧是空 PCH，上游 STATIC 模式也是这么过的），
-# 但那是 3 条纯浪费的边和 3 个空产物，限定 CXX 就没有。
+# Attach PCH only to ordinary targets that compile C++. Exclude imported, interface,
+# and utility targets; targets with their own PCH; targets inheriting PCH from
+# StarRocksPCH; and targets with DISABLE_PRECOMPILE_HEADERS.
+# Restrict headers to CXX: mixed-language targets otherwise create unused empty
+# C PCH files because starrocks_pch.h is guarded by __cplusplus.
 function(_sr_attach_pch_walk d)
   get_property(_tgts DIRECTORY "${d}" PROPERTY BUILDSYSTEM_TARGETS)
   foreach(t IN LISTS _tgts)
@@ -66,7 +63,7 @@ function(_sr_attach_pch_walk d)
       continue()
     endif()
     target_precompile_headers(${t} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${_sr_pch}>")
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")   # 与上游 StarRocksPCH 同款：让 ccache 能命中 clang 的 PCH
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")   # Match upstream StarRocksPCH so ccache can reuse Clang PCH files.
       target_compile_options(${t} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-Xclang -fno-pch-timestamp>")
     endif()
     math(EXPR _n "${_n} + 1")
@@ -79,7 +76,7 @@ function(_sr_attach_pch_walk d)
 endfunction()
 
 function(_sr_attach_pch_all)
-  # 上游开关：WITH_PCH=OFF 表示这棵树整体不要 PCH，不能违背它；此时只补缺失头
+  # Respect upstream WITH_PCH=OFF; in that case only supply the missing header.
   if(DEFINED WITH_PCH AND NOT WITH_PCH)
     _sr_dynlib_include_vector("上游 WITH_PCH=OFF")
     return()

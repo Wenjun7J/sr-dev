@@ -1,44 +1,48 @@
 #!/bin/bash
-# ccache-pch —— CMAKE_CXX_COMPILER_LAUNCHER。普通 TU 原样交给 ccache；编 PCH（-x c++-header / -x c-header）时
-# 多做两件事：PCH 本体直接用编译器生成（不经 ccache，见下），并生成 <gch>.sum 配合 pch_external_checksum=true 让 ccache 哈希 .sum 而不是 .gch 字节。
+# CMAKE_CXX_COMPILER_LAUNCHER: pass ordinary TUs to ccache. For PCH, invoke the
+# compiler directly and generate <gch>.sum for pch_external_checksum, so ccache
+# hashes the checksum instead of non-reproducible .gch bytes.
 #
-# 为什么必须这样（2026-09-12 实测）：
-#   - GCC 的 .gch 字节不可复现：同容器连续编两次大小都不同。ccache 默认按 .gch 内容哈希，
-#     于是 PCH 一被重建（--clean / 换镜像），该目标下所有 TU 必 miss（0/1446）。
-#   - PCH 编译命令自带 -include cmake_pch.hxx，ccache 把旧的 .gch 当输入哈希，而输出正是它，
-#     编完发现"输入被改了"就拒存（548 次 Input file modified），PCH 结果从没进过缓存。
-#   - 跨机共享的前提：另一台机器生成的 .gch 字节必然不同，只有 .sum 能对得上。
+# GCC can produce different .gch bytes even for consecutive builds in one container.
+# Hashing those bytes makes every dependent TU miss after a clean build or image change.
+# PCH commands also include their own output through -include, causing ccache to
+# reject storage as 'Input file modified'. A reproducible .sum enables cross-host reuse.
 #
-# .sum 算法 v5（2026-09-15，按四轮 review 与合成工程实测修订；算法一变就升版本，旧 .sum 由 sr-build 迁移淘汰）：
-#   1) 参数按 ccache base_dir 的规则改写：$CCACHE_BASEDIR 之下的绝对路径 -> realpath 相对 cwd。
-#      实测与 ccache 实际传给编译器的 argv 逐项一致（-I../../src、-include src/.../cmake_pch.hxx、源文件 ../../src/...）。
-#      不能只替换前缀（等价但不同的字串），也不能抹成 basename（同名不同目录 + __FILE__ 会碰撞）。
-#   2) 主输入保持 cmake_pch.hxx.cxx + -include hxx，与真实 PCH 编译同一预处理上下文。-E 下 GCC 不加载 .gch（实测）。
-#   3) -E -fdirectives-only：保留全部 #define/#undef 文本，头文件不展开宏。必须如此——全展开的 -E 看不见"只改了宏定义"
-#      （宏没在 PCH 头里被使用），合成工程实测会造成错误命中。行号/文件切换标记保留（__INCLUDE_LEVEL__ 的结构、
-#      __FILE__ 的文件身份都在里面）；-fno-working-directory 去掉 "# 1 <cwd>//"（对应 comp_dir，真实编译里已被抹成 .）。
-#   4) 行号标记里的文件名按 GCC 的顺序语义施加 -ffile-prefix-map（最后指定者优先、首个匹配即停）；有 macro/debug 专用映射时不归一化：cmake_pch.hxx 里 #include 的是绝对路径
-#      （内容，ccache 改不到），但编译器产物（__FILE__、DW_AT_name）里它已经是映射后的相对路径——校验和看到的文件名
-#      = 产物里的文件名。工程没配 prefix-map 时保持绝对路径，跨目录不共享：正确的保守行为。
-#   5) 哈希输入 = "v5" + 改写后的参数 + 归一化后的 -E 输出。参数里只有被归一化覆盖的 prefix-map 退化为选项名，
-#      其余（单独的 macro/debug 映射）连值一起进哈希——否则改映射目标产物变了 .sum 不变。
-#   6) 先写同目录临时文件，全部步骤成功后原子 mv；任一失败删掉旧 .sum（ccache 退化为按 .gch 内容哈希：正确但不可共享）。
+# Checksum algorithm v5; increment its version when semantics change so sr-build
+# can migrate old checksums.
+# 1. Rewrite absolute paths under CCACHE_BASEDIR to realpath-relative paths from
+#    cwd, matching ccache's compiler argv. Prefix substitution or basenames alone
+#    are insufficient and can collide across directories or __FILE__ values.
+# 2. Keep the cmake_pch.hxx.cxx input and -include header to match PCH preprocessing.
+#    GCC does not load .gch with -E.
+# 3. Use -E -fdirectives-only to retain #define/#undef without expanding header
+#    macros. Full preprocessing misses changes to macros unused inside the PCH.
+#    Preserve line/file markers for __INCLUDE_LEVEL__ and __FILE__; remove the
+#    working-directory marker with -fno-working-directory.
+# 4. Normalize marker filenames using GCC's ordered -ffile-prefix-map semantics:
+#    last specified first, stop at the first match. Skip normalization when macro
+#    or debug maps are mixed in. Without a map, retain absolute paths conservatively.
+# 5. Hash the version, rewritten arguments, and normalized preprocessor output.
+#    Remove values only from maps whose effect is fully reflected in normalized
+#    output; other mapping values and their order must remain in the hash.
+# 6. Publish through a temporary file in the same directory and an atomic rename.
+#    On any failure, remove the old .sum so ccache safely falls back to .gch hashing.
 set -o pipefail
 out=""; prev=""
 for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
-# 判定"这是在编 PCH"：-x c++-header / -x c-header，或输出是 *.gch（CMake 给 C 语言 PCH 的命令不带 -x，靠 .h 后缀让 GCC 自行判定）
+# Detect PCH through -x c++-header/-x c-header or a .gch output; CMake's C PCH command may omit -x.
 case " $* " in *" -x c++-header "*|*" -x c-header "*) ;; *) case "$out" in *.gch) ;; *) exec ccache "$@" ;; esac ;; esac
 
-# PCH 本体的生成不走 ccache，直接调编译器：ccache 不哈希 -ffile-prefix-map 的值，会把另一组映射目标下生成的 .gch 当命中恢复
-# 回来（合成工程实测：__FILE__ 已烘进 .gch，TU 再新鲜编也是错的）；而 .gch 字节本就不可复现、缓存它只省 65×~1s，TU 的缓存
-# 靠 .sum 与 .gch 字节无关。不能外发（icecc 不支持远端生成 PCH），这里也不设 CCACHE_PREFIX。
-# review r7#6：PCH 本体经 icerun 走本机 daemon 的槽位——原来直连编译器绕过并发闸门，clean 时多个目标的 PCH 会同时挤本机。
-# icerun 只做本地限流：不外发、不改命令与产物，与 .sum 逻辑无关。icerun 或 daemon 套接字不在时回退直连（今天的行为）。
+# Generate PCH without ccache: it does not hash -ffile-prefix-map values and may
+# restore a .gch with the wrong baked-in __FILE__ values. TU caching uses .sum
+# independently of .gch bytes. icecc cannot generate PCH remotely.
+# Use icerun for the local daemon's concurrency slots, without changing arguments
+# or outputs. Fall back to direct compilation if icerun or the daemon socket is unavailable.
 if command -v icerun >/dev/null 2>&1 && [ -S /var/run/icecc/iceccd.socket ]; then icerun "$@"; else "$@"; fi; rc=$?
 { [ $rc = 0 ] && [ -n "$out" ]; } || exit $rc
 
 base=${CCACHE_BASEDIR:-}
-# base 目录本身也要改写（-I$base 这种），否则两条路径的哈希参数不同（合成工程实测踩过）
+# Rewrite the base directory itself too, including arguments such as -I$base.
 rel(){ if [ -n "$base" ] && { [ "$1" = "$base" ] || [[ "$1" == "$base"/* ]]; }; then realpath -m --relative-to="$PWD" -- "$1"; else printf '%s' "$1"; fi; }
 args=(); skip=0
 for a in "$@"; do
@@ -52,26 +56,25 @@ for a in "$@"; do
   args+=("$r")
 done
 
-# 行号标记归一化 —— 只在"全部映射都是 -ffile-prefix-map"时做，并精确复现 GCC 的匹配语义：
-#   GCC 把每条 -f*-prefix-map 头插进链表，重映射时从最后指定的那条开始，第一个前缀匹配者生效（gcc/file-prefix-map.cc：
-#   add_prefix_map / remap_filename）。所以既不是"最长前缀优先"，也不能把映射放进集合排序——同样两条映射交换顺序，
-#   产物里的 __FILE__ 就不同（review 复现：ONE,TWO 与 TWO,ONE 曾得到同一个 .sum）。这里用 sed 的 t 跳转实现
-#   "首个匹配即停"，规则按 argv 逆序排列。
-#   出现任何 -fmacro-prefix-map / -fdebug-prefix-map（它们各自只作用于 __FILE__ 或调试信息，且各有独立链表）就放弃归一化，
-#   所有映射参数连值带顺序完整进哈希——保守但正确：这种工程跨目录不共享。
+# Normalize line markers only when all maps are -ffile-prefix-map. GCC prepends
+# maps to a list, so the last specified matching map wins, not the longest prefix.
+# Preserve argument order and emit sed rules in reverse order; t stops at the first match.
+# If macro/debug-specific maps are present, keep every map value and its order in
+# the hash instead. This sacrifices cross-directory reuse to preserve correctness.
 FMAPS=(); MIXED=0
 for a in "${args[@]}"; do case "$a" in -ffile-prefix-map=*=*) FMAPS+=("${a#*=}");; -fmacro-prefix-map=*|-fdebug-prefix-map=*) MIXED=1;; esac; done
 sedf="$out.sum.sed.$$"; : > "$sedf" 2>/dev/null
-esc_lhs(){ printf '%s' "$1" | sed 's/[][\\.*^$|]/\\&/g'; }   # 前缀里的 . 等按字面匹配（GCC 是纯字符串前缀比较）
-esc_rhs(){ printf '%s' "$1" | sed 's/[\\&|]/\\&/g'; }          # sed RHS 中 & 是整个匹配，| 是分隔符
+esc_lhs(){ printf '%s' "$1" | sed 's/[][\\.*^$|]/\\&/g'; }   # Match prefix characters such as '.' literally, as GCC uses plain string-prefix comparison.
+esc_rhs(){ printf '%s' "$1" | sed 's/[\\&|]/\\&/g'; }          # Escape '&' (the whole match) and '|' (the delimiter) in the sed replacement.
 if [ $MIXED = 0 ] && [ ${#FMAPS[@]} -gt 0 ]; then
   for (( k=${#FMAPS[@]}-1; k>=0; k-- )); do
     m=${FMAPS[k]}; printf 's|^\\(# [0-9]* "\\)%s|\\1%s|; t\n' "$(esc_lhs "${m%=*}")" "$(esc_rhs "${m##*=}")"
   done > "$sedf" 2>/dev/null
 fi
 
-# 哈希参数：被归一化覆盖（file-only 场景）的映射只留选项名——其值与顺序的效果已在归一化后的 .i 里体现，而换目录时 OLD 不同
-# 正是期望被抹掉的；混合场景全部映射连值带顺序进哈希（review：改映射目标产物变了 .sum 不能不变）
+# For file-only maps, hash option names without values because normalized output
+# already captures mapping effects and order. For mixed maps, retain values and
+# order so a change in mapped filenames also changes the checksum.
 hashed=()
 for r in "${args[@]}"; do
   case "$r" in
@@ -80,7 +83,8 @@ for r in "${args[@]}"; do
   esac
 done
 
-# 预处理、归一化、哈希、写入、发布是一个整体：任何一步失败都删掉旧 .sum（.gch 可能已更新，旧 .sum 描述的是旧内容）
+# Preprocessing, normalization, hashing, writing, and publication must all succeed.
+# Otherwise remove the old checksum, which may no longer describe the regenerated PCH.
 publish_sum(){
   local tmp sum
   tmp=$(mktemp "$out.sum.XXXXXX" 2>/dev/null) || return 1
@@ -88,7 +92,7 @@ publish_sum(){
     && [ -f "$sedf" ] && sed -f "$sedf" "$tmp.raw" > "$tmp.i" && [ -s "$tmp.i" ] \
     && sum=$({ printf 'v5\n'; printf '%s\n' "${hashed[@]}"; cat "$tmp.i"; } | sha256sum | cut -d' ' -f1) && [ -n "$sum" ] \
     && printf 'v5 %s\n' "$sum" > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$out.sum"; } || { rm -f "$tmp" "$tmp.raw" "$tmp.i"; return 1; }
-  [ -n "${SR_PCH_KEEP_I:-}" ] && mv -f "$tmp.i" "$out.i" 2>/dev/null || rm -f "$tmp.i"   # SR_PCH_KEEP_I=1 留下归一化后的 -E 输出供检查
+  [ -n "${SR_PCH_KEEP_I:-}" ] && mv -f "$tmp.i" "$out.i" 2>/dev/null || rm -f "$tmp.i"   # SR_PCH_KEEP_I=1 retains normalized preprocessor output for inspection.
   rm -f "$tmp.raw"; return 0
 }
 if ! publish_sum; then

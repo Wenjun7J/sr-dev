@@ -1,57 +1,62 @@
-# srdev 站点配置。复制为 srdev.conf 按环境填写；srdev.conf 在 .gitignore 里，不要提交。
-# 宿主机的 sr 直接 source 它，并在每次调用时把它同步为 ~/farm/srdev.conf（0600），容器内的 sr-build/sr-farm 读 /farm/srdev.conf——
-# 所以改完立刻生效，不用重建容器。（早先是把文件 bind mount 到 /etc/srdev.conf：单文件挂载钉 inode，编辑器保存后容器读到的仍是旧内容。）
+# Site configuration: copy to srdev.conf and fill in local values. Never commit it.
+# The host sr sources this file and copies it to ~/farm/srdev.conf (0600) on each call;
+# container helpers read /farm/srdev.conf, so changes do not require a container rebuild.
+# A single-file bind mount would retain the old inode when an editor replaces the file.
 
-## 镜像来源
-SR_BASE_IMAGE=REGISTRY_HOST:5000/starrocks/toolchains-ubuntu:main-20260707   # sr image 的 base：官方 toolchains 镜像（不是 dev-env）
-SR_APT_MIRROR=                     # 建镜像/装节点时替换 archive.ubuntu.com 的源，如 mirrors.cloud.aliyuncs.com；留空不换
-#SR_REGISTRIES=/path/to/registries.conf   # 版本号解析表，默认与 sr 同目录的 registries.conf
-#SR_TP_REPO=REGISTRY_HOST:5000/starrocks/dev-env-ubuntu   # 临时开关：非空则忽略 registries.conf，一律用这个仓库解析依赖镜像（某命名空间发布断了时用；撤销即删）
+# Image sources
+SR_BASE_IMAGE=REGISTRY_HOST:5000/starrocks/toolchains-ubuntu:main-20260707   # Base for sr image: the official toolchains image, not dev-env.
+SR_APT_MIRROR=                     # Optional replacement for archive.ubuntu.com, e.g. mirrors.cloud.aliyuncs.com; empty keeps the default.
+# SR_REGISTRIES=/path/to/registries.conf   # Version lookup table; defaults to registries.conf beside sr.
+# SR_TP_REPO=REGISTRY_HOST:5000/starrocks/dev-env-ubuntu   # Temporary override: bypass registries.conf; remove to restore normal lookup.
 
-## 宿主机
-SR_TPDIR=/srv/srdev/thirdparty     # 各版本 thirdparty 的公共目录（按 digest 存、全机共享）；不可写时退回 ~/thirdparty
-#CPUS=16                           # 容器 CPU 限额
-#MEM=64g                           # 容器内存限额
-#IMG=my-sr-dev:custom              # 可选镜像名；默认 sr-dev:<构建输入摘要>，避免不同工具版本混用
+# Host settings
+SR_TPDIR=/srv/srdev/thirdparty     # Host-wide thirdparty cache keyed by digest; falls back to ~/thirdparty if not writable.
+# CPUS=16                           # Container CPU limit.
+# MEM=64g                           # Container memory limit.
+# IMG=my-sr-dev:custom              # Optional image; defaults to sr-dev:<build-input fingerprint>.
 
-## 编译农场（sr farm init 申请的云上节点）
-SR_NODE_USER=sr                    # 节点上的 ssh 用户
-SR_NODE_PASSWORD=                  # 节点初始密码，仅首次铺 ssh 密钥用；之后全走专用密钥 ~/farm/ssh/id_farm
-WORKERS=5                          # 申请的机器总数（全部当 worker；平台自带的 1 台 FE 也算在内，写 5 就开 5 台）
-#SR_LOCAL_JOBS=8                   # 本机并发上限：既是常驻 iceccd 的 -m，也是 ninja 的本机份额（默认=容器 CPU 配额）。
-                                   # 本次 ninja 并发每次读取；常驻 iceccd 的 -m 只在 daemon 启动时生效。用户级 -j 已移除。
-                                   # SR_LOCAL_JOBS / SR_FE_UT_JOBS / SR_LINK_JOBS / SR_LINK_MEM_GB 支持非空环境变量临时覆盖，优先于本文件。
-                                   # 如 SR_LOCAL_JOBS=6 SR_LINK_JOBS=1 sr -v main be-ut --dist off；不修改配置、不重建容器。
-#SR_FE_UT_JOBS=8                   # FE 单测的 maven -T（默认跟 SR_LOCAL_JOBS）。控制的是 reactor 并发，
-                                   # 实际测试 JVM 数还取决于 surefire 的 fork 配置，别当成 JVM 总数。
-#SR_DYNLIB_PCH=1                   # BE 单测 .so 模式下补挂 PCH（1，默认）还是只 -include vector（0）。实测本地编译 PCH 快约 5%，
-                                   # 分布式无收益；切换会让该树全部 TU 重编。命令行 --[no-]dynlib-pch 优先。
-#SR_FE_HEAP=2g                     # sr deploy 起的 FE 堆上限（默认 2g；上游模板 8g 会和编译抢容器内存）
-#SR_PORT_BASE=28000                # FE/BE 端口基址。新部署默认 24000+(uid%300)*20；旧部署保留原端口
-#SR_FE_DEBUG_PORT=28008            # FE 调试端口，默认端口基址+8；starlet 使用基址+9
-#SR_LINK_JOBS=2                    # 同时跑几个链接器；默认取 CPU配额/5 与 (内存GiB-5)/SR_LINK_MEM_GB 较小值，限制在 1..8
-#SR_LINK_MEM_GB=15                 # 单条链接的历史内存估值，不是安全上界；内存不足一条时仍串行执行并告警
-#SR_CC_LINK=0                      # 关掉"编译完在源码树根建 compile_commands.json 软链接"（默认开，给 clangd 固定寻址路径）
+# Compilation farm: cloud nodes provisioned by sr farm init.
+SR_NODE_USER=sr                    # SSH user on worker nodes.
+SR_NODE_PASSWORD=                  # Initial SSH password, used only to install the dedicated ~/farm/ssh/id_farm key.
+WORKERS=5                          # Total machines requested, including the platform's FE node; all serve as workers.
+# SR_LOCAL_JOBS=8                   # Local iceccd -m limit and Ninja share; defaults to the container CPU quota.
+                                   # Ninja reads this on every build; a running iceccd only reads -m at startup. User-level -j is removed.
+                                   # Nonempty SR_LOCAL_JOBS / SR_FE_UT_JOBS / SR_LINK_JOBS / SR_LINK_MEM_GB environment values override this file.
+                                   # Example: SR_LOCAL_JOBS=6 SR_LINK_JOBS=1 sr -v main be-ut --dist off; no config edit or rebuild needed.
+# SR_FE_UT_JOBS=8                   # Maven -T for FE tests; defaults to SR_LOCAL_JOBS and controls reactor concurrency.
+                                   # The number of test JVMs also depends on Surefire fork settings; it is not equal to reactor concurrency.
+# SR_DYNLIB_PCH=1                   # Add PCH in BE shared-library tests (1), or only -include vector (0); about 5% faster locally in the benchmark.
+                                   # No distributed-build benefit was observed. Changing this rebuilds all TUs; --[no-]dynlib-pch takes precedence.
+# SR_FE_HEAP=2g                     # FE heap for sr deploy; the upstream 8g default competes with builds.
+# SR_PORT_BASE=28000                # FE/BE base; new deployments use 24000+(uid%300)*20, existing ones retain saved ports.
+# SR_FE_DEBUG_PORT=28008            # FE debugger defaults to base+8; starlet uses base+9.
+# SR_LINK_JOBS=2                    # min(CPU quota/5, (memory GiB-5)/SR_LINK_MEM_GB), clamped to 1..8.
+# SR_LINK_MEM_GB=15                 # Historical estimate per linker, not a hard bound; warn and run serially if even one does not fit.
+# SR_CC_LINK=0                      # Disable the source-root compile_commands.json symlink; enabled by default for clangd.
 
-## 端口：默认按 uid 取模推导，共享机上 uid 相差 250(SPORT)/500(DPORT、代理) 的两个人会撞在一起。
-## 撞车时 sr farm init 会明确报出来；这三项用于手工错开。
-#SPORT=18740                        # icecc scheduler（同时占用 SPORT+1 作文本管理口）
-#DPORT=19740                        # 本机 iceccd
-#SR_CCACHE_PROXY_PORT=20740         # ccache 的 OSS 代理
+# Ports derive from UID modulo arithmetic. UIDs differing by 250 can collide on
+# SPORT; differences of 500 can collide on DPORT and the cache proxy.
+# sr farm init reports conflicts; use these overrides to assign distinct ports.
+# SPORT=18740                        # icecc scheduler; SPORT+1 is its text management port.
+# DPORT=19740                        # Local iceccd.
+# SR_CCACHE_PROXY_PORT=20740         # OSS-backed ccache proxy.
 
-## sr pack：把 output/ 打成与官方日构建同构的 tar.gz，可选上传 OSS（凭据同样只从各人自己的 ~/.ossutilconfig 读）
-#SR_PKG_BUCKET=<桶名>                # 不配就只能本地打包，sr pack --upload 会直接拒绝
-#SR_PKG_PREFIX=packages/main/Release/  # 对象前缀，要以 / 结尾
-#SR_PKG_DIR=/path/to/pkg     # 本地输出目录（默认 ~/pkg）；包有 4G+，别放小盘
-ITYPE=8c32g                        # 节点规格（平台侧的名字）
-#SR_NODE_JOBS=                     # 每台 worker 的编译并发（icecc -m，也决定总 -j=台数×此值+本地）。
-                                   # 留空=按节点实际 CPU 核数自动定；内存受限时压低（8c16g 编 ASAN 每槽~2G，
-                                   # 8 并发超 16G，设 6 更稳）。改了要 sr farm down 再 init 才生效。
-#TSP_REGION=cn-zhangjiakou         # 平台申请参数
-#TSP_CSP=aliyun
+# sr pack creates a tar.gz matching the official daily-build layout and can upload
+# it to OSS using the user's ~/.ossutilconfig credentials.
+# SR_PKG_BUCKET=<bucket-name>        # Required for --upload; local packaging works without it.
+# SR_PKG_PREFIX=packages/main/Release/  # Object prefix; include the trailing slash.
+# SR_PKG_DIR=/path/to/pkg            # Defaults to ~/pkg; allow space for packages larger than 4 GB.
+ITYPE=8c32g                        # Instance type identifier recognized by the platform.
+# SR_NODE_JOBS=                     # Per-worker icecc -m; total concurrency is worker count times this value plus local capacity.
+                                   # Empty derives the limit from each node's CPU count. Reduce it on memory-limited
+                                   # nodes: ASAN can use about 2 GB per slot, so six slots are safer than eight on 8c16g.
+                                   # Recreate the farm with sr farm down/init after changing this setting.
+# TSP_REGION=cn-zhangjiakou         # Platform provisioning parameters.
+# TSP_CSP=aliyun
 
-## ccache 远端（可选）：配了桶名即启用。本地 miss 才查远端、命中回填本地；所有人共享同一前缀。
-## 凭据用各人自己的 ~/.ossutilconfig（ossutil 的配置），代理随容器起，端口按 uid。
-## 能跨机共享的前提是 PCH 走 .sum 哈希（ccache.conf 已开 pch_external_checksum）。
-#SR_CCACHE_REMOTE_BUCKET=<桶名>       # 与 ossutil 配置同一 endpoint（建议内网端点）
-#SR_CCACHE_REMOTE_PREFIX=ccache/       # 桶内前缀
+# Optional remote ccache: setting a bucket enables it. Query remote storage after
+# a local miss and populate the local cache on a remote hit; users share one prefix.
+# Credentials come from ~/.ossutilconfig. The proxy runs in the container on a UID-derived port.
+# Cross-host PCH reuse requires the .sum hashing enabled by pch_external_checksum.
+# SR_CCACHE_REMOTE_BUCKET=<bucket-name>  # Use the ossutil endpoint, preferably its internal address.
+# SR_CCACHE_REMOTE_PREFIX=ccache/         # Prefix inside the bucket.

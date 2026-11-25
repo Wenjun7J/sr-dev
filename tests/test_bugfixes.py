@@ -16,7 +16,7 @@ class CcachePchSedTests(unittest.TestCase):
     def test_prefix_map_escaping_and_last_equals_split(self):
         source = (REPO / 'files/ccache-pch').read_text()
         start = source.index('FMAPS=(); MIXED=0')
-        end = source.index('# 哈希参数', start)
+        end = source.index('hashed=()', start)
         snippet = source[start:end]
         script = (
             'set -euo pipefail\n'
@@ -306,7 +306,7 @@ ensure_local_daemon
         warm_end = source.index('\nwarm_workers(){', warm_start)
         warm_fn = source[warm_start:warm_end]
         sched_start = source.index('port_is_ours(){')
-        sched_end = source.index('# --network host', sched_start)
+        sched_end = source.index('dcount(){', sched_start)
         sched_fn = source[sched_start:sched_end]
 
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,6 +1,7 @@
-# 版本号 -> 官方 dev-env 镜像 的解析表。复制为 registries.conf 后把 REGISTRY_HOST 换成你的内网镜像仓。
-# 格式: <命名空间>  <registry>/<repo>   —— 按此顺序解析，取第一个命中的。
-# 日常只写版本号（sr -v 4.1 build）；真要指定命名空间写 ee:4.1 / os:4.1。
-# registry 需能匿名访问 v2 API（tags/list 与 HEAD manifests），Docker Hub 因需 token 不适用。
+# Resolve versions to official dev-env images. Copy to registries.conf and replace
+# REGISTRY_HOST with your registry. Format: <namespace> <registry>/<repository>.
+# Entries are tried in order; the first match wins. Use sr -v 4.1 build normally,
+# or select a namespace explicitly with ee:4.1 / os:4.1.
+# The v2 tags/list and HEAD manifests APIs must allow anonymous access; token-authenticated Docker Hub is unsupported.
 ee  REGISTRY_HOST:5000/<企业版命名空间>/dev-env-ubuntu
 os  REGISTRY_HOST:5000/starrocks/dev-env-ubuntu

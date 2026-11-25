@@ -279,8 +279,8 @@ def prune(root, farm, repos, apply=False, inventory=docker_inventory, lookup=cur
         current = set()
         for image in sorted(set(entries.values()) - {None}):
             digest = lookup(image)
-            # registry 删除历史 tag 后，旧 digest 已不再是当前来源，
-            # 应按普通旧缓存参与候选判断；网络/5xx 等其他错误仍然中止。
+            # A deleted upstream tag no longer designates a current digest, so its cache
+            # can be considered for pruning. Network failures and 5xx errors must still abort.
             if digest is not None:
                 current.add(digest)
         candidates = []

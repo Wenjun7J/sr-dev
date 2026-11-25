@@ -1,28 +1,28 @@
 #!/bin/bash
-# clangd-host —— 让 VSCode 的 clangd 跑进编译容器里，并且用和编译**完全相同**的依赖挂载。
-# 用法：把 VSCode 的 clangd.path 指向这个脚本（通常经 ~/bin/clangd 软链接）。
+# Run VS Code's clangd in the build container with the same dependency mounts.
+# Set clangd.path to this script, usually through a ~/bin/clangd symlink.
 #
-# 为什么非进容器不可：compile_commands.json 里的编译器是 /opt/gcc-toolset-14/bin/g++，
-# 头文件搜索路径里有 /var/local/thirdparty/installed/...。宿主机上前者压根不存在，
-# 于是 --query-driver 问不出系统头路径，boost/protobuf/thrift 等也全都找不到。
+# Compilation commands refer to container-only compilers and thirdparty paths.
+# Running on the host would break --query-driver system-header discovery and
+# resolution of dependencies such as Boost, Protobuf, and Thrift.
 #
-# 为什么还要私有挂载命名空间：容器**默认**命名空间里 /var/local/thirdparty/installed 是空的
-# （实测 0 个条目）。真正的依赖是每次编译时按 digest bind 进去的，见 sr 的 build 分支。
-# clangd 不照做的话，第三方头文件一个也解析不了。
+# The default container mount namespace has no selected thirdparty installation.
+# Match sr build's private namespace and digest-specific bind mount so clangd can
+# resolve the same third-party headers.
 #
-# 铁律：绝不往 stdout 写任何东西——这条管道就是 LSP 协议本身，多一个字节客户端就崩。
-# 所有自述一律走 stderr（VSCode 的 clangd 输出面板能看到）。
+# Keep stdout exclusively for LSP traffic. Send all diagnostics to stderr,
+# where VS Code's clangd output panel can display them.
 set -uo pipefail
 say(){ printf 'clangd-host: %s\n' "$*" >&2; }
 
-HERE=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)     # 仓库根
+HERE=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)     # Repository root.
 CONF_FILE=${SR_CONF:-$HERE/srdev.conf}; [ -f "$CONF_FILE" ] && . "$CONF_FILE"
 BASE=${BASE:-$HOME}
 SR_USER=${SR_USER:-$(id -un)}
 NAME=${SR_CLANGD_CONTAINER:-${SR_USER}_farm}
 CLANGD=${SR_CLANGD_BIN:-clangd-20}
 
-# 找源码树：VSCode 以 workspaceRoot 作为 cwd 启动 clangd；拿不到就从 --compile-commands-dir 里推
+# Find the source tree from VS Code's workspace cwd, then try --compile-commands-dir.
 find_root(){ local d=${1:-}
   while [ -n "$d" ] && [ "$d" != / ] && [ "$d" != . ]; do
     [ -f "$d/build.sh" ] && [ -d "$d/be/src" ] && { printf '%s\n' "$d"; return 0; }
@@ -33,7 +33,7 @@ if [ -z "$SR" ]; then
     --compile-commands-dir=*) SR=$(find_root "${a#*=}" 2>/dev/null || true); [ -n "$SR" ] && break;; esac; done
 fi
 
-# 这棵树用的是哪个依赖 digest —— 和 sr build 读的是同一份记录，保证 clangd 与编译看到同一套头文件
+# Read the same dependency digest record as sr build to use matching headers.
 DG=""
 if [ -n "$SR" ]; then
   BR=$(git -C "$SR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
@@ -43,7 +43,7 @@ if [ -n "$SR" ]; then
   case "$DG" in ''|*[!0-9a-f]*) DG="";; esac
 fi
 
-# 容器没起就起一下。sr up 会往 stdout 说话，必须整体改道 stderr，否则污染 LSP 流。
+# Start the container if needed; redirect sr up output to stderr to preserve the LSP stream.
 if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" != true ]; then
   say "容器 $NAME 没在跑，先 sr up"
   "$HERE/sr" up >&2 2>&1 || { say "容器起不来，放弃"; exit 1; }
@@ -51,7 +51,7 @@ fi
 
 if [ -n "$DG" ]; then
   say "进容器 $NAME，依赖 digest ${DG:0:12}，源码树 $SR"
-  # sh -c 的参数：$0=digest，$1=clangd，$2..=clangd 的参数；exec "$@" 正好是 $1 带着 $2.. 起飞（不要 shift）
+  # sh -c receives $0=digest, $1=clangd, and $2..=arguments. exec "$@" must not shift them.
   exec docker exec -i -w "${SR:-$PWD}" "$NAME" \
     unshare -m --propagation private sh -c \
     'exec 6</tp; flock -s 6 || exit 1

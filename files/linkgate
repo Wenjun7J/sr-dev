@@ -1,17 +1,16 @@
 #!/bin/bash
-# linkgate —— 容器级的链接并发闸门（CMake 的 <LANG>_LINKER_LAUNCHER，由 cmake-linkpool 注入）。
+# Container-wide link concurrency gate, installed as CMake's <LANG>_LINKER_LAUNCHER.
 #
-# 为什么光有 ninja 的 job pool 不够（codex r14#6）：pool 只管住一次 ninja 自己的并发。容器里可以同时有
-# 好几棵源码树在编，每棵都按"整个容器的内存"算出自己的链接槽数，于是 64G 容器上两棵 ASAN 树各开 3 个
-# ld.lld，实际 6 个同时跑、每个十几 G，照样撞上限或被宿主机的 earlyoom 杀掉。链接不经 icecc，
-# 没有 iceccd -m 那样的跨树闸门，只能自己做一个。
+# A Ninja job pool constrains only one build. Concurrent source trees can each
+# budget all container memory and collectively exceed its limit, especially with
+# ASAN links. Linking bypasses icecc, so it needs a separate cross-tree gate.
 #
-# 怎么做：N 个槽文件放在共享卷 /farm 上，每个链接进程 flock 抢一个，抢到才 exec 真正的链接命令。
-# flock 的 fd 不是 close-on-exec，exec 之后锁仍然被持有，链接器退出时内核自动释放（容器内实测验证过）。
-# 于是全容器同时在跑的链接器不会超过 max(各构建的 SR_LINK_JOBS)，而不是它们之和。
-# 只作用于可执行文件与动态库的链接；静态库是 ar，不吃内存，CMake 也不会给它套 launcher。
+# Each linker takes one of N flock slots in the shared /farm volume before exec.
+# The descriptor survives exec; the kernel releases its lock when the linker exits.
+# Total concurrency is bounded by the largest SR_LINK_JOBS among active builds,
+# not their sum. CMake applies this only to executable/shared-library links, not ar.
 #
-# 闸门是优化，绝不能成为构建挂掉的新原因：任何一步不顺（没有 flock、建不了目录、等太久）都直接放行。
+# This gate is an optimization: bypass it if flock, directory access, or the wait budget fails.
 set -u
 [ $# -gt 0 ] || exit 0
 N=${SR_LINK_JOBS:-1}; case "$N" in ''|*[!0-9]*|0) N=1;; esac
@@ -19,9 +18,9 @@ D=${SR_LINK_GATE_DIR:-/farm/linkgate}
 command -v flock >/dev/null 2>&1 || exec "$@"
 mkdir -p "$D" 2>/dev/null || exec "$@"
 chmod 1777 "$D" 2>/dev/null
-# 等待上限：宁可挤一下也不能把构建永远挂住（默认 2 小时，单个 ASAN 链接实测几分钟）
-# codex 复查#12：要把"槽位被别人占着"（该等）和"根本就锁不了"（该立刻放行）分开。
-# 原来两种情况一起轮询到 2 小时超时，一个打不开的槽目录会让每次链接都白等两小时。
+# Bound waiting to avoid hanging a build indefinitely; the default is two hours.
+# Distinguish occupied slots, which warrant waiting, from inaccessible slots,
+# which require an immediate bypass rather than waiting for the entire timeout.
 deadline=$(( $(date +%s) + ${SR_LINK_GATE_WAIT:-7200} ))
 while :; do
   i=1; opened=0
@@ -30,16 +29,16 @@ while :; do
     chmod 666 "$D/slot.$i" 2>/dev/null || true
     if [ ! -L "$D/slot.$i" ] && { exec 200<"$D/slot.$i"; } 2>/dev/null; then
       opened=$(( opened + 1 ))
-      flock -n 200 && exec "$@"               # 抢到了：fd 200 随 exec 继承，链接器退出时内核自动释放
+      flock -n 200 && exec "$@"               # fd 200 survives exec; the kernel releases the slot when the linker exits.
     fi
     { exec 200>&-; } 2>/dev/null
     i=$(( i + 1 ))
   done
-  # 一个槽都打不开 = 目录权限/文件系统的问题，不是竞争，等下去没有意义
+  # No openable slots means a permission/filesystem problem, not lock contention.
   [ "$opened" = 0 ] && { echo "linkgate: $D 下一个槽文件都打不开，本次链接不受闸门限制" >&2; exec "$@"; }
   if [ "$(date +%s)" -ge "$deadline" ]; then
-    # 这里和 codex 的建议不同：它主张超时就报错退出。但闸门只是内存保护，让一次几小时的构建
-    # 因为记账问题直接失败，代价比"挤一下可能 OOM"更大。所以仍然放行，但把话说到 stderr 上。
+    # A timeout should not discard hours of build work because of gate bookkeeping.
+    # Bypass the gate and report the possible memory pressure on stderr.
     echo "linkgate: 等了 $(( ${SR_LINK_GATE_WAIT:-7200} / 60 )) 分钟仍抢不到槽（$N 个），本次不受闸门限制，内存可能吃紧" >&2
     exec "$@"
   fi

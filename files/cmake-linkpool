@@ -1,32 +1,31 @@
 #!/bin/bash
-# cmake-linkpool —— 给 configure 注入 ninja 的「链接并发池」。
+# Inject a Ninja link job pool during CMake configuration.
 #
-# 为什么需要：上游 be/CMakeLists.txt / build.sh / run-be-ut.sh 里没有任何 JOB_POOL，链接并发 = 编译并发。
-# 编译有 iceccd -m 卡着本机数量，链接不经 icecc、只受 ninja -j 约束。ASAN 单测是动态链接 + 上百个测试可执行文件，
-# 每个 ld.lld 2~4G：-j80 时同时 35 个 ld.lld 吃掉 30G 撞容器上限被内核杀；-j8 时 8 个也把 24G 容器顶在 memory.max 上
-# 反复回收，进度停在 "Checking thrift generation" 之后一动不动，连 docker exec 都进不去（2026-09-17 两次现场）。
+# Upstream build and test scripts do not set JOB_POOL, so links can inherit full
+# compile concurrency. iceccd limits compilation but not linking; concurrent ASAN
+# links can exhaust container memory or stall it in reclaim. Limit links separately.
 #
-# 怎么接进去：上游 env.sh 认 CUSTOM_CMAKE 覆盖 CMAKE_CMD，build.sh 与 run-be-ut.sh 的 configure 都经它。
-# 只在 configure 调用（参数里有 -G）时注入 -DCMAKE_JOB_POOLS=link=N -DCMAKE_JOB_POOL_LINK=link；
-# 池不进 ninja 的命令哈希，重新 configure 不会让已编好的边变脏。Makefile 生成器忽略池，无害。
-# N 由 sr-build 按容器内存算好放进 SR_LINK_JOBS；没有该变量就原样透传，等于没装这个包装。
+# Upstream env.sh accepts CUSTOM_CMAKE for both build.sh and run-be-ut.sh.
+# Inject CMAKE_JOB_POOLS=link=N and CMAKE_JOB_POOL_LINK=link only for configure
+# invocations containing -G. Pools do not affect Ninja command hashes, and Make
+# generators ignore them. sr-build sizes SR_LINK_JOBS from CPU and memory limits;
+# without it, leave link-pool settings unchanged.
 real=${SR_REAL_CMAKE:-cmake}
-[ "$(readlink -f "$(command -v "$real" 2>/dev/null || echo "$real")" 2>/dev/null)" = "$(readlink -f "$0")" ] && real=cmake   # 防止环境里残留指向自己
-# 同时注入两道闸门，各管一层：
-#   CMAKE_JOB_POOLS/JOB_POOL_LINK —— ninja 内部的，管住"这一次构建"的链接并发；
-#   CMAKE_CXX_LINKER_LAUNCHER=linkgate —— 容器级的 flock 槽位，管住"整个容器里所有源码树"的链接并发。
-#   只有前者的话，多棵树同时链接会各按整个容器的内存算槽数，加起来照样撞上限（codex r14#6）。
-# -G 既可能写成 `-G Ninja` 也可能写成 `-GNinja`，两种都要认，否则静默不注入（codex 之外，自查发现）。
+[ "$(readlink -f "$(command -v "$real" 2>/dev/null || echo "$real")" 2>/dev/null)" = "$(readlink -f "$0")" ] && real=cmake   # Avoid recursion if the configured executable points back to this wrapper.
+# Apply two independent limits: Ninja's job pool limits one build, while the
+# linkgate launcher uses shared flock slots to limit all source trees in a container.
+# A per-build pool alone cannot prevent combined memory overcommit.
+# Recognize both -G Ninja and -GNinja forms.
 GATE=${SR_LINK_GATE:-/usr/local/bin/linkgate}
-# 两类注入各自独立判断：原来整段都包在 SR_LINK_JOBS 的正则里，
-# 没设它时连带把别的注入也吞掉（耦合，虽然 sr-build 总会 export）。
+# Evaluate link-pool settings separately from other injected arguments, so a missing
+# SR_LINK_JOBS does not accidentally disable unrelated configuration hooks.
 inj=()
 if [[ "${SR_LINK_JOBS:-}" =~ ^[1-9][0-9]*$ ]]; then
   inj+=("-DCMAKE_JOB_POOLS=link=$SR_LINK_JOBS" -DCMAKE_JOB_POOL_LINK=link)
   [ -x "$GATE" ] && inj+=("-DCMAKE_CXX_LINKER_LAUNCHER=$GATE")
 fi
-# sr-build 可以再塞别的 configure 参数（目前用于 --dynlib 的 CMAKE_PROJECT_INCLUDE）。
-# 故意不加引号：这里就是要按空格拆成多个参数。
+# sr-build may supply additional configure arguments, including CMAKE_PROJECT_INCLUDE
+# for --dynlib. Word splitting is intentional: this variable contains multiple arguments.
 [ -n "${SR_EXTRA_CMAKE_ARGS:-}" ] && inj+=($SR_EXTRA_CMAKE_ARGS)
 if [ ${#inj[@]} -gt 0 ]; then
   for a in "$@"; do

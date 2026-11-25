@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""极简 TSP 客户端 —— 只用标准库，不需要 pip/requests/click。
-   端点与 tsp-cli 保持一致；token 复用 ~/.tsp/config.json（由宿主机卷挂入）。"""
+"""Minimal standard-library TSP client; no requests or click dependency.
+Use the same endpoints as tsp-cli and reuse ~/.tsp/config.json mounted from the host."""
 import json, os, re, sys, urllib.parse, urllib.request
 
-CFG = os.path.expanduser(os.environ.get("TSP_CONFIG", "~/.tsp/config.json"))   # TSP_CONFIG 供测试指向独立凭据
+CFG = os.path.expanduser(os.environ.get("TSP_CONFIG", "~/.tsp/config.json"))   # TSP_CONFIG lets tests use isolated credentials.
 
 def _cfg():
     try:
         with open(CFG) as f: return json.load(f)
     except Exception as e:
-        # 不能 sys.exit：exists 的调用方把退出码 1 当"集群不存在"，凭据问题必须是"查询失败"(2)
+        # Raise instead of exiting with 1: exists reserves 1 for confirmed absence; credential errors must return 2.
         raise RuntimeError("未找到/读不了 TSP 凭据 %s（%s）。请在宿主机跑一次 tsp login，或挂载该目录。" % (CFG, e))
 
 def _req(path, data=None, raw=False):
@@ -23,7 +23,7 @@ def _req(path, data=None, raw=False):
     return t if raw else json.loads(t)
 
 def clusters():
-    """集群列表。响应结构不符时直接以 2 退出——不能把它当成空列表（review #9）"""
+    """List clusters; exit with 2 on an invalid response rather than treating it as empty."""
     r = _req("/cluster/api/cluster/list/")
     if not isinstance(r, dict) or not isinstance(r.get("detail"), list):
         _die2("TSP 响应结构不符: %s" % str(r)[:200])
@@ -33,8 +33,10 @@ def _die2(msg):
     print(msg, file=sys.stderr); sys.exit(2)
 
 def exists(cid):
-    """结构化判定：退出码 0=存在(打印状态) 1=不存在 2=查询失败。sr-farm down 用它区分"没了"和"查不到"。
-    凭据、网络、响应结构、元素解析——任何一种失败都是 2；只有成功查完一份有效列表且确认不含 CID，才返回 1。"""
+    """Exit with 0 for an existing cluster (printing status), 1 for confirmed absence,
+    or 2 for query failure. sr-farm down relies on this distinction. Credential,
+    network, response-shape, and entry-parsing failures must all return 2; only a
+    successfully validated list without the requested ID can establish absence."""
     try:
         cs = clusters()
         for c in cs:
@@ -64,7 +66,7 @@ def nodes(name):
     return []
 
 def spec(name):
-    """返回每个节点的 ip / cpu / 内存 / 磁盘，建完农场时打印给用户看。"""
+    """Return node addresses and instance metadata for the farm summary."""
     for c in clusters():
         if c.get("cluster_name") != name:
             continue
@@ -81,11 +83,11 @@ def spec(name):
     return {}
 
 def row(name):
-    """网页表格里才有到期时间和 22 点清扫开关（API 不返回）"""
+    """Read expiry and the 22:00 cleanup switch from the HTML table; the API omits them."""
     t = _req("/cluster/list/", raw=True)
-    # 只认单元格边界的精确匹配。原来找不到就退回子串 t.find(name)，会命中别的集群名里的子串——
-    # 实测：查询不存在的 alice_farm 会返回 other_alice_farm_backup 那一行的 Running 与到期时间，
-    # 于是 status 显示别人的状态、resume 的平台状态判断也被误导。找不到就当不存在。
+    # Match the complete table cell, never a substring of another cluster's name.
+    # For example, looking up alice_farm must not return other_alice_farm_backup.
+    # No exact match means the cluster is absent from the table.
     i = t.find(">" + name + "<")
     if i < 0: return {}
     s = t.rfind("<tr", 0, i); e = t.find("</tr>", i)
@@ -97,15 +99,16 @@ def op(cluster_id, type_, add_hours=None):
     d = {"cluster_id": cluster_id, "type": type_, "op_scope": "ALL"}
     if add_hours: d["add_hours"] = str(add_hours)
     r = _req("/cluster/update/", d)
-    # 业务失败尽力识别："收到了 JSON"不等于成功。字段名未完全掌握，只用常见的 success/code；
-    # 识别不了的情况由 sr-farm 通过后续 exists 观察真实状态兜底。
+    # Receiving JSON does not prove success. Check common success/code fields where
+    # recognized; sr-farm verifies the resulting state through subsequent exists calls.
     if not isinstance(r, dict) or r.get("success") is False or r.get("code") not in (None, 0, "0", 200, "200"):
         sys.exit("TSP 操作 %s 未成功: %s" % (type_, str(r)[:200]))
     return r
 
 def create(name, workers, duration=2, itype="8c32g", disk="20"):
-    # disk 20 而不是 100：实测 worker 上 icecc 只占 4 KB——预处理源码进来、.o 出去，
-    # 不落任何持久数据。原先那 100G 数据盘 8~10% 的占用全是 TSP 部署的 StarRocks。
+    # Compilation workers need little persistent disk: preprocessed sources arrive
+    # and object files leave. Use 20 GB rather than allocating 100 GB for an unused
+    # StarRocks installation.
     d = {"cluster_name": name, "csp": os.environ.get("TSP_CSP", "aliyun"),
          "description": "sr-farm distributed compile workers",
          "duration": str(duration),
@@ -117,15 +120,16 @@ def create(name, workers, duration=2, itype="8c32g", disk="20"):
          "linux_type": "ubuntu", "arch": "amd64",
          "package_option": "officially release", "deploy_obj": "starrocks",
          "branch_name": "branch-4.1", "build_type": "Release",
-         # package_path=null 让平台不部署 StarRocks：农场只要机器，不要数据库。
-         # 省掉部署时间，也省掉事后清理（FE 默认 -Xmx26g 会把 8c32g 压垮）。
+         # package_path=null requests machines without deploying StarRocks.
+         # This avoids deployment and cleanup overhead, including an oversized default FE heap.
          "region": os.environ.get("TSP_REGION", "cn-zhangjiakou"), "package_path": "null",
          "release_version": "4.1.0", "sr_conf": "daily-release",
          "data_import": "false", "wide_table": "false",
          "replication_num": "3", "data_sets": ""}
     r = _req("/cluster/quick/apply/", d)
-    # 业务失败必须非零退出（比照 op）：原来只 return，调用方也不看退出码，于是"重名创建失败"会被当成成功，
-    # 随后按名字找 CID 就把已存在的同名集群认领过来，并对它跑 node-setup（会停掉那批机器上的服务）。
+    # Return a failure status on rejected creation. Otherwise a duplicate-name error
+    # could be treated as success, causing the caller to claim an existing cluster
+    # and run node-setup against its services.
     if not isinstance(r, dict) or r.get("success") is False or r.get("code") not in (None, 0, "0", 200, "200"):
         sys.exit("TSP 创建集群未成功: %s" % str(r)[:200])
     return r
@@ -153,5 +157,5 @@ if __name__ == "__main__":
         _main()
     except SystemExit:
         raise
-    except Exception as e:          # 凭据/网络/解析错误：一句话 + 非零退出，不抛栈
+    except Exception as e:          # Report credential/network/parsing failures briefly with a nonzero exit status, without a traceback.
         sys.exit("TSP 请求失败: %s" % e)

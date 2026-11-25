@@ -1,15 +1,16 @@
 #!/bin/bash
-# sr —— 宿主机唯一入口。单容器编所有版本：
-#   版本差异全靠"指路"，容器永不重建（重建会杀掉 scheduler，农场就断了）：
-#     thirdparty  公共目录 $SR_TPDIR/<digest>/ 整体挂成 /tp，编译时 bind 到规范路径，用哪个由 STARROCKS_THIRDPARTY 指
-#     编译器      镜像里备齐 gcc 11/12/13/14，用哪个由 STARROCKS_GCC_HOME 指
-#   依赖镜像的版本由用户显式指定（-v），不自动推断；指定后自动跟随该版本 tag 的最新 digest，
-#   digest 变了会提示"若报依赖错误先 rebase"（加依赖不破坏老代码；依赖升级时你的代码可能还没跟上）。
+# Host-side entrypoint for building supported versions in one persistent container.
+# Select version-specific thirdparty mounts and GCC paths instead of recreating
+# the container and interrupting the scheduler or farm. The shared digest cache
+# is mounted at /tp; STARROCKS_THIRDPARTY and STARROCKS_GCC_HOME select each build's inputs.
+# Users choose dependency versions with -v; their tags follow the latest digest.
+# A digest change may require rebasing source code to match updated dependencies.
 set -uo pipefail
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
-# 站点相关的东西（registry、base 镜像、apt 源、公共依赖目录、节点账号）全在 srdev.conf 里，
-# 该文件不进仓库；容器内挂成 /etc/srdev.conf 给 sr-farm 用。模板见 srdev.conf.example。
-# 单次构建的非空并发覆盖优先于站点配置；不改配置文件，也不覆盖容器/农场身份。
+# Keep registry, base-image, apt-mirror, cache-directory, and node settings in the
+# untracked srdev.conf; see srdev.conf.example. Synchronize it to /farm for helpers.
+# Nonempty per-invocation concurrency overrides take precedence without changing
+# site configuration or container/farm identity.
 SR_BUILD_OVERRIDES=()
 for sr_build_var in SR_LOCAL_JOBS SR_FE_UT_JOBS SR_LINK_JOBS SR_LINK_MEM_GB; do
   [ -z "${!sr_build_var:-}" ] || SR_BUILD_OVERRIDES+=("$sr_build_var=${!sr_build_var}")
@@ -23,11 +24,11 @@ WORK=${WORK:-$HOME}
 CPUS=${CPUS:-16}
 MEM=${MEM:-64g}
 SR_USER=${SR_USER:-$(id -un)}
-SLICE=${SLICE:-srfarm_${SR_USER}.slice}   # 名字必须用下划线：systemd 把 a-b.slice 当成 a.slice 的子节点
+SLICE=${SLICE:-srfarm_${SR_USER}.slice}   # Use underscores: systemd interprets a-b.slice as a child of a.slice.
 NAME=${SR_USER}_farm
-IMG=${IMG:-}   # 默认为构建输入的内容标识，见 image_identity
-# 依赖按 digest 存，内容不可变、与用户无关——放公共目录全机共享，别人拉过的你不用再拉。
-# 公共目录不可写时退回自己 $HOME 下。
+IMG=${IMG:-}   # Default to the build-input content identity; see image_identity.
+# Dependency contents are immutable and keyed by digest, so users can share one
+# host-wide cache. Fall back to the user's home directory when it is not writable.
 SHARED_TP=${SR_TPDIR:-/srv/srdev/thirdparty}
 if [ -z "${SR_TPDIR:-}" ] && [ ! -e "$SHARED_TP" ]; then
   ( umask 000; mkdir -p "$SHARED_TP" && chmod 1777 "$SHARED_TP" ) 2>/dev/null || true
@@ -44,9 +45,9 @@ else
   fi
 fi
 
-# 只解析子命令之前的全局版本选项。子命令之后的 -v 是 sr-build 自己的
-# verbose 选项，不能被宿主入口吞掉；缺少参数时也要给出正常错误，而不是
-# 在 set -u 下报 unbound variable。
+# Parse global version options only before the subcommand. After it, -v belongs
+# to sr-build's verbose option. Report missing values explicitly instead of
+# triggering an unbound-variable error under set -u.
 SPEC=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -57,9 +58,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# SR_TP_REPO（srdev.conf）非空时：忽略 registries.conf 的命名空间，一律用它解析依赖镜像。
-# 用途：某个命名空间的发布断了（例如某个来源暂时没有所需的依赖更新），先临时切到别处；
-# 撤销就是删掉那一行，registries.conf 原样保留。
+# A nonempty SR_TP_REPO bypasses registry namespaces and selects this dependency
+# repository directly, for example during a publishing outage. Remove the override
+# to restore the unchanged registries.conf lookup order.
 ns_list(){ if [ -n "${SR_TP_REPO:-}" ]; then echo override; else awk '!/^#/&&NF{print $1}' "$CONF"; fi; }
 ns_url(){ [ -n "${SR_TP_REPO:-}" ] && { echo "$SR_TP_REPO"; return 0; }
   [ -f "$CONF" ] || { echo "!! 缺少 $CONF：cp registries.conf.example registries.conf 并填上你的 registry" >&2; return 1; }
@@ -72,9 +73,9 @@ tags_of(){ local ns=$1 u c; u=$(ns_url "$ns"); [ -n "$u" ] || return 1
     [ -s "$c.tmp" ] && mv "$c.tmp" "$c" || rm -f "$c.tmp"
   fi
   cat "$c" 2>/dev/null; }
-# 解析规则（按序）：main 先看 latest（用户指定：main 对应 tag 以 latest 匹配优先）；再 X.Y / X.Y-latest / X.Y-ee / X.Y-ee-latest；再最新的 X.Y-YYYYMMDD；
-# 最后兜底取该 minor 最高的补丁版 X.Y.Z（review：菜单从 3.5.20 抠出 3.5，镜像源没有 3.5-latest 时原来解析不了）。
-# 第三个参数可传已取到的 tag 列表，省一次请求
+# Resolve main to latest first, then try X.Y, X.Y-latest, X.Y-ee, X.Y-ee-latest,
+# and the newest X.Y-YYYYMMDD tag. Finally, fall back to the highest X.Y.Z patch.
+# An optional third argument reuses an already-fetched tag list.
 pick_tag(){ local ns=$1 v=$2 t c ve; t=${3:-$(tags_of "$ns")} || return 1; ve=${v//./\\.}
   for c in $([ "$v" = main ] && echo latest) "$v" "$v-latest" "$v-ee" "$v-ee-latest"; do
     grep -qx -- "$c" <<<"$t" && { echo "$c"; return 0; }; done
@@ -88,24 +89,25 @@ resolve(){ local v=$1 n
   for n in $(ns_list); do
     TAG=$(pick_tag "$n" "$v" 2>/dev/null) && { NS=$n; PBASE="$(ns_url "$n"):$TAG"; return 0; }
   done; return 1; }
-# 可选版本：main + 各 minor，只列 pick_tag 真能解析的（review：原来从 X.Y.Z 抠出 X.Y 就列，解析规则却可能不认）；
-# main 置顶，其余按版本号降序取 8 个，跨命名空间去重
+# Offer only versions that pick_tag can resolve. Put main first, followed by up
+# to eight minor versions in descending order, deduplicated across namespaces.
 candidate_versions(){ local n t c
   for n in $(ns_list); do t=$(tags_of "$n" 2>/dev/null) || continue
     for c in main $(printf '%s\n' "$t" | grep -oE '^[0-9]+\.[0-9]+' | sort -Vr | uniq); do
       pick_tag "$n" "$c" "$t" >/dev/null 2>&1 && echo "$c"; done
   done | awk '!seen[$0]++' | sort -Vr | awk '/^main$/{m=1; next} {a[++k]=$0} END{if(m) print "main"; for(i=1; i<=k && i<=8; i++) print a[i]}'; }
-# 不 pull 就能拿到内容指纹（实测 ~50ms）。用 digest 当目录名：上游重推同名 tag 也认得出来。
+# Read the content digest without pulling the image; digest-based directories detect republished tags.
 digest_of(){ local img=$1 h repo tag
   h=${img%%/*}; repo=$(echo "${img#*/}" | cut -d: -f1); tag=${img##*:}
-  # Accept 必须覆盖四种类型：registry 按 Accept 挑 manifest，只写 docker v2 时 OCI index（starrocks/dev-env-ubuntu 就是）返回 404
+  # Advertise Docker and OCI manifest/index types; Docker-only Accept headers can return 404 for OCI images.
   curl -sI --max-time 10 -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json" \
     "http://$h/v2/$repo/manifests/$tag" 2>/dev/null \
-    | grep -i '^docker-content-digest:' | tr -d '\r' | awk '{print $2}'; }   # 返回完整 sha256:…，截短只在显示时做
+    | grep -i '^docker-content-digest:' | tr -d '\r' | awk '{print $2}'; }   # Return the full sha256 digest; shorten it only for display.
 
 running(){ [ "$(docker inspect -f '{{.State.Running}}' $NAME 2>/dev/null)" = true ]; }
-# 交互性只看宿主机 stdin：是终端就把它接进容器（-i）并告知 SR_TTY=1，容器里的 Y/N 询问据此判断（-i 下容器内 -t 0 恒为假）。
-# -t 只在 stdout 也是终端时加：stdout 进了管道（sr build | tee log）还挂 -t，docker 会拒绝或把回车/转义码灌进日志（review）
+# Determine interactivity from host stdin, forwarding it with -i and SR_TTY=1.
+# Container stdin is not itself a TTY with -i alone. Add -t only when stdout is
+# also a terminal, so pipelines such as tee receive clean output.
 TTY=(); if [ -t 0 ]; then TTY=(-i -e SR_TTY=1); [ -t 1 ] && TTY=(-it -e SR_TTY=1); fi
 
 image_identity(){
@@ -130,7 +132,7 @@ build_image(){
   echo "== 构建单镜像 $IMG（base=${SR_BASE_IMAGE:-Dockerfile 默认}，装 gcc 11/12/13 + 各自的 icecc 工具链包）…"
   BA=(--build-arg APT_MIRROR="${SR_APT_MIRROR:-}" --build-arg SR_IMAGE_ID="$IMAGE_ID"); [ -n "${SR_BASE_IMAGE:-}" ] && BA+=(--build-arg BASE="$SR_BASE_IMAGE")
   docker build -f "$HERE/Dockerfile" "${BA[@]}" -t $IMG "$HERE"; }
-# 没镜像就地构建（首次约 5 分钟）：sr up / sr build 都不该因为"还没跑 sr image"停下来；sr image 保留为显式重建
+# Build a missing image automatically for sr up/build; sr image remains the explicit rebuild command.
 ensure_image(){
   image_identity || return 1
   local metadata actual
@@ -145,12 +147,11 @@ ensure_image(){
   fi
   [ -n "$IMAGE_REF" ]
 }
-# 站点配置每次调用都同步进容器可见的目录。原来把 srdev.conf 作为单个文件 bind mount 到 /etc/srdev.conf：Docker 单文件挂载钉的是
-# inode，vim/sed -i 保存都是"写新文件再 rename"换了 inode，容器就永远读到容器创建那一刻的旧内容（实测：宿主 WORKERS=6/8c16g，
-# 容器仍 5/8c32g）。/farm 是目录挂载，文件替换可见；写临时文件再 mv 保证容器不会读到半截。/etc/srdev.conf 的挂载保留，仅作旧容器兼容。
-# 临时文件必须 mktemp 每次新建、不能用固定名 srdev.conf.tmp：固定名一来被两个并发 sr 同时写会发布半截配置（codex r8#2），
-# 二来目录还没收紧时可被别人预置成符号链接，cp 跟着写、mv 把链接发布出去，容器 root source 它就等于执行别人的文件（codex r8#3）。
-# 调用方必须检查返回码：同步失败还继续，容器就会按上一次的旧配置干活（codex r8#4）。
+# Synchronize configuration into the directory-mounted /farm on every invocation.
+# Single-file bind mounts retain the old inode after an editor replaces a file.
+# Publish atomically through a unique mktemp file, avoiding partial concurrent
+# writes and precreated symlink attacks. The old /etc/srdev.conf mount is retained
+# only for compatibility. Callers must abort if synchronization fails.
 sync_conf(){
   if [ ! -f "$CONF_FILE" ]; then
     [ -f "$BASE/farm/srdev.conf" ] && echo "   (提示：$CONF_FILE 不存在，容器仍在用上次同步的 $BASE/farm/srdev.conf)" >&2
@@ -158,26 +159,23 @@ sync_conf(){
   fi
   local tmp; tmp=$(mktemp "$BASE/farm/.srdev.conf.XXXXXX" 2>/dev/null) || return 1
   cp -f "$CONF_FILE" "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$BASE/farm/srdev.conf" || { rm -f "$tmp" 2>/dev/null; return 1; }; }
-# "64g" -> 字节。只认 docker 那几种后缀；给不出数就返回空，调用方跳过比较。
+# Convert Docker memory sizes such as 64g to bytes; return empty for unsupported values.
 mem_bytes(){ local v=${1:-} n u; n=${v%[a-zA-Z]}; u=${v#"$n"}
   case "$n" in ''|*[!0-9]*) return 1;; esac
   case "$(printf %s "$u" | tr A-Z a-z)" in
     g) echo $(( n * 1073741824 ));; m) echo $(( n * 1048576 ));; k) echo $(( n * 1024 ));; b|'') echo "$n";; *) return 1;; esac; }
 
-# 改了 srdev.conf 里的 CPUS / MEM 之后不必重建容器：docker update 能热改配额，
-# 实测这一天里从 8c24G 一路改到 16c64G，容器里正在跑的构建和 sr deploy 起的集群都没中断。
-# 所以这里发现"运行中的配额 != 配置"就直接热改，用户只要 sr up（或直接下一次 sr build）。
-# 不走 sr down && sr up 是有原因的：那会连带杀掉 sr deploy 部署的 FE/BE 和别人正在跑的构建。
-# 例外是 iceccd 的 -m：它是启动参数，改不了，只能重启 daemon；空闲时顺手停掉让下次编译重新拉起，
-# 有构建在跑就只提示（sr-build 复用已有 daemon 时也会再提醒一次 -m 不符）。
-# "16" / "1.5" -> nanocpus；非法返回空
+# Use docker update to increase configured resource limits without interrupting
+# builds or deployed services. Automatic shrinking is unsafe and requires an
+# explicit container restart when idle. iceccd -m is a startup setting, so a
+# mismatch is reported rather than silently restarting the daemon.
+# Convert CPU values such as 16 or 1.5 to nanocpus; invalid values return empty.
 cpu_nanos(){ case "${1:-}" in ''|*[!0-9.]*|.*|*.) return 1;; *.*.*) return 1;; esac
   awk -v c="$1" 'BEGIN{ n=c*1000000000; if (n<1) exit 1; printf "%d", n }' 2>/dev/null; }
 
-# cgroup 上限的三种取值：具体字节数/纳核数、inf（无限制）、?（读不到）。
-# codex 第三轮#3：原来把 memory.max 的 "max" 当普通字符串比，于是"无限制 -> 64G"被判成放大照做了，
-# 而那其实是缩容；CPU 的 "max" 则被归成空值，单独改 CPU 时静默漏判、跟着内存改时又会被一起收紧。
-# 必须把"无限制"和"读不到"分开，无限制按正无穷参与比较。
+# Represent cgroup limits as a number, inf for unlimited, or ? for unavailable.
+# Unlimited is positive infinity, not an unknown value; replacing it with a finite
+# limit is a reduction and must not be mistaken for an automatic increase.
 norm_mem(){ case "${1:-}" in max) echo inf;; ''|*[!0-9]*) echo '?';; *) echo "$1";; esac; }
 norm_cpu(){ case "${1:-}" in max) echo inf; return;; ''|*[!0-9]*) echo '?'; return;; esac
   case "${2:-}" in ''|*[!0-9]*) echo '?'; return;; esac
@@ -189,23 +187,23 @@ is_shrink(){ [ "$1" = '?' ] && return 1; [ "$1" = inf ] && return 0; [ "$1" -gt 
 show_g(){ case "$1" in inf) echo 无限制;; '?') echo 读不到;; *) awk -v n="$1" 'BEGIN{printf "%.4g", n/1073741824}';; esac; }
 show_c(){ case "$1" in inf) echo 无限制;; '?') echo 读不到;; *) awk -v n="$1" 'BEGIN{printf "%g", n/1000000000}';; esac; }
 
-# 有效上限 = 容器自己的 cgroup 与父 slice 取小。两边都直接读 cgroup 文件，不经 docker 的记账——
-# 父 slice 没改成时 docker 的 HostConfig 早已等于期望值，只看它就会永远早退（codex r14#5 / 复查#6）。
-# codex 第三轮#2：CPU 原来只读了容器侧，父 slice 限制更紧时会谎称"已生效"。现在两边都读。
+# Effective limits are the minimum of container and parent-slice cgroup values.
+# Read both CPU and memory directly: Docker's HostConfig can already match the
+# request even when updating the parent slice failed.
 eff_limits(){ local out cm cc cq cp sm sc sq sp
-  # codex 第四轮#2：原来把两个文件拼成一行空白分隔再 read 三个变量——memory.max 读不到时字段会左移，
-  # cm 拿到的其实是 CPU 的 quota，"内存读不到就不动配额"那条保护直接失效。改成用 | 分隔并显式填 ?。
+  # Use explicit separators and ? for missing fields; whitespace splitting could
+  # otherwise shift a CPU quota into the missing memory-limit field.
   out=$(docker exec $NAME sh -c 'm=$(cat /sys/fs/cgroup/memory.max 2>/dev/null); c=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null); printf "%s|%s\n" "${m:-?}" "${c:-?}"' 2>/dev/null)
   case "$out" in *'|'*) cm=${out%%|*}; cc=${out#*|};; *) cm='?'; cc='?';; esac
   cq=${cc%% *}; cp=${cc#* }
-  # codex 第四轮#1：sq 原来预置成 max，read 因文件不可读而根本没执行时它仍是 max -> 被当成"无限制"，
-  # 于是"CPU 读不到就不碰 CPU"的退路被绕过。改成先取内容、取不到就是 ?，不让初值冒充读数。
+  # Read before assigning a value; an unreadable cpu.max must remain unknown,
+  # not inherit an initial max value and be mistaken for unlimited.
   if [ -n "${SLICE:-}" ] && [ -d "/sys/fs/cgroup/$SLICE" ]; then
     sm=$(cat "/sys/fs/cgroup/$SLICE/memory.max" 2>/dev/null); sm=${sm:-?}
     sc=$(cat "/sys/fs/cgroup/$SLICE/cpu.max" 2>/dev/null); sc=${sc:-?}
     sq=${sc%% *}; sp=${sc#* }
   else
-    # slice 目录不存在 = 没有这一层限制（当前就是顶层 slice 的部署方式），按无限制算
+    # A missing parent slice imposes no additional limit; treat it as unlimited.
     sm=max; sq=max; sp=""
   fi
   printf '%s %s\n' "$(min_lim "$(norm_mem "$cm")" "$(norm_mem "$sm")")" \
@@ -220,19 +218,19 @@ resize_if_needed(){
   [ "$em" != "$wm" ] && need_m=1
   [ -n "$wc" ] && [ "$ec" != '?' ] && [ "$ec" != "$wc" ] && need_c=1
   if [ $need_m = 0 ] && [ $need_c = 0 ]; then
-    # CPU 读不到时它永远算不出 need_c，静默跳过会让人以为核对过了（codex 第四轮"提示不完整"）
+    # Report unavailable CPU readings rather than implying that the quota was checked.
     [ -n "$wc" ] && [ "$ec" = '?' ] && echo "   (读不到 CPU 的有效上限，本次没有核对 CPU 配额)"
     return 0
   fi
-  # 自动路径只放大。缩小会立刻作用到正在跑的构建和容器里常驻的 FE/BE，可能直接把它们压到 OOM；
-  # 而"先探测忙不忙再动手"本身与构建启动存在竞态（探测完锁就放了），所以干脆不自动缩（codex r14#2/#3/#4）。
+  # Only increase limits automatically. Shrinking can OOM active builds or services,
+  # and a check-then-act idle probe races with new work starting.
   if is_shrink "$em" "$wm" || { [ -n "$wc" ] && [ "$ec" != '?' ] && is_shrink "$ec" "$wc"; }; then
     echo "!! srdev.conf 里的配额比容器当前有效值小（内存 $(show_g "$em")G -> $MEM，CPU $(show_c "$ec") -> ${CPUS} 核）。"
     echo "   调小不会自动执行：它会立刻作用到正在跑的构建和容器里常驻的 FE/BE，可能直接把它们压到 OOM。"
     echo "   确认空闲后用 sr down && sr up 重建容器，那条路径是干净的。"
     return 0
   fi
-  # CPU 有效值读不到时不碰 CPU：盲目带上 --cpus 可能在不知情的情况下把它收紧
+  # Do not modify an unknown CPU limit: passing --cpus could unknowingly reduce it.
   local cpu_arg=""; [ -n "$wc" ] && [ "$ec" != '?' ] && cpu_arg=1
   [ -n "$wc" ] && [ "$ec" = '?' ] && echo "   (读不到 CPU 的有效上限，本次只改内存，不动 CPU)"
   echo "== 容器配额比 srdev.conf 小，放大（docker update，不重建容器）"
@@ -245,7 +243,7 @@ resize_if_needed(){
       || echo "   (提示：sudo -n systemctl set-property 没成功；父 slice 上限可能还是旧值，下面回读会看出来)"
   fi
   docker update ${cpu_arg:+--cpus="$CPUS"} --memory="$MEM" --memory-swap="$(( wm * 2 ))" $NAME 2>&1 | sed 's/^/   docker: /'
-  # 回读用同一套"父子取小"的读数，不经 docker 的记账
+  # Verify the effective container/parent limits directly, not Docker's recorded settings.
   read -r em ec < <(eff_limits)
   if [ "$em" = "$wm" ]; then echo "   内存已生效（回读有效上限 $(show_g "$wm")G）"
   else echo "   !! 内存没改成：期望 $(show_g "$wm")G，实际有效 $(show_g "$em")G。下次 sr up 还会再试；要彻底解决请 sr down && sr up。"; fi
@@ -253,34 +251,34 @@ resize_if_needed(){
     if [ "$ec" = "$wc" ]; then echo "   CPU 已生效（回读有效 $CPUS 核）"
     else echo "   !! CPU 没改成：期望 $CPUS 核，实际有效 $(show_c "$ec") 核。下次 sr up 还会再试。"; fi
   fi
-  # 不自动 pkill iceccd：探测忙闲与动手之间必然有竞态，误杀的后果是 icecc 失去并发闸门、
-  # 无限制本地编译直到 OOM。-m 过期由 sr-build 复用 daemon 时提示，真要刷新就 sr down && sr up。
+  # Do not automatically kill iceccd: an idle probe races with new work, and killing
+  # the daemon can bypass concurrency limits. Report a stale -m and require an
+  # explicit sr down/up when the user can safely restart.
   [ $need_c = 1 ] && echo "   (本机 iceccd 的 -m 是启动参数，仍是旧核数；下次构建会提示，空闲时 sr down && sr up 刷新)"
   return 0; }
 
-# 从 $PWD 上溯找 StarRocks 根；给了参数就只认那个目录本身（不上溯）。build 分支里另有一个同义的局部实现，
-# 那个还要兼顾"参数里哪个才是目录"的扫描，这里只服务 pack 这类简单场景。
+# Without an argument, search upward from PWD for the StarRocks root. An explicit
+# path must itself be the root. Build dispatch has a separate equivalent helper
+# that also distinguishes source paths from option values.
 tree_root(){ local d
   if [ -n "${1:-}" ]; then
     [ -f "$1/build.sh" ] && [ -d "$1/be/src" ] && { (cd "$1" && pwd -P); return 0; }; return 1; fi
   d=$(pwd -P); while [ "$d" != / ]; do
     [ -f "$d/build.sh" ] && [ -d "$d/be/src" ] && { echo "$d"; return 0; }; d=$(dirname "$d"); done; return 1; }
 
-# bind mount 钉的是目录本身（dentry），不是路径字符串。宿主机上把 ~/ccache 改名成 ~/ccache-old，
-# 容器里的 /ccache 还是同一个目录——inode 不变，缓存照常命中，人以为"清空了缓存"其实一点没清
-# （目录改名后，容器仍指向原目录，docker inspect 中记录的路径也不会随之更新）。
-# 和当初 srdev.conf 单文件挂载被 inode 钉住是同一类坑，只是这次是目录。
-# 换挂载点只能重建容器，所以这里只做检测：比对容器里各挂载点的 inode 与宿主机上"现在"该路径的 inode。
-# codex r14#15：原来只告警就继续，但 /farm 漂移之后 sync_conf 写的是新目录、容器读的是旧挂载，
-# 宿主机与容器会基于两份不同的配置和农场状态干活——这比不干活更糟。所以 /farm 与 /tp 漂移直接失败；
-# /ccache 漂移只影响缓存命中，告警即可。比对带上设备号：跨文件系统时 inode 可能撞号。
+# Bind mounts pin directory objects, not path strings. Renaming a host cache
+# therefore leaves the container using the original directory even if docker
+# inspect still shows the old path. Compare device/inode pairs with the current
+# host paths. Cache drift warrants a warning; farm or dependency drift must abort
+# because host and container would otherwise use different state or inputs.
+# Changing a mount requires explicit container recreation.
 check_mounts(){
   local out hi ci p hp fatal=0
   out=$(docker exec $NAME sh -c 'for d in /ccache /farm /tp; do printf "%s %s\n" "$d" "$(stat -c %d:%i "$d" 2>/dev/null || echo -)"; done' 2>/dev/null) || return 0
   while read -r p ci; do
     case "$p" in /ccache) hp=$BASE/ccache;; /farm) hp=$BASE/farm;; /tp) hp=$TPDIR;; *) continue;; esac
     [ "$ci" = - ] && continue
-    hi=$(stat -L -c %d:%i "$hp" 2>/dev/null)   # -L：挂载点本身可能是符号链接，docker 挂的是它的目标（codex 复查#10）
+    hi=$(stat -L -c %d:%i "$hp" 2>/dev/null)   # Follow symlinks: Docker mounts their targets.
     [ "$hi" = "$ci" ] && continue
     if [ -z "$hi" ]; then
       echo "!! 容器里的 $p 挂的目录，在宿主机上已经不在 $hp 了（被改名或删了？）。"
@@ -307,15 +305,16 @@ tp_read_lock(){
 
 ensure_container(){
   local version_policy=${1:-check}
-  # 顺序要紧：先把 farm 目录收紧到 0700 再往里写配置——目录还开放时写固定路径会被预置的符号链接劫持（codex r8#3）。
-  # 0700 迁移也必须在 running 短路之前，否则已在跑的老部署永远不会被修；改不动就拒绝，这是提权向量，不能带着跑。
+  # Restrict the farm directory to 0700 before writing configuration and before
+  # the running-container shortcut. Otherwise another user could precreate a
+  # symlink or replace state; refuse to continue if the permission change fails.
   mkdir -p "$BASE/farm" 2>/dev/null
   if [ -d "$BASE/farm" ] && [ "$(stat -L -c %a "$BASE/farm" 2>/dev/null)" != 700 ]; then
     chmod 700 "$BASE/farm" 2>/dev/null || { echo "!! 无法把 $BASE/farm 设为 0700（其他用户可替换 state.env 提权），请先手动 chmod 700 后重试"; return 1; }
     echo "   (已把 $BASE/farm 收紧为 0700)"
   fi
-  # 挂载检查必须在 sync_conf 之前：/farm 漂移时 sync_conf 会把配置写进宿主机的新目录，而容器读的还是旧挂载，
-  # 两边各拿一份配置干活（codex r14#15）。所以先查挂载，致命就中止，别再往下写任何东西。
+  # Check mounts before sync_conf. If /farm drifted, writing host configuration
+  # would update a different directory from the one the container reads.
   if running; then
     check_container_version "$version_policy" || return 1
     check_mounts || return 1
@@ -326,13 +325,15 @@ ensure_container(){
   sync_conf || { echo "!! 同步站点配置到 $BASE/farm/srdev.conf 失败（磁盘满/不可写？）。继续下去容器会按上一次的旧配置干活，已中止。"; return 1; }
   ensure_image || { echo "!! 镜像构建失败"; return 1; }
   mkdir -p $BASE/ccache $BASE/m2 $BASE/farm $BASE/.tsp $BASE/iceccrun $TPDIR
-  # review r7#3(P1)：原来 farm 是 0777 且无 sticky，本机任何用户都能删掉再放一个 state.env，容器 root 会读它 → 提权。
-  # 改 0700：owner 仍能删容器 root 建的文件（删文件只看目录 w 位），容器 root 不受目录权限限制，其他用户进不来。
-  # iceccrun 不能 0700：daemon 以 nobody 跑、要在里面建 socket（实测目录属主已是 nobody，chmod 会 EPERM）；它保持 0755，
-  # 不可写就不是"替换文件"的向量。残余：socket 本身 0777（icecc 默认），靠 $HOME 0750 挡住非同组用户；换 daemon uid 另议。
+  # Use 0700 for farm state so other users cannot replace files later read by
+  # container root. The owner can still delete root-created files through directory
+  # permissions. Keep iceccrun accessible to the daemon for socket creation; its
+  # non-writable directory prevents replacement, while socket access also depends
+  # on the enclosing home-directory permissions.
   chmod 700 $BASE/farm 2>/dev/null || echo "!! 无法把 $BASE/farm 设为 0700，请手动 chmod 700（否则其他用户可替换 state.env）"
-  # review r7#2(P1)：两次首次 sr build 并发，慢的一方会在快的一方已开工后 docker rm -f 掉它的容器。按容器名加锁、锁内复查。
-  # 验证轮 #5：无命令的 `exec ... 2>/dev/null` 会永久吞掉本 shell 后续的 stderr；用 { } 把重定向限定在这一句
+  # Serialize first startup by container name and recheck under the lock, so a
+  # second caller cannot remove a container already doing work. Scope redirection
+  # around exec with braces so later stderr output is not permanently suppressed.
   { exec 8>"$BASE/farm/.container.lock"; } 2>/dev/null || { echo "!! 无法打开 $BASE/farm/.container.lock（目录权限？），拒绝在无互斥下起容器"; return 1; }
   flock -w 120 8 || { echo "!! 等待容器启动锁超时（另一个 sr 正在起容器？）"; return 1; }
   if running; then exec 8>&-; check_container_version "$version_policy"; return $?; fi
@@ -343,29 +344,28 @@ ensure_container(){
       "MemoryMax=$(echo "$MEM" | tr 'gmk' 'GMK')" >/dev/null 2>&1 && CGP=(--cgroup-parent "$SLICE")
   fi
   docker rm -f $NAME >/dev/null 2>&1
-  # --init: tini 当 PID1 回收僵尸。否则被杀的 iceccd 留成 <defunct>，探活会误判 daemon 还在，
-  # icecc 随即绕过并发闸门无限制本地编译 -> OOM（踩过）
-  # --ulimit nofile: BE 打开 storage engine 要求 fd 上限 >= 60000，docker 默认软上限 1024，
-  # 跑 BE 单测会直接 "file descriptors limit is too small" 退出（踩过）。给足一次，省得每处再抬。
+  # --init reaps orphaned children so zombie iceccd processes cannot fool liveness
+  # checks and bypass concurrency limits. Set nofile high enough for BE's storage
+  # engine and unit tests, which require at least 60000 descriptors.
   docker run -d --name $NAME --init --network host --privileged \
     ${CGP[@]+"${CGP[@]}"} --cpus=$CPUS --memory=$MEM --ulimit nofile=655350:655350 \
     -v $WORK:$WORK -v $BASE/ccache:/ccache -v $BASE/m2:/root/.m2 \
     -v $BASE/farm:/farm -v $BASE/.tsp:/root/.tsp -v $BASE/iceccrun:/var/run/icecc \
     -v $TPDIR:/tp $([ "${TPDIR#$WORK/}" = "$TPDIR" ] && echo "-v $TPDIR:$TPDIR") ${CONF_MOUNT[@]+"${CONF_MOUNT[@]}"} \
     -e SR_USER="$SR_USER" -e SR_UID="$(id -u)" -e SR_OSSCFG="$HOME/.ossutilconfig" -w $WORK "$IMAGE_REF" sleep infinity >/dev/null
-  local drc=$?; exec 8>&-   # 容器起完就放锁（无论成败）
+  local drc=$?; exec 8>&-   # Release the startup lock as soon as container creation finishes, on success or failure.
   [ $drc = 0 ] || { echo "!! 容器启动失败（docker run 返回非零）"; return 1; }
   echo "== 容器 $NAME 已启动（单容器，编所有版本；限额 ${CPUS}核/${MEM}）"
-  # 看门狗随容器死。容器重建后若已有农场，必须立刻把它拉回来——否则 3 小时无续约，
-  # 死人开关会把农场释放（踩过：一天里反复重建容器，农场被自己的保护机制清掉了）
+  # The watchdog dies with its container. Restart it immediately for an existing
+  # farm after container recreation, or the unrenewed lease will expire.
   [ -f "$BASE/farm/state.env" ] && docker exec $NAME sr-farm _wd >/dev/null 2>&1 && echo "   看门狗已重新拉起（农场续约恢复）"
-  return 0   # 上一行是条件链，没有农场时会返回 1，曾让新用户第一次 sr build 在容器起好后被 || exit 1 打断
+  return 0   # Return success even when no farm exists; the preceding conditional chain can otherwise return 1.
 }
 
-# 把某个官方镜像的 thirdparty 拉到 $TPDIR/<digest>/，并记下它要哪个 gcc
-# $1=镜像引用 repo@sha256:…（一切 docker 操作按 digest，tag 移动或本地残留同 tag 旧镜像都拿不到错内容）
-# $2=完整 digest（64 hex，直接做目录名：名字与内容由构造保证一致，永远不需要替换一个可能正被别人 bind 着编译的目录）
-# $3=解析出的 tag 形式，只用于记录
+# Extract an image's thirdparty directory into $TPDIR/<digest> and record its GCC major.
+# $1 is repo@sha256:...; every Docker operation uses the digest to avoid moving tags.
+# $2 is the full 64-hex directory digest, whose contents are immutable once ready.
+# $3 is the resolved tag reference, recorded only as metadata.
 ensure_tp(){
   local img=$1 dg=$2 tagname=${3:-$1}
   local d=$TPDIR/$dg
@@ -373,46 +373,47 @@ ensure_tp(){
   [ -n "${TP_FALLBACK_NOTE:-}" ] && echo "$TP_FALLBACK_NOTE" >&2
   echo "== 首次使用该镜像的依赖，拉取中（约 7 秒，6~8G）…" >&2
   docker image inspect "$img" >/dev/null 2>&1 || { echo "   拉镜像 $img …" >&2; docker pull -q "$img" >/dev/null 2>&1; }
-  # 多用户可能同时拉同一 digest：flock 串行，先拷到 .tmp 再原子 mv，别人永远看不到半成品
-  # 锁文件要能被所有用户打开：A 建的 644 文件 B 打不开写就 flock 不了；sticky 目录(1777)下带 O_CREAT 打开别人文件会 EACCES，故用只读 fd 上锁。
+  # Serialize extraction of the same digest and publish a complete temporary
+  # directory atomically. Open shared lock files read-only: O_CREAT on another
+  # user's file can fail in a sticky directory under protected_regular.
   local lk="$TPDIR/.lock.$dg"
   [ -e "$lk" ] || ( umask 000; : >>"$lk" ) 2>/dev/null
   chmod 666 "$lk" 2>/dev/null || true
   [ ! -L "$lk" ] || { echo "!! 依赖锁文件异常（符号链接）：$lk" >&2; return 1; }
-  # 提取放进子 shell 持锁：子 shell 一退锁就放（review extra#3：原来 exec 7 在主 shell 拿锁不放，B 要等 A 整轮编译结束
-  # 才能用已经就绪的依赖）。里面任何一步失败都不发布半成品（review extra#1：原来元数据写失败仍 mv、探测不到 gcc 就默认 14）。
+  # Hold the extraction lock in a subshell so it is released before compilation.
+  # Never publish after an extraction, metadata, or compiler-detection failure.
   (
     flock 9 || exit 1
-    [ -f "$d/.ready" ] && exit 0   # 等锁期间别人拷完了
+    [ -f "$d/.ready" ] && exit 0   # Another user may have completed extraction while this caller waited for the lock.
     t="$d.tmp.$$"; rm -rf "$t" 2>/dev/null; mkdir -p "$t/installed"
-    # 不在这里 rm "$d"：旧目录里的 installed 是 cp -a 从镜像拷来的、属主是 root，developer 的 rm -rf 删不动它，
-    # $d 会残留，随后 mv 把 $t 塞进 $d 变成嵌套（<digest>/<digest>.tmp.NNN，顶层永远没 .ready，容器挂载报 installed 不存在——2026-09-16 踩过）。
-    # 发布见下面的"重命名让路"。
-    # 布局必须是 <dir>/installed/...：build.sh 检查 $STARROCKS_THIRDPARTY/installed/llvm/lib/libLLVMInstCombine.a，
-    # 找不到就会去跑 build-thirdparty.sh 现场编（踩过：平铺后 rc=127）
-    # 用 docker run 而不是 docker cp：实测 7s vs 18s，docker cp 要把 6.6G 序列化成 tar 流过 daemon
+    # Do not remove the destination here: root-owned extracted contents may survive
+    # an unprivileged rm, making mv nest the temporary directory inside it. Rename
+    # the old destination out of the way during publication instead.
+    # Preserve <dir>/installed/... so build.sh finds prebuilt dependencies rather
+    # than attempting a thirdparty build. docker run avoids docker cp's large tar stream.
     docker run --rm -v "$t/installed":/dst "$img" cp -a /var/local/thirdparty/installed/. /dst/ >/dev/null 2>&1 \
       || { echo "!! 依赖拉取失败" >&2; rm -rf "$t"; exit 1; }
-    # 这个镜像用哪个 gcc 大版本，编译时据此选 /opt/gccNN。探测失败就中止——绝不能默认 14 继续编（会选错编译器）
+    # Detect the required GCC major; abort if detection fails rather than guessing 14.
     gv=$(docker run --rm "$img" bash -c 'G=$(ls -d /opt/gcc-toolset-*/bin/gcc 2>/dev/null|sort -V|tail -1); [ -n "$G" ]||G=$(command -v gcc); $G -dumpversion' 2>/dev/null)
     gv=${gv%%.*}; gv=${gv//[!0-9]/}
     [ -n "$gv" ] || { echo "!! 探测不到 $img 的 gcc 版本，不敢默认 14，已中止（检查镜像或重试）" >&2; rm -rf "$t"; exit 1; }
     docker run --rm -v "$t":/dst "$img" bash -c "echo $gv > /dst/.gccmajor; echo $tagname > /dst/.image; echo $img > /dst/.ref; echo sha256:$dg > /dst/.digest; chmod -R a+rX /dst; touch /dst/.ready" >/dev/null 2>&1 \
       || { echo "!! 依赖元数据写入失败，不发布半成品目录，已中止" >&2; rm -rf "$t"; exit 1; }
-    # 发布前完整性自检：.ready 与数字 .gccmajor 都必须在
+    # Require both .ready and a numeric .gccmajor before publication.
     { [ -f "$t/.ready" ] && grep -qE '^[0-9]+$' "$t/.gccmajor" 2>/dev/null; } \
       || { echo "!! 依赖目录完整性检查未过（缺 .ready 或 .gccmajor 非数字），已中止" >&2; rm -rf "$t"; exit 1; }
-    # 发布：$d 若还在（含删不动的 root 属主 installed），先重命名让路——普通用户拥有父目录 $TPDIR 时 rename 直接成功；
-    # 若 $TPDIR 带 sticky(1777) 且残留目录属主是他人或 root，退回容器 root 移走，这样 mv 目标必不存在，绝不会嵌套。
+    # Rename an existing destination before moving the new directory into place.
+    # In sticky directories, use container root if ownership prevents the rename,
+    # ensuring mv cannot accidentally create a nested dependency directory.
     if [ -e "$d" ]; then
       mv -f "$d" "$d.stale.$$" 2>/dev/null \
         || docker run --rm -v "$TPDIR":/tp "$img" sh -c 'mv -f "/tp/$1" "/tp/$1.stale.$2"' _ "$dg" "$$" >/dev/null 2>&1
       [ -e "$d" ] && { echo "!! 无法移开旧依赖目录 $d，中止，不做嵌套发布" >&2; rm -rf "$t"; exit 1; }
     fi
     mv "$t" "$d" || { echo "!! 发布依赖目录失败" >&2; rm -rf "$t"; exit 1; }
-    # 顺手用 root（容器/镜像里 root）清掉被让路的 root 属主残留，避免 .stale 越攒越多。
-    # 这是可选收尾，绝不能决定提取成败：它若是子 shell 的最后一条命令，正常（没有 stale）时 [ -d ] 返回 1，
-    # 会把已经发布成功的依赖判成失败，于是每个新 digest 的首次拉取都"失败"（codex r8#1）。故失败只提示，并显式 exit 0。
+    # Use container root to remove stale root-owned contents. Cleanup is optional:
+    # report failure but explicitly return success after publication, including when
+    # no stale directory exists.
     if [ -d "$d.stale.$$" ]; then
       docker run --rm -v "$TPDIR":/tp "$img" sh -c "rm -rf /tp/$dg.stale.$$" >/dev/null 2>&1 \
         || echo "   (提示：旧目录残留 $d.stale.$$ 未能清理，可稍后手工删；不影响本次依赖)" >&2
@@ -424,31 +425,29 @@ ensure_tp(){
   return 1; }
 
 case "${1:-}" in
-image)   build_image ;;   # 显式重建（改了 Dockerfile 之后）；平时 sr up / sr build 发现没镜像会自动构建
+image)   build_image ;;   # Explicit image rebuild; normal up/build creates the image only when missing.
 ide)     python3 "$HERE/files/sr-vscode.py" "$PWD" "$HERE" /farm/deploy --ide-only ;;
 up)      ensure_container && tp_register ;;
 down)    docker rm -f $NAME >/dev/null 2>&1; echo "容器已删除（挂载卷保留）" ;;
 shell)   ensure_container allow-old && docker exec -it $NAME bash -l ;;
 history|log)
   F=$BASE/farm/builds.tsv
-  # 历史文件可选：第一次构建时它还不存在，但侧车里已经有"运行中"那一行了，
-  # 直接退出会让用户在最需要看进度的时候什么都看不到（codex#3）。
-  # 第 7 列是 build.sh 的退出码：0=成功，其余=失败。history 只报成功/失败，不写原因（用户要求）；要查原因看末列日志路径
-  # 对齐：printf 的 %-Ns 按字节补齐，而中文在终端占 2 列 —— 表头与数据、数据行彼此都会错开
-  # （本地/分布式/FEUT 三种值的字节数与显示宽度各不相同，原来三行各自歪一个量）。所以按显示宽度自己补：
-  # UTF-8 里 2 字节字符显示 1 列、3 字节显示 2 列、4 字节显示 2 列，减去差值即得。
-  # 列宽取"表头与本次要显示的数据"两者的最大值，不再写死 —— 原来源码树@分支 硬截到 22 字节，分支名整段看不见。
-  # 运行中的构建：sr-build 开工时写 /farm/sr-build.<md5>.run 侧车（前 7 列同 history 行 + 开始秒 + 临时日志/内存采样路径），收尾删。
-  # 判活不看 PID，看它持有的 .lock：flock -n 拿得到 = 没人在编 = 侧车是被 SIGKILL 留下的残骸，顺手清掉。
-  # 进度（ninja 的 [已完成/总数]）和内存峰值都在容器 /tmp 里，宿主机看不见，借一次 docker exec 读；
-  # 容器不在就不可能有运行中的构建，安静地不显示。结果列写 R，awk 里映射成"运行中"。
+  # History is optional before the first completed build; running-build sidecars
+  # may already exist. Column 7 records build.sh's exit code, displayed as success
+  # or failure; the log path contains details.
+  # Align by terminal display width rather than UTF-8 byte count, and choose widths
+  # from both headers and data so source/branch names are not truncated.
+  # A running build writes /farm/sr-build.<md5>.run with history fields, start time,
+  # and temporary log/sample paths. Check its source lock, not its PID: an available
+  # lock identifies a stale sidecar left by SIGKILL. Fetch progress and memory data
+  # from container /tmp through docker exec; omit running rows if the container is absent.
   RUNNING=$(docker exec $NAME sh -c '
     T=$(printf "\t")
     for f in /farm/sr-build.*.run; do
       [ -f "$f" ] || continue
       lk=${f%.run}.lock
-      # 必须在持锁作用域内判活并删残骸：flock 命令一返回锁就没了，
-      # 新构建可能正好在这个窗口里拿到锁、写下侧车，然后被这里的 rm 误删（codex#5）。
+      # Check liveness and remove stale sidecars while holding the lock. Releasing
+      # it first could let a new build publish a sidecar that this cleanup then deletes.
       if flock -n 9 -c "rm -f \"$f\"" 9<>"$lk" 2>/dev/null; then continue; fi
       IFS=$T read -r st user tree ver mode n tgt s outf anonf phase < "$f" || continue
       case "$s" in ""|*[!0-9]*) continue;; esac
@@ -468,10 +467,10 @@ history|log)
     BEGIN{ h[1]="时间"; h[2]="用户"; h[3]="源码树@分支"; h[4]="版本"; h[5]="目标"; h[6]="模式"
            h[7]="边数"; h[8]="结果"; h[9]="用时"; h[10]="anon峰"; h[11]="命中/编译"
            NC=11
-           cap[3]=64 }   # 只有这列可能很长；列宽本来就按实际数据自适应，上限放宽对短名字零代价。
-                          # 截断时留下 .. 作记号，且仅在纯 ASCII 时截（按字节切中文会切碎）
+           cap[3]=64 }   # Only this column may be very long; short names still use their actual width.
+                          # Mark truncation with .. and truncate ASCII only to avoid splitting UTF-8 characters.
     { n++
-      # 目标是第 12 个字段（后加的）。老行没有它，从"模式"里的 UT*/FEUT 前缀反推，两代格式显示一致。
+      # Target is field 12; infer it from legacy UT*/FEUT mode prefixes when absent.
       tgt=$12
       if(tgt==""){ if($5 ~ /^UT/) tgt="be-ut"; else if($5=="FEUT") tgt="fe-ut"; else tgt="?" }
       md=$5; sub(/^UT/,"",md); if(md=="FEUT") md="本地"
@@ -488,9 +487,10 @@ history|log)
            line=""
            for(i=1;i<=NC;i++) line=line (i>1?" ":"") (i==NC?cell[j,i]:pad(cell[j,i],w[i])); print line } }' ;;
 pack)
-  # 把当前源码树的 output/ 打成和官方日构建同构的包：顶层目录名 = 文件名 = <树名>-<短sha>[-dirty]，
-  # 里面就是 be/ fe/（以及构建时带上的 apache_hdfs_broker/）和 LICENSE/NOTICE，不额外塞东西。
-  # 上传必须显式 --upload：往共享桶里推 4G+ 的对象是对外动作，不能顺手做。桶名/前缀是站点信息，只从 srdev.conf 读。
+  # Package output/ in the official layout: a top-level tree-shortsha[-dirty]
+  # directory containing BE/FE, optional broker files, and LICENSE/NOTICE.
+  # Uploading large objects requires explicit --upload; bucket/prefix come only
+  # from site configuration.
   shift
   P_UP=0; P_FORCE=0; P_NAME=""; P_OUT=${SR_PKG_DIR:-$BASE/pkg}; P_SRC=""; P_LEVEL=${SR_PKG_LEVEL:-6}; P_JOBS=${SR_PKG_JOBS:-16}
   while [ $# -gt 0 ]; do case "$1" in
@@ -516,18 +516,18 @@ PU
   { [ -d "$POUTD/be" ] || [ -d "$POUTD/fe" ]; } || { echo "!! $POUTD 下既没有 be/ 也没有 fe/，不像编译产物"; exit 1; }
   if [ -z "$P_NAME" ]; then
     PSHA=$(git -C "$PSR" rev-parse --short HEAD 2>/dev/null || echo nogit)
-    # 脏树要在包名里说清楚：官方包都来自干净的 CI 构建，拿一个带未提交改动的包去部署而不自知很容易查半天
+    # Mark uncommitted source changes in the package name so deployed artifacts are not mistaken for clean CI builds.
     [ -n "$(git -C "$PSR" status --porcelain 2>/dev/null)" ] && PDIRTY=-dirty || PDIRTY=""
     P_NAME="$(basename "$PSR")-${PSHA}${PDIRTY}"
   fi
-  # codex r14#16：包名会原样进 tar --transform 的 sed 替换串，`&` 在替换侧代表"整段匹配"，
-  # --name 'a&b' 实测打出来的顶层目录是 aoutputb/；`|` 是分隔符会直接让表达式失效。所以限定字符集。
+  # Restrict names used in tar's sed replacement: '&' expands to the matched text
+  # and '|' terminates the delimiter, so accepting them would corrupt the archive layout.
   case "$P_NAME" in
     ''|.|..) echo "!! 包名不能为空，也不能是 . 或 ..：$P_NAME"; exit 1;;
     -*) echo "!! 包名不能以 - 开头：$P_NAME"; exit 1;;
     *[!A-Za-z0-9._-]*) echo "!! 包名只允许字母数字和 . _ -（它要当 tar 替换串和目录名）：$P_NAME"; exit 1;;
   esac
-  # 上传的前置条件必须在压缩之前查完：压一个包要几分钟，压完才说"没配桶"是在浪费时间（自测踩到）
+  # Validate upload prerequisites before spending time compressing the package.
   PURL=""
   if [ $P_UP = 1 ]; then
     [ -n "${SR_PKG_BUCKET:-}" ] || { echo "!! 没配 SR_PKG_BUCKET，不知道往哪个桶传。在 srdev.conf 里配上桶名与前缀再试。"; exit 1; }
@@ -541,11 +541,10 @@ PU
   fi
   mkdir -p "$P_OUT" 2>/dev/null || { echo "!! 建不了输出目录 $P_OUT"; exit 1; }
   PTGZ=$P_OUT/$P_NAME.tar.gz
-  # codex r14#7：ninja install 是逐文件拷贝，构建收尾时打包会读到半装好的 output/，tar 不会报错，
-  # 包名里的 sha 也证明不了产物就是那个提交。所以打包全程持有 sr-build 用的同一把源码树锁。
-  # codex 复查#8：锁文件不存在就跳过加锁，等于第一次用时没有互斥——无条件建出来再锁，没有 flock 就拒绝。
-  # codex 复查#9：无命令的 `exec … 2>/dev/null` 会把重定向留在当前 shell，后面 pigz/mv 的 stderr 全没了，
-  # 必须用 { } 限定（项目里已经踩过两次）。
+  # Hold the same source-tree lock as sr-build for the entire packaging operation;
+  # ninja install copies files incrementally, so output may otherwise be incomplete.
+  # Always create the lock file, require flock, and scope exec redirection with
+  # braces to preserve subsequent diagnostics.
   PLOCK=$BASE/farm/sr-build.$(printf %s "$PSR" | md5sum | cut -c1-12).lock
   command -v flock >/dev/null || { echo "!! 没有 flock，无法与构建互斥；这时候打包可能得到半装好的 output/，已拒绝。"; exit 1; }
   : > "$PLOCK" 2>/dev/null || [ -e "$PLOCK" ] || { echo "!! 建不了源码树锁 $PLOCK"; exit 1; }
@@ -553,8 +552,8 @@ PU
   { exec 9>>"$PLOCK"; } 2>/dev/null || { echo "!! 打不开源码树锁 $PLOCK"; exit 1; }
   flock -n 9 || { echo "!! 这棵源码树正在编译：$PSR"
     echo "   ninja install 是逐文件拷贝，这时候打包会得到半装好的 output/。等它编完再来。"; exit 1; }
-  # codex r14#4：两个 sr pack 同名并发会同时截断同一个 .part，还能各自绕过"已存在"检查。
-  # 用按目标文件加的锁把"检查 + 发布"框起来，临时文件也每次唯一。
+  # Lock each destination across existence checks and publication. Use a unique
+  # temporary file so concurrent pack commands cannot truncate each other's data.
   { exec 7>>"$PTGZ.lock"; } 2>/dev/null || { echo "!! 建不了 $PTGZ.lock（输出目录不可写？）"; exit 1; }
   flock -n 7 || { echo "!! 另一个 sr pack 正在生成同名包 $PTGZ"; exit 1; }
   [ -e "$PTGZ" ] && [ $P_FORCE = 0 ] && { echo "!! $PTGZ 已存在（--force 覆盖）"; exit 1; }
@@ -568,9 +567,9 @@ PU
   [ -n "$PURL" ] && echo "   上传目标: $PURL"
   echo "   压缩: pigz -$P_LEVEL -p$P_JOBS（产物 $(du -sh "$POUTD" | cut -f1)，需要几分钟）"
   PS0=$(date +%s)
-  # flags=r：改写只作用于成员名，不碰符号链接的目标（否则指向 output/... 的链接会被改坏）
-  # codex r14#8：原来只看 PIPESTATUS[0]（tar）。pigz 在收尾时失败（盘写满、参数非法）照样被当成成功，
-  # 发布出一个截断的包。两个退出码都要看；tar 的 stderr 也别丢，失败时要说得出原因。
+  # flags=r transforms archive member names without rewriting symlink targets.
+  # Check both tar and pigz exit codes before publishing, and retain tar's error
+  # output so truncated archives or compression failures cannot appear successful.
   tar -C "$PSR" --transform "flags=r;s|^output|$P_NAME|" -cf - output 2>"$PERR" | pigz -"$P_LEVEL" -p"$P_JOBS" > "$PPART"
   PRC=("${PIPESTATUS[@]}")
   if [ "${PRC[0]}" != 0 ] || [ "${PRC[1]}" != 0 ]; then
@@ -583,8 +582,8 @@ PU
   echo "   完成: $(du -h "$PTGZ" | cut -f1)  用时 $(( ($(date +%s)-PS0)/60 ))m$(( ($(date +%s)-PS0)%60 ))s"
   [ $P_UP = 0 ] && { echo "   （只打包。要上传加 --upload）"; exit 0; }
   echo "== 上传 -> $PURL"
-  # codex r14#9：原来 `ossutil cp | tail -3` 把退出码丢了，紧跟的 stat 又可能读到同名旧对象，
-  # 于是上传失败也显示得像成功。改成先看上传本身的退出码，再用远端大小和本地对比。
+  # Check ossutil's own exit status before comparing remote and local sizes;
+  # a pipeline ending in tail or an old same-name object must not mask upload failure.
   ossutil cp "$PTGZ" "$PURL" 2>&1 | tail -3; URC=${PIPESTATUS[0]}
   [ "$URC" = 0 ] || { echo "!! 上传失败（ossutil rc=$URC），远端对象未更新或不完整"; exit 1; }
   RSIZE=$(ossutil stat "$PURL" 2>/dev/null | awk -F': *' '/Content-Length/{print $2; exit}' | tr -d ' \r')
@@ -673,8 +672,9 @@ digest 变了会提示（若报依赖相关错误，先 rebase 代码）。换�
 U
 ;;
 *)
-  # 帮助和默认解释不需要容器、registry 或 thirdparty。这样在新机器、
-  # 非源码目录及无网络环境中也能立即回答。遇 -- 或选项值停止/跳过，避免把 `-- --help` 当宿主预览。
+  # Help and default explanations need no container, registry, or thirdparty, even
+  # outside a source tree or offline. Honor -- and option values so forwarded
+  # arguments such as -- --help are not intercepted.
   case "$1" in
     build|be-ut|fe-ut|compdb|ccdb)
       PREVIEW_ARGS=("$@")
@@ -699,16 +699,16 @@ U
   case "$1:${2:-}" in deploy:--status|deploy:--stop|deploy:--help|deploy:-h|farm:status|farm:down|farm:suspend|farm:--help|farm:-h|farm:help) VERSION_POLICY=allow-old;; esac
   ensure_container "$VERSION_POLICY" || exit 1
   sub=$1; shift
-  # sr be-ut [选项] [-- run-be-ut.sh 参数] = sr build --be-ut …：编 BE 单测（走农场）然后接着跑。
-  # 不再注入 --run：编完就跑已经是 --be-ut 自己的默认，只编不跑用 sr be-ut --no-run
+  # sr be-ut forwards to sr build --be-ut and runs tests after compilation by
+  # default. Do not inject --run; use --no-run for compilation only.
   case "$sub" in be-ut) sub=build; set -- --be-ut "$@";; esac
-  # sr fe-ut [选项] = sr build --fe-ut …：跑 FE 单测（纯 maven，不碰农场/ccache）
+  # sr fe-ut forwards to sr build --fe-ut: Maven only, without farm or ccache usage.
   [ "$sub" = fe-ut ] && { sub=build; set -- --fe-ut "$@"; }
-  # sr compdb = sr build --compdb：只生成 compile_commands.json，不编译
+  # sr compdb forwards to sr build --compdb and generates compile_commands.json without compiling.
   case "$sub" in compdb|ccdb) sub=build; set -- --compdb "$@";; esac
   case "$sub" in
     build)
-      # 判断构建目标：纯 FE（--fe / --fe-ut）不读取、不解析、也不锁定 BE thirdparty。
+      # Pure FE targets (--fe/--fe-ut) must not read, resolve, or lock BE thirdparty dependencies.
       HOST_TARGET=all; skipv=0
       for a in "$@"; do
         [ $skipv = 1 ] && { skipv=0; continue; }
@@ -723,26 +723,24 @@ U
         esac
       done
       NEED_TP=1; [ "$HOST_TARGET" = fe ] && NEED_TP=0
-      # 版本记忆：按「源码树 + 分支」记，切分支要重新指定
-      # 与容器内 sr-build 同一规则找源码目录（review #7）：遇 -- 停；--dist/--build-prefix 跳过其值；其余 -* 跳过；
-      # 第一个存在的目录型位置参数就是源码根（必须是根本身，不上溯）；没给时才从 $PWD 上溯。
-      # 不能"扫所有参数里的现存目录"：-- 后面透传给 build.sh 的目录会被误认。
-      # 单测模式下 sr 不认识的参数会整段透传，它们的值是裸词（--module storage 的 storage）。
-      # codex r14#12：宿主机原来只看"是不是现存目录"，在含 storage/ 的目录里跑 sr be-ut --module storage
-      # 会把 storage 当成源码树，于是版本记忆按错的 key 去查，而容器内用的是上溯找到的真源码树——两边脱节。
-      # 判据和容器内 sr-build 保持一致：单测模式下位置参数必须真含 build.sh 才算源码树。
+      # Remember versions per physical source tree and branch. Match sr-build's path
+      # parser: stop at --, skip option values, and require an explicit path to be a
+      # source root; otherwise search upward from PWD.
+      # Do not mistake forwarded directories or unit-test option values such as
+      # --module storage for source roots. In test mode, a positional directory must
+      # contain build.sh to qualify.
       UTM=0; for a in "$@"; do [ "$a" = -- ] && break
         case "$a" in --be-ut|--fe-ut) UTM=1; break;; esac; done
       TSTART=""; skipv=0
       for a in "$@"; do
         [ $skipv = 1 ] && { skipv=0; continue; }
         case "$a" in --) break;; --dist|--build-prefix) skipv=1;; -*) ;;
-          *) if [ -d "$a" ] && { [ "$UTM" = 0 ] || [ -f "$a/build.sh" ]; }; then TSTART=$(cd "$a" && pwd -P); break; fi;;   # pwd -P：软链接与真路径同一个 key（review latest#1）
+          *) if [ -d "$a" ] && { [ "$UTM" = 0 ] || [ -f "$a/build.sh" ]; }; then TSTART=$(cd "$a" && pwd -P); break; fi;;   # Use physical paths so symlinks and their targets share one key.
         esac
       done
       root_of(){ local d
           if [ -n "$TSTART" ]; then [ -f "$TSTART/build.sh" ] && [ -d "$TSTART/be/src" ] && { echo "$TSTART"; return 0; }; return 1; fi
-          d=$(pwd -P); while [ "$d" != / ]; do   # 物理路径：软链接进来也算同一棵树（review latest#1）
+          d=$(pwd -P); while [ "$d" != / ]; do   # Resolve symlinks to the same physical source tree.
           [ -f "$d/build.sh" ] && [ -d "$d/be/src" ] && { echo "$d"; return 0; }; d=$(dirname "$d"); done; return 1; }
       WROOT=$(root_of || true); PDIR=$BASE/farm/versions; KEY=""; BR="?"
       if [ -n "$WROOT" ]; then
@@ -760,11 +758,11 @@ U
         SPEC=$(cut -d' ' -f1 "$PDIR/$KEY")
         echo "(依赖=$SPEC · $(basename "${WROOT:-?}")@${BR:-?}，你之前指定过；换用 -v)" >&2
       fi
-      # 首次编译且没给 -v：交互时让用户直接输入依赖版本（main / 4.0 这样），能解析就记住；之后换版本才需要 -v。
-      # 不列菜单（用户要求：输入比选编号直观）；输错时才把 registry 里当前能解析的版本打出来当提示。
-      # 不自动推断（分支名和依赖版本未必对应，猜错代价是一次失败的全量）。非交互环境仍要求 -v。
+      # For an interactive first build without -v, ask for a dependency version and
+      # remember a successful resolution. Show available versions only after invalid
+      # input. Never infer dependencies from branch names; noninteractive calls require -v.
       if [ -z "$SPEC" ]; then
-        if [ -t 0 ]; then   # 只看 stdin：sr build | tee log 这种 stdout 接管道的用法也该能询问；提示走 stderr
+        if [ -t 0 ]; then   # Check stdin only so piped stdout still permits input; send prompts to stderr.
           echo "首次编译 $(basename "${WROOT:-?}")@${BR:-?}：需要指定依赖版本（对应官方 dev-env 镜像；之后会记住，换版本用 sr -v <版本> build）" >&2
           while :; do
             read -r -p "请输入依赖版本（如 main 或 4.0）: " ans
@@ -779,14 +777,14 @@ U
       fi
       resolve "$SPEC" || { echo "!! 找不到版本 $SPEC，sr versions 看可选项"; exit 1; }
       DGFULL=$(digest_of "$PBASE"); [ -n "$DGFULL" ] || { echo "!! 拿不到 $PBASE 的 digest"; exit 1; }
-      DG=${DGFULL#sha256:}; DGS=${DG:0:12}       # 目录名用完整 digest，显示用 12 位
-      REF="${PBASE%:*}@$DGFULL"                 # 按 digest 引用镜像（%:* 去掉的是最后的 :tag，registry 的 :5000 不受影响）
+      DG=${DGFULL#sha256:}; DGS=${DG:0:12}       # Use the full digest for directory names and 12 characters for display.
+      REF="${PBASE%:*}@$DGFULL"                 # Address images by digest; %:* removes the final tag without stripping a registry port.
       echo "   依赖镜像 $PBASE  digest=$DGS$([ -n "${SR_TP_REPO:-}" ] && echo "  (SR_TP_REPO 强制，忽略 ee/os 命名空间)")"
-      # 自动跟随上游最新镜像（加依赖不会破坏老代码）；但 digest 变了要提醒——
-      # 如果是依赖升级而你的代码还没 rebase，编译可能会挂，这时该 rebase 而不是怪工具
+      # Follow the selected upstream tag, but report digest changes so users can
+      # rebase source code if updated dependencies require matching source changes.
       if [ -n "$KEY" ] && [ -f "$PDIR/$KEY" ]; then
         OLD_DG=$(cut -d' ' -f2 "$PDIR/$KEY" 2>/dev/null)
-        if [ -n "$OLD_DG" ] && [ "${OLD_DG:0:12}" != "${DG:0:12}" ]; then   # 旧记录可能是 12 位格式，按前缀比
+        if [ -n "$OLD_DG" ] && [ "${OLD_DG:0:12}" != "${DG:0:12}" ]; then   # Older records may contain 12-character digests; compare prefixes.
           echo "   注意：上游 $SPEC 的依赖镜像已更新（${OLD_DG:0:12} -> $DGS），本次用新的。"
           echo "         若编译报依赖相关错误，先把代码 rebase 到最新再试。"
         fi
@@ -794,30 +792,27 @@ U
       ensure_tp "$REF" "$DG" "$PBASE" >/dev/null || exit 1
       GMAJ=$(cat "$TPDIR/$DG/.gccmajor" 2>/dev/null | cut -d. -f1); GMAJ=${GMAJ:-14}
       GHOME=/opt/gcc$GMAJ
-      # gcc14 在镜像里叫 /opt/gcc-toolset-14。找不到就报错，绝不静默退回 gcc13：
-      # 依赖要 14 却拿 13 去编，农场的工具链配对检查只会确认"13 和 13 的包配对"，发现不了已经偏离依赖要求（codex r13#3）。
+      # GCC 14 lives at /opt/gcc-toolset-14. Refuse a missing required compiler rather
+      # than substituting GCC 13: matching a compiler to its icecc archive would not
+      # detect that both differ from the dependency image's requirement.
       [ "$GMAJ" = 14 ] && GHOME=$(docker exec $NAME sh -c 'ls -d /opt/gcc-toolset-14 2>/dev/null' || true)
       [ -n "$GHOME" ] || { echo "!! 镜像里找不到 gcc$GMAJ（依赖 $DGS 要求 gcc$GMAJ）。请 sr image 重建镜像后重试。"; exit 1; }
-      # 再核一遍实际版本：目录名对不代表里面的 gcc 就是那个大版本
+      # Verify the compiler's actual major version, not just its directory name.
       GREAL=$(docker exec $NAME sh -c "$GHOME/bin/gcc -dumpversion 2>/dev/null" | cut -d. -f1)
       [ "$GREAL" = "$GMAJ" ] || { echo "!! $GHOME 里的 gcc 实际是 ${GREAL:-未知} 版，依赖 $DGS 要求 $GMAJ 版。"
                                   echo "   用错编译器的产物 ABI 不一致且不会报错，已中止。请 sr image 重建镜像。"; exit 1; }
-      # 每次编译进自己的私有 mount namespace，把该版本的依赖 bind 到规范路径 /var/local/thirdparty。
-      # 不能改路径挂成 /tp/<digest> 直接用：CMakeCache 会把首次 configure 找到的 FILEPATH 缓存成
-      # /var/local/thirdparty/...，之后不再重找（踩过：toolchains base 上 libcurl.a 找不到；dev-env base 上
-      # 则静默链到内置的 main 依赖）。规范路径 + 私有 ns：路径永不变、版本互不干扰、并发各用各的。
-      # 可选透传：CCACHE_REMOTE_STORAGE(ccache 远端存储 URL) / SR_CCACHE_DIR(换一个缓存目录做对照实验)
-      # MAVEN_OPTS: FE 的 maven JVM 参数/日志开关透传；SR_LOCAL_OK: 非交互且无农场时放行本机编（review：容器里提示了它，这里却没转发）
-      # SR_DRYRUN / FARM_STATE：测试钩子，只走到决策打印就停 / 指向伪造的农场状态文件
-      # 并发类旋钮平时从容器里的 /farm/srdev.conf 读；放进白名单是为了允许命令行临时覆盖单次构建
-      # （SR_FE_UT_JOBS=6 sr fe-ut 这种）。不放进来的话环境变量到不了容器，会静默失效。
+      # Bind selected dependencies to /var/local/thirdparty in a private mount namespace.
+      # CMakeCache stores absolute FILEPATH values from initial configuration, so actual
+      # builds require a stable canonical path even when their digest changes.
+      # Forward optional cache, Maven, interactivity, and test settings explicitly.
+      # Concurrency settings normally come from /farm/srdev.conf; the environment
+      # allowlist also permits temporary per-build overrides such as SR_FE_UT_JOBS=6.
       XENV=(-e "SR_VERSION_KEY=$KEY" -e "SR_TPDIGEST_FULL=$DG"); for v in CCACHE_REMOTE_STORAGE SR_CCACHE_DIR SR_EXPLAIN MAVEN_OPTS SR_LOCAL_OK SR_DRYRUN FARM_STATE SR_FE_UT_JOBS SR_LOCAL_JOBS SR_LINK_JOBS SR_LINK_MEM_GB SR_BUILD_PREFIX SR_EXTRA_CMAKE_ARGS SR_DYNLIB_PCH; do [ -n "${!v:-}" ] && XENV+=(-e "$v"); done
-      # compdb 走另一条路：不做 bind，直接把 STARROCKS_THIRDPARTY 指向依赖目录在**宿主机上的真实路径**。
-      # 为什么：clangd 把"跳转到第三方头文件"解析成 compile_commands.json 里那个绝对路径，而 VSCode 是在
-      # 宿主机上打开它的。用 /var/local/thirdparty 的话，宿主机上只有一份共用的旧拷贝——多版本并行开发时
-      # 两棵树会跳到同一份，而且和各自钉住的依赖对不上（实测 gcc14 那份多出一整棵 benchgen/ 头文件树，
-      # 宿主机那份没有，跳过去就是文件不存在）。用 $TPDIR/<digest> 这个路径，容器内外指的是同一份东西。
-      # 真实编译仍走 bind：CMakeCache 会把首次 configure 的绝对路径缓存死，那条路径必须恒定，不能跟着 digest 变。
+      # For compdb, use the dependency's real host path at $TPDIR/<digest> instead of
+      # a bind mount. clangd resolves absolute paths from the compilation database, and
+      # VS Code opens those files on the host; both sides must address the same digest.
+      # Real builds still use the canonical bind path because CMake caches absolute
+      # paths across subsequent configurations.
       CDB=0; for a in "$@"; do [ "$a" = -- ] && break; [ "$a" = --compdb ] && { CDB=1; break; }; done
       if [ "$CDB" = 1 ] && docker exec $NAME test -d "$TPDIR/$DG/installed" 2>/dev/null; then
         exec docker exec -w "$PWD" \
@@ -830,13 +825,13 @@ U
         ${XENV[@]+"${XENV[@]}"} ${TTY[@]+"${TTY[@]}"} $NAME unshare -m --propagation private sh -c \
           'mount --bind "/tp/$0/installed" /var/local/thirdparty/installed && exec sr-build "$@"' "$DG" "$@" ;;
     farm) docker exec ${TTY[@]+"${TTY[@]}"} $NAME sr-farm "$@" ;;
-    # deploy 必须带 -w "$PWD"：它要从当前目录上溯找源码树，用这棵树的产物部署（通用转发分支不带工作目录）
+    # Pass the host cwd to deploy so it finds the intended source tree and its build outputs.
     deploy)
       docker exec -w "$PWD" -e SR_UID="$(id -u)" -e SR_DEPLOY_DIR="${SR_DEPLOY_DIR:-/farm/deploy}" \
         -e SR_FE_DEBUG_PORT="${SR_FE_DEBUG_PORT:-}" -e SR_PORT_BASE="${SR_PORT_BASE:-}" \
         ${TTY[@]+"${TTY[@]}"} $NAME sr-deploy "$@"
       DRC=$?; [ "$DRC" = 0 ] || exit "$DRC"
-      # 在宿主用户下写配置和入口，避免生成 root 所有的 .vscode 或使用容器的 HOME。
+      # Write IDE configuration and entrypoints as the host user, avoiding root-owned files or the container HOME.
       VSCODE=1; VBE=1; VFE=1; VARGS=()
       for a in "$@"; do
         case "$a" in

@@ -1,25 +1,25 @@
 #!/bin/bash
-# sr-farm —— 编译农场生命周期（跑在容器内）
-#   续约用「重置为 N 小时」语义：容器一关，续约停止，农场 1 小时内自我了断。
-#   这是刻意的死人开关设计。
+# sr-farm: compilation farm lifecycle management, running inside the container.
+# Renewal resets expiry to now + N hours. If the container stops, renewals stop
+# and the farm expires within an hour: an intentional dead man's switch.
 set -uo pipefail
-# 站点配置由宿主机 sr 只读挂进来；set -a 让 tspapi.py / ssh 子进程也看得到
-# 优先读宿主机每次调用同步进来的 /farm/srdev.conf（目录挂载，改了立刻可见）；/etc/srdev.conf 是旧的单文件挂载，
-# 钉在容器创建时的 inode 上、编辑器保存后就过期（实测容器读到的一直是旧 WORKERS/ITYPE），只作为老容器的兼容回退
+# The host mounts site configuration read-only; set -a exports it to tspapi.py and SSH.
+# Prefer /farm/srdev.conf, synchronized by the host on each invocation. The legacy
+# /etc/srdev.conf file mount pins an inode and can go stale after an editor saves it.
 SRCONF=/farm/srdev.conf; [ -f "$SRCONF" ] || SRCONF=/etc/srdev.conf
-# 先记下纯环境变量给的值（source 之前），看门狗每轮热加载时按它复位——否则从配置里删掉某项后，
-# 变量在长跑进程里仍留着上一轮的值，`${VAR:-默认}` 永远取不到默认（codex r9#1）。同时保持"环境覆盖配置"的优先级。
-# 看门狗子进程优先用父进程显式传来的基线（用 - 而非 :- ，空字符串也算"父进程说了算"）；
-# 其它调用是干净环境，直接取当前环境值。
+# Capture environment overrides before sourcing configuration. Reset to this baseline
+# on each watchdog reload so removed settings return to their defaults.
+# A watchdog child uses the explicit baseline from its parent; use - rather than :-
+# so an explicitly empty value is preserved. Other invocations use their own environment.
 ENVBASE_IDLE_MIN=${SR_WD_BASE_IDLE-${IDLE_MIN:-}}
 ENVBASE_RENEW_MIN=${SR_WD_BASE_RENEW_MIN-${RENEW_MIN:-}}
 ENVBASE_RENEW_H=${SR_WD_BASE_RENEW_H-${RENEW_H:-}}
 [ -f "$SRCONF" ] && { set -a; . "$SRCONF"; set +a; }
-API=${SR_TSPAPI:-/usr/local/bin/tspapi.py}   # SR_TSPAPI/SR_FARM_DIR 供隔离测试替换平台客户端与状态目录
+API=${SR_TSPAPI:-/usr/local/bin/tspapi.py}   # SR_TSPAPI/SR_FARM_DIR let isolated tests replace the platform client and state directory.
 FARM=${SR_FARM_DIR:-/farm}
 STATE=$FARM/state.env
-# review r7#3(P1)：state.env 不再 source（目录曾是 0777，可被替换后当 root 执行）。只接受白名单键的 KEY=value 并校验取值形状，
-# 任何一行不合规就拒绝加载——文件是我们自己 printf 写的，合规是常态，不合规就是损坏或篡改。
+# Never source state.env: a replaced state file would execute as root. Accept only
+# allowlisted KEY=value entries with validated values; reject any malformed line.
 load_state(){ local k v
   [ -f "$STATE" ] || return 1
   while IFS='=' read -r k v || [ -n "$k" ]; do
@@ -35,11 +35,12 @@ load_state(){ local k v
     esac
     printf -v "$k" '%s' "$v"
   done < "$STATE"; }
-# review r7#5：init/resume/suspend/down/rebalance 的「读状态→平台操作→写状态」全程互斥，否则 resume 会把并发 suspend 刚写的
-# suspended 覆盖回 running。常驻进程（看门狗、scheduler）启动时必须关掉继承的 fd 8，否则锁被永久占住。
+# Serialize the entire read-state / platform-operation / write-state sequence for
+# init, resume, suspend, down, and rebalance. Long-lived children must close fd 8
+# so they cannot retain the lifecycle lock indefinitely.
 lifecycle_lock(){
-  # 拿不到锁文件就拒绝操作（fail closed）：无互斥地改农场状态比拒绝更危险；/farm 打不开本身就说明环境坏了
-  # 验证轮 #5：无命令的 `exec ... 2>/dev/null` 会把 stderr 永久重定向到 /dev/null，后续所有报错都被吞；用 { } 把它限定在这一句
+  # Fail closed if the lock file cannot be opened; changing farm state without a lock is unsafe.
+  # Scope stderr redirection to this command: a bare exec would silence all later errors.
   { exec 8>"$FARM/lifecycle.lock"; } 2>/dev/null || { echo "!! 无法打开 $FARM/lifecycle.lock，拒绝在无互斥保护下操作农场"; exit 1; }
   flock -w 600 8 || { echo "!! 另一个农场操作正在进行（等锁 10 分钟超时），稍后再试"; exit 1; }; }
 LOGF=$FARM/watchdog.log
@@ -47,60 +48,55 @@ KEY=$FARM/ssh/id_farm
 NAME=${FARM_NAME:-${SR_USER:-$(id -un)}_farm}
 WORKERS=${WORKERS:-4}
 ITYPE=${ITYPE:-8c32g}
-DISK=${DISK:-20}   # 实测 icecc 在 worker 上只占 4KB，不需要数据盘
-IDLE_MIN=${IDLE_MIN:-15}     # resume 实测 29 秒，可以激进休眠
-WARM_EVERY_MIN=${SR_WARM_EVERY_MIN:-5}   # 看门狗最多每 N 分钟自动预热一次（某台真坏了也不会每分钟空转）
+DISK=${DISK:-20}   # icecc uses very little disk space on workers; no data disk is needed.
+IDLE_MIN=${IDLE_MIN:-15}     # Resume takes about 29 seconds, so an aggressive idle timeout is practical.
+WARM_EVERY_MIN=${SR_WARM_EVERY_MIN:-5}   # Limit automatic warmup to once every N minutes, even for a broken worker.
 RENEW_MIN=${RENEW_MIN:-15}
-RENEW_H=${RENEW_H:-3}       # renew 语义是「重置为 now+N」而非累加，实测确认
-NUSER=${SR_NODE_USER:-sr}          # 节点 ssh 用户
-NODEPW=${SR_NODE_PASSWORD:-}       # 节点初始密码，只在首次铺密钥时用，之后全走密钥；不要写进代码
+RENEW_H=${RENEW_H:-3}       # Renewal resets expiry to now + N hours; it does not add time to the old expiry.
+NUSER=${SR_NODE_USER:-sr}          # SSH user on worker nodes.
+NODEPW=${SR_NODE_PASSWORD:-}       # Initial password, used only to install the SSH key. Never hardcode credentials.
 mkdir -p $FARM/ssh 2>/dev/null; chmod 700 $FARM/ssh 2>/dev/null
 SSHO="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10"
 n_ssh(){ ssh -n -i $KEY $SSHO $NUSER@"$1" "$2"; }
 beat(){ : > $FARM/last-build 2>/dev/null; chmod 666 $FARM/last-build 2>/dev/null; }
-# 9>&- 不能省：sr-build 是持着构建锁(fd 9)调过来的，看门狗常驻会把那把锁永久占住
-# （踩过：编译早已结束、ps 里没有 sr-build，却一直报「已有构建在进行」）
-# 8>&-：别把生命周期锁带进常驻进程。SR_WD_BASE_*：把「source 配置之前」的纯环境基线显式传给看门狗——
-# 父进程是 set -a 导出配置后才 fork 的，子进程若自己从环境里取基线，取到的是被配置污染的值，
-# 于是从配置里删掉某项后永远回不到默认（codex r10#5）。
-# codex r15#5：pgrep 不是互斥——两棵树同时 sr build 时，两个 _wd 可以都在对方起来之前通过检查，
-# 于是跑出两个看门狗各自续约、预热、判休眠，一个刚唤醒另一个就可能把它睡掉。
-# pgrep 保留为廉价快速路径，真正的单例由 _watchdog 入口那把 flock 保证（拿不到就直接退出）。
+# Close fd 9: sr-build holds a build lock on it, and a persistent watchdog would
+# otherwise keep that lock after the build exits. Also close lifecycle lock fd 8.
+# Pass the pre-configuration environment as SR_WD_BASE_* explicitly: the parent
+# has already exported configuration values, which must not become the child's baseline.
+# pgrep is only a fast path. Concurrent builds can both pass it, so _watchdog
+# uses flock to enforce a single instance and avoid conflicting lifecycle decisions.
 wd_ensure(){ pgrep -f "[s]r-farm _watchdog" >/dev/null || {
   SR_WD_BASE_IDLE="$ENVBASE_IDLE_MIN" SR_WD_BASE_RENEW_MIN="$ENVBASE_RENEW_MIN" SR_WD_BASE_RENEW_H="$ENVBASE_RENEW_H" \
     setsid nohup "$0" _watchdog </dev/null >>"$LOGF" 2>&1 8>&- 9>&- & }; }
-# scheduler 跑在本容器里：实测它只占 3.2MB / 0.5% CPU，纯中介（预处理源码和产物都是
-# client 与 worker 直连传输，不经过它）。放这儿省下一整台 8c32g 去当 worker。
-# 容器是 --network host，所以农场节点直接连宿主机 IP 即可（反向连通已实测五台全通）。
+# Run the scheduler in this container: it is a lightweight coordinator. Clients and
+# workers exchange preprocessed sources and build outputs directly. With host networking,
+# workers connect to the host IP, leaving all cloud nodes available as workers.
 HOSTIP=$(hostname -I | awk '{print $1}')
-# 每个用户一套独立的 icecc：宿主机是多人共享的开发机，默认端口只有第一个人抢得到，
-# 后来者的 daemon 静默 bind 失败 -> 客户端连不上 -> 无限制本地并发 -> OOM（踩过）。
-# 端口由 uid 推导，保证同一用户的 sr-farm 与 sr-build 算出同一组数；
-# netname 再隔离一层，保证 worker 只认自己主人的 scheduler。
+# Give each user a separate icecc instance on the shared development host. Port collisions
+# can prevent the daemon from starting and cause uncontrolled local compilation.
+# Derive the same ports in sr-farm and sr-build from the host UID, and use a distinct
+# network name so workers only connect to their owner's scheduler.
 SR_USER=${SR_USER:-$(id -un)}
-# 容器里 id -u 恒为 0（root），按它推导端口所有用户都会撞到 18700（踩过）。
-# 宿主机的 sr 用 -e SR_UID 把真实 uid 传进来；没传时才退回 id -u。
+# id -u is always 0 inside the root container. Use SR_UID supplied by the host sr
+# command to derive user-specific ports, falling back to id -u only when absent.
 UIDN=${SR_UID:-$(id -u 2>/dev/null || echo 0)}
 NETNAME=${NETNAME:-${SR_USER}_farm}
-# scheduler 占 SPORT 和 SPORT+1（文本管理口）两个端口，所以按 uid 每人跨 2：否则相邻 uid 的 SPORT 正撞上前一个人的
-# SPORT+1（review#1 P1，实测第二个 scheduler Address already in use 退出）。250 人落在 [18700,19198]，不越到 DPORT 段。
-# 已有农场的端口记在各自 state.env 里、source 时覆盖此默认值，老农场不受影响，新 init 才用新分配。
-SPORT=${SPORT:-$(( 18700 + 2 * (UIDN % 250) ))}    # scheduler（+1 为文本管理口）
-DPORT=${DPORT:-$(( 19700 + UIDN % 500 ))}    # 本机 iceccd
-# 多 profile 容器共用一个农场：容器都是 --network host，8765 全机唯一。
-# 必须查端口而不是查进程——各容器 PID namespace 独立，pgrep 看不到别家的 scheduler，
-# 会重复去起然后 bind 失败。
-# SR_SCHED_VERBOSE=1（srdev.conf）时 scheduler 以 -vvv 跑，日志里能看到每个任务派给谁/为什么不派——排查"某台 worker 零任务"用
-# 端口 $1 上的监听，是不是**本容器 PID 命名空间里**跑着 $2 的进程。
-# 只用于 init 时的撞车检查，不能用来替代 sched_ensure 的判据：多 profile 场景下
-# 兄弟容器起的 scheduler 是合法的，而各容器 PID namespace 独立，这里归因不到它。
+# The scheduler uses SPORT and SPORT+1 for its control interface, so allocate ports
+# in steps of two. UID modulo 250 maps SPORT to [18700, 19198], below the DPORT range.
+# Existing farms load their recorded ports from state.env, overriding these defaults.
+SPORT=${SPORT:-$(( 18700 + 2 * (UIDN % 250) ))}    # Scheduler; SPORT+1 is the text control port.
+DPORT=${DPORT:-$(( 19700 + UIDN % 500 ))}    # Local iceccd.
+# Profile containers share the host network but have separate PID namespaces.
+# Check whether the listener on $1 runs $2 in this container. sched_ensure also
+# recognizes a sibling container's scheduler by its network name on the control port.
+# SR_SCHED_VERBOSE=1 enables -vvv scheduler logs for diagnosing worker assignment.
 port_is_ours(){ local line pid
   line=$(ss -ltnpH "sport = :$1" 2>/dev/null)
   case "$line" in *users:*) ;; *) return 1;; esac
   for pid in $(printf '%s\n' "$line" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
     case "$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)" in *"$2"*) return 0;; esac
   done; return 1; }
-# scheduler 的文本管理口（端口 = SPORT+1，icecream 自带）。
+# Query icecream's built-in text control interface at SPORT+1.
 sched_q(){ exec 3<>/dev/tcp/127.0.0.1/$((SPORT+1)) 2>/dev/null || return 1; printf '%s\nquit\n' "$1" >&3; timeout 2 cat <&3; exec 3>&-; }
 sched_ensure(){
   if port_is_ours "$SPORT" icecc-scheduler; then return 0; fi
@@ -114,18 +110,18 @@ sched_ensure(){
     return 1
   fi
   /usr/sbin/icecc-scheduler -n "$NETNAME" -p "$SPORT" -d -l /tmp/icecc-scheduler.log $([ -n "${SR_SCHED_VERBOSE:-}" ] && echo "-v -v -v") >/dev/null 2>&1 6>&- 8>&- 9>&-
-}   # 8>&- 生命周期锁；6>&- 看门狗单例锁——scheduler 是常驻进程，继承了就把锁永久占住（codex r15 复查#1）
-# --network host 让容器和宿主机共享 netns，本地就能数出连上来的 daemon
-# grep -c 计数为 0 时退出码是 1，用 || echo 0 会多打一行；必须吃掉退出码
-# 按 NODES 里的远端 IP 逐个判"有没有到 scheduler 端口的已建立连接"。不能数所有含端口的连接：
-# 本地 iceccd 那条回环连接两端各算一次，5 台显示 7；反过来少连 2 台也能凑够数，degraded 检测就形同虚设（review #4）
+}   # Close lifecycle fd 8 and watchdog fd 6 so the persistent scheduler cannot retain their locks.
+# Host networking exposes worker connections locally. Check each remote IP in NODES
+# for an established scheduler connection, rather than counting all matching sockets:
+# the local daemon's loopback connection appears twice and can hide missing workers.
+# grep -c exits with 1 for zero matches; suppress its status without printing a second zero.
 dcount(){ local n=0 ip
   for ip in ${NODES:-}; do
     [ -n "$(ss -tnH state established "( sport = :$SPORT and dst = $ip )" 2>/dev/null)" ] && n=$((n+1))
   done; echo $n; }
-# 下发节点配置（幂等）。$1=1 表示首次要先铺密钥。node-setup.sh 内部回读文件比对，报"写入OK/不符"
-# 逐个收集每台的退出码：裸 wait 汇总不了失败，部署全挂也看不出来（codex r13#6）。
-# 仍保留调用方的 worker 连接检查作为第二道——两者互相独立，一个查"部署脚本怎么说"，一个查"实际连上没有"。
+# Deploy node configuration idempotently; $1=1 also installs the SSH key. node-setup.sh
+# reads back the configuration to verify it. Collect each child's exit status because
+# a bare wait loses individual failures. The caller separately checks worker connections.
 provision_nodes(){ local first=${1:-0} ip p bad="" pids=() ips=()
   for ip in $NODES; do
     ( [ "$first" = 1 ] && SSHPASS="$NODEPW" sshpass -e ssh-copy-id -i $KEY.pub $SSHO $NUSER@$ip >/dev/null 2>&1
@@ -136,9 +132,9 @@ provision_nodes(){ local first=${1:-0} ip p bad="" pids=() ips=()
   for i in "${!pids[@]}"; do wait "${pids[$i]}" || bad="$bad ${ips[$i]}"; done
   [ -n "$bad" ] && echo "   !! 这些节点部署未成功：$bad（上面每行的 iceccd= 字段能看出卡在哪）"
   [ -z "$bad" ]; }
-# 全机有没有编译在跑：按源码树锁判断（pgrep 只看得见本容器，多 profile 下会把别人的编译当空闲）。
-# 任意一把锁被占住就算忙。没有 flock 就当"不忙"——这个判据只用来决定要不要自动休眠，
-# 判错的代价是白睡一次（构建会退回本地），不是数据损坏。
+# Detect builds across profile containers by their source-tree locks; pgrep only sees
+# this container. Any held lock means busy. Without flock, assume idle: this check
+# only controls automatic suspension, and a mistaken suspension falls back to local builds.
 busy(){ local f
   command -v flock >/dev/null || return 1
   for f in "$FARM"/sr-build.*.lock; do
@@ -146,25 +142,23 @@ busy(){ local f
     ( exec 8>>"$f"; flock -n 8 ) >/dev/null 2>&1 || return 0
   done; return 1; }
 wait_workers(){ local i; for i in $(seq 1 "$1"); do sleep 2; [ "$(dcount)" -ge "$WORKERS" ] && return 0; done; return 1; }
-# ---- worker 预热 ----
-# icecc 的 pick_server 对「从没编过、又没有 env」的 worker 只当 bestui，永远输给任何已有评分的 best；于是 scheduler 每次
-# 重启后，重连较晚的那台会永久零任务（192.0.2.10 与 192.0.2.11 各实测复现过一次，农场白白少一台）。
-# 就绪后主动给还没评分的 worker 各派一个「有真实编译成本」的任务：把 env 传过去并拿到 speed，此后它就正常参与调度。
-# 关键约束（codex r9）：scheduler 的 add_job_stats 会丢弃产物 <4096 字节或 user_msec=0 的任务计时——我第一次用一行函数
-# 预热，env 传过去了但 speed 仍是 0。所以既要产物够大又要真花 CPU；成败以「该 worker 的 speed 变成非 0」为准，不看 icecc 返回码。
-# 只需一种 gcc：统计按 worker 累计、不分工具链；别的工具链首次用时再传包即可。
-# 预热被信号打断时的收尾。靠 bash 的动态作用域看到 warm_workers 里的 pids/dir（trap 是在 warm_workers 作用域内触发的）。
+# ---- Worker warmup ----
+# icecc can starve workers with no compiler environment or speed history once other
+# workers have a score. Send each unscored worker a real compilation to install its
+# environment and establish a speed score.
+# The scheduler discards timing samples for outputs smaller than 4096 bytes or zero
+# user CPU time. Judge success by a nonzero worker speed, not the icecc exit status.
+# One GCC version is enough because scores belong to workers, not toolchains.
+# Signal cleanup uses Bash dynamic scope to access warm_workers' pids and dir.
 warm_abort(){ local rc=$1 p
   kill ${pids[@]+"${pids[@]}"} 2>/dev/null
   for p in ${pids[@]+"${pids[@]}"}; do wait "$p" 2>/dev/null; done
   rm -rf "${dir:-/nonexistent}" 2>/dev/null
   echo "   预热被中断（农场本身已就绪；稍后可 sr farm rebalance 补预热）" >&2
   exit "$rc"; }
-# 看门狗每分钟顺带查一次：有没有评分为 0 的 worker。有就预热。
-# 为什么必须periodic而不能只靠 init/resume/rebalance：那三处都是「某一时刻做一次」，而 worker 的 daemon
-# 可以在任何时刻重启（2026-09-17 实测：节点的 unattended-upgrades 把 iceccd 连带重启 8 轮，全发生在 rebalance
-# 预热之后），重启即以「零历史」重新注册、评分归零，此后永远拿不到任务。只有周期检查能自愈。
-# 限流 WARM_EVERY_MIN 分钟一次：某台真的坏了也不会每分钟空转一轮预热。
+# The watchdog checks for zero-score workers every minute. Lifecycle-only warmup is
+# insufficient: a daemon may restart later, lose its score, and remain starved.
+# Periodic checks restore it, with WARM_EVERY_MIN limiting retries for broken workers.
 warm_if_starving(){
   [ "${FARM_STATUS:-}" = running ] || return 0
   local now last cs ip sp need=0
@@ -173,42 +167,42 @@ warm_if_starving(){
   cs=$(sched_q listcs 2>/dev/null); [ -n "$cs" ] || return 0
   for ip in ${NODES:-}; do
     sp=$(printf '%s\n' "$cs" | sed -nE "s/^ [^ ]+ \(${ip//./\\.}:[0-9]+\).*speed=([0-9.]+).*/\1/p" | head -1)
-    case "${sp:-}" in 0|0.0|0.00) need=1; break;; esac    # 没注册（取不到）不算，那是另一回事
+    case "${sp:-}" in 0|0.0|0.00) need=1; break;; esac    # Ignore unregistered workers; missing registration is a separate problem.
   done
   [ "$need" = 1 ] || return 0
   echo "$(date '+%F %T') 发现评分为 0 的 worker，自动预热" >>"$LOGF"
   warm_workers >>"$LOGF" 2>&1
   rc=$?
-  # 返回 2 表示本机 iceccd 尚未启动，本轮只是跳过；不能因此推迟
-  # 下一次真正的预热。
+  # Return code 2 means the local iceccd is not running and warmup was skipped.
+  # Do not delay the next real warmup attempt.
   [ "$rc" != 2 ] && echo "$now" > "$FARM/.last-warm"
   return "$rc"; }
 
 warm_workers(){
   command -v icecc >/dev/null 2>&1 || return 0
   local envf="" gxx="" gccdir gh dir src cs ip name sp i n=0 fail="" deadline got want rem alive=0 q st pids=() p
-  # 工具链包必须和编译器配对：包按 mtime 取最新、编译器按路径取第一个的话，多 gcc 的镜像里会配错版本
-  # （客户端用 A 预处理、worker 用 B 编，预热必失败）。先定编译器目录，再取同名目录下的包——和 sr-build 同一规则（codex r10#4）。
+  # Match the compiler to its toolchain archive. Select the compiler directory first,
+  # then the archive in the corresponding directory, as sr-build does. Independently
+  # choosing the newest archive could pair preprocessing and compilation from different GCC versions.
   for gccdir in /opt/gcc-toolset-*/ /opt/gcc[0-9]*/; do
     [ -x "${gccdir}bin/g++" ] || continue
     gh=$(basename "${gccdir%/}"); envf=$(ls -t "/opt/icecc/$gh"/*.tar.gz 2>/dev/null | head -1)
     [ -n "$envf" ] && { gxx="${gccdir}bin/g++"; break; }
   done
   { [ -n "$envf" ] && [ -n "$gxx" ]; } || { echo "   (跳过预热：镜像里没有配对的 icecc 工具链包与编译器)"; return 0; }
-  # 预热必须经本机 iceccd 才会外发；没有 daemon 时 icecc 直接在本机编，白跑且留不下远端评分（codex r10#2）。
-  # daemon 由 sr-build 每次构建时按配对参数启动，这里只检查不另起，免得起出一个参数不匹配的常驻 daemon。
-  # 判据是"客户端真能 connect 到 socket"，不是"有进程/端口"：容器重建后常见 socket 残留但 daemon 已死，
-  # 那时 icecc 静默全本地编译，预热白跑还留不下远端评分（与 sr-build 的 daemon_connectable 同一问题）。
+  # Warmup requires a reachable local iceccd socket; otherwise icecc compiles locally
+  # and creates no remote speed score. sr-build starts the daemon with matching options,
+  # so only check it here. A stale socket or an existing process/port is not sufficient.
   if ! { [ -S "${ICESOCK:-/var/run/icecc/iceccd.socket}" ] && python3 -c "import socket,sys
 s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(2)
 try: s.connect('${ICESOCK:-/var/run/icecc/iceccd.socket}'); s.close()
 except Exception: sys.exit(1)" 2>/dev/null; }; then
     echo "   (跳过预热：本机 iceccd 连不上——它由 sr build 启动。首次构建后跑一次 sr farm rebalance 即可)"
-    return 2   # 2 = 跳过（不是失败也不是成功）；调用方据此如实报告就绪程度
+    return 2   # 2 means skipped, neither success nor failure; callers report readiness accordingly.
   fi
-  # rebalance 刚重启 scheduler 时 worker 还没重连完，有界等待它们注册（最多 60 秒）。
-  # 必须按 $NODES 里的 IP 逐个数：listcs 的总行数含本机提交端，拿它和 WORKERS 比会提前满足，
-  # 结果最后重连的那台被当成"未注册"跳过预热——正是我们要防的那台（实测 192.0.2.12 中招）。
+  # After a scheduler restart, allow up to 60 seconds for workers to register. Count
+  # each IP in NODES: listcs also includes the local submitter, so counting all entries
+  # can skip warmup for the last remote worker to reconnect.
   want=$(printf '%s\n' ${NODES:-} | grep -c .)
   for i in $(seq 1 30); do
     cs=$(sched_q listcs 2>/dev/null); got=0
@@ -223,30 +217,30 @@ except Exception: sys.exit(1)" 2>/dev/null; }; then
       echo "std::vector<std::string> sr_warm_$i(int x){std::vector<std::string> v;for(int i=0;i<x;i++)v.push_back(std::to_string(i*$i));return v;}"
     done; } > "$src"
   echo "== 预热 worker（让每台都拿到 env 与速度评分，避免 scheduler 重启后有机器零任务）…"
-  # 被 Ctrl+C / kill 时收掉预热子进程和临时目录，并**退出**——只清理不退出的话，信号打断 wait 后循环会继续给剩下的 worker
-  # 派任务，而源码临时目录已经删了，最后还可能返回 0（codex r11#1；和第 7 轮 sr-build 的 on_signal 是同一类错，那边改对了这边漏了）。
-  # 此处农场状态已写好、生命周期锁也已释放，中途退出是安全的：农场就绪，只是没预热完。
+  # On interruption, stop warmup children, remove temporary files, and exit. Merely
+  # cleaning up would let the loop continue submitting jobs with deleted sources.
+  # Farm state is already saved and the lifecycle lock released; only warmup is incomplete.
   trap 'warm_abort 130' INT; trap 'warm_abort 143' TERM
   deadline=$(( $(date +%s) + 300 ))
   for ip in ${NODES:-}; do
-    # 单任务时限取 min(180, 剩余预算)，并给 TERM→KILL 宽限，总预算才是真的封顶（codex r10#3）
+    # Use min(180, remaining budget) per job, with a TERM-to-KILL grace period to enforce the total limit.
     rem=$(( deadline - $(date +%s) )); [ "$rem" -gt 180 ] && rem=180
     [ "$rem" -le 10 ] && { fail="$fail $ip(超预算未预热)"; continue; }
     name=$(printf '%s\n' "$cs" | sed -nE "s/^ ([^ ]+) \(${ip//./\\.}:[0-9]+\).*/\1/p" | head -1)
     [ -n "$name" ] || { fail="$fail $ip(未注册)"; continue; }
     sp=$(printf '%s\n' "$cs" | sed -nE "s/^ [^ ]+ \(${ip//./\\.}:[0-9]+\).*speed=([0-9.]+).*/\1/p" | head -1)
-    case "${sp:-0}" in 0|0.0|0.00) ;; *) continue;; esac     # 已有评分的跳过
+    case "${sp:-0}" in 0|0.0|0.00) ;; *) continue;; esac     # Skip workers that already have a speed score.
     ( unset ICECC; ICECC_VERSION="$envf" ICECC_PREFERRED_HOST="$name" \
         timeout -k 10 "$rem" icecc "$gxx" -O2 -c "$src" -o "$dir/$name.o" >/dev/null 2>&1 ) &
     pids+=($!)
-    # 只等自己起的预热任务，绝不能用裸 wait：wd_ensure 刚起的常驻看门狗也是本 shell 的子进程，
-    # 裸 wait 会一直等它，init/resume 直接卡死（codex r10#1；rebalance 不起看门狗所以之前没暴露）
+    # Wait only for warmup children. A bare wait would also wait for the persistent
+    # watchdog started by wd_ensure, causing init/resume to hang indefinitely.
     if [ "${#pids[@]}" -ge 2 ]; then wait "${pids[0]}" 2>/dev/null; pids=(${pids[@]:1}); fi
     n=$((n+1))
   done
   for p in ${pids[@]+"${pids[@]}"}; do wait "$p" 2>/dev/null; done
   pids=(); trap - INT TERM
-  cs=$(sched_q listcs 2>/dev/null)                # 以 speed 判定，不看 icecc 返回码
+  cs=$(sched_q listcs 2>/dev/null)                # Judge readiness by speed, not the icecc exit status.
   for ip in ${NODES:-}; do
     sp=$(printf '%s\n' "$cs" | sed -nE "s/^ [^ ]+ \(${ip//./\\.}:[0-9]+\).*speed=([0-9.]+).*/\1/p" | head -1)
     case "${sp:-}" in ''|0|0.0|0.00) case "$fail" in *"$ip"*) ;; *) fail="$fail $ip";; esac;; esac
@@ -254,12 +248,13 @@ except Exception: sys.exit(1)" 2>/dev/null; }; then
   rm -rf "$dir"
   [ -n "$fail" ] && echo "   !! 这些 worker 预热后仍无速度评分，可能接不到任务：$fail（稍后可 sr farm rebalance 重试）"
   return 0; }
-# 每台 worker 的编译并发槽（= icecc -m）。显式 SR_NODE_JOBS 优先（内存受限时压低）；
-# 否则读一台节点的实际核数；再退回 ITYPE 前缀里的核数（如 8c16g→8）；最后 8。
-# sr-build 用它算总并发 J = WORKERS*NCPU + 本地，所以要写进 state.env。
+# Compilation slots per worker (icecc -m): prefer SR_NODE_JOBS, then a node's actual
+# CPU count, then the ITYPE prefix (e.g. 8c16g -> 8), and finally 8. Record this in
+# state.env so sr-build can calculate total parallelism as WORKERS*NCPU plus local slots.
 node_jobs(){ local ip n
-  # 一律归一化成正整数：客户端拿它做 Bash 算术，auto/空/0/08 这类字串会让构建 "unbound variable"/八进制报错/算出 J=16
-  # （review 0916b）。SR_NODE_JOBS 只认正整数，其它往下按实测核数；10# 防八进制。init 已在申请前挡掉非法值，这里再兜一层。
+  # Normalize to a positive decimal integer before Bash arithmetic. Values such as
+  # auto, zero, or 08 can fail or yield incorrect parallelism. Invalid SR_NODE_JOBS
+  # falls back to the measured CPU count; init validates it before allocating nodes.
   case "${SR_NODE_JOBS:-}" in ''|*[!0-9]*) ;; *) n=$((10#$SR_NODE_JOBS)); [ "$n" -gt 0 ] && { echo "$n"; return; };; esac
   for ip in ${NODES:-}; do
     n=$(timeout 8 ssh -n -i $KEY $SSHO $NUSER@$ip nproc 2>/dev/null); n=${n//[!0-9]/}
@@ -271,10 +266,9 @@ node_jobs(){ local ip n
 
 case "${1:-}" in
 init)
-  lifecycle_lock   # 两个 init 并发时只能有一个通过下面的存在性检查
-  # codex r15 复查#3：上一版在"没等到 Running"和"节点数不够"时留下 initializing 就退出，
-  # 而 resume 入口又拒绝 initializing——平台随后变成 Running、节点随后补齐，也只能释放重建，
-  # 白白丢掉一套已经申请好的机器。改成让 init 自己认领这份最小记录，从断点继续，不重新申请。
+  lifecycle_lock   # Only one concurrent init may pass the existence check below.
+  # Resume an initializing farm from its saved minimal state instead of allocating
+  # again. A previous timeout may have left nodes that become ready later.
   CONT=0
   if [ -f "$STATE" ]; then
     { load_state || exit 1; }
@@ -288,14 +282,10 @@ init)
   fi
   WANTW=${WANTW:-$WORKERS}
   [ -n "$NODEPW" ] || { echo "!! 首次给节点铺 ssh 密钥需要节点初始密码：在 srdev.conf 里设 SR_NODE_PASSWORD 后重试"; exit 1; }
-  # codex r15#9：端口是按 uid 取模推导的——SPORT 撞在 uid 相差 250 的人身上，DPORT 撞在相差 500 的人身上。
-  # 撞上之后 sched_ensure 会把别人的监听当成自己的 scheduler 而跳过启动，worker 因 netname 不符连不上，
-  # 最后只表现为"0/N 连上、degraded"，看不出真正原因。到这一步 state.env 还不存在（上面已挡住"已有农场"），
-  # 所以此刻端口上任何归因不到我们的东西都是撞车，直接说清楚并给出改法。
-  # codex r15 复查#5：上一版只给 SPORT 开了豁免，结果把三种完全正常的情况全判成撞车：
-  #   scheduler 同时占 SPORT 和 SPORT+1，而 down 并不停 scheduler，于是正常的 down -> init 必然被挡；
-  #   本机 iceccd 常驻在 DPORT 上（任何编译过的人都有），首次 init 也会被挡。
-  # 判据要连"端口上跑的是不是我们那个服务"一起看，而不只看端口号。
+  # UID-derived ports can collide. Before allocating a farm, reject any listener that
+  # cannot be attributed to our service and explain how to change the ports.
+  # Allow our scheduler on SPORT and SPORT+1 after down, and our persistent local
+  # iceccd on DPORT after a build; an occupied port alone is not a conflict.
   while read -r _p _svc; do
     [ -n "${_p:-}" ] || continue
     [ -n "$(ss -ltnH "sport = :$_p" 2>/dev/null)" ] || continue
@@ -309,67 +299,66 @@ $SPORT icecc-scheduler
 $((SPORT+1)) icecc-scheduler
 $DPORT iceccd
 EOF
-  # 非法配置要在申请集群之前挡住（review 0916b）：SR_NODE_JOBS 要么留空（按节点核数自动），要么正整数
+  # Validate before allocating: SR_NODE_JOBS must be empty (automatic) or a positive integer.
   if [ -n "${SR_NODE_JOBS:-}" ] && ! printf '%s' "$SR_NODE_JOBS" | grep -qE '^[1-9][0-9]*$'; then
     echo "!! SR_NODE_JOBS='$SR_NODE_JOBS' 非法：留空=按节点 CPU 核数自动定，或填正整数（如 6）。已中止，未申请集群。"; exit 1
   fi
   [ "${WORKERS:-0}" -ge 1 ] 2>/dev/null || { echo "!! WORKERS 必须是 ≥1 的整数（现为 '${WORKERS:-}'）"; exit 1; }
-  [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N "" -f "$KEY" -C sr-farm   # 专用密钥，不碰你个人的 ~/.ssh
+  [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N "" -f "$KEY" -C sr-farm   # Dedicated key; leave the user's personal ~/.ssh untouched.
   sched_ensure || exit 1
-  # review extra2#3：WORKERS 就是要申请的机器总数（用户按它估费用）。平台每个集群必带 1 台 FE，全部当 worker，
-  # 所以 BE 台数 = WORKERS-1，总数正好 = WORKERS（原来传 WORKERS 台 BE 再加 1 台 FE，写 5 实际开 6 台）。
-  # 绝不认领同名集群：创建前先查平台上有没有同名的。有就停下——本地没有 state.env 时 sr farm down 也释放不了它，
-  # 只能人工到平台核对（codex r13#2：原来 create 业务失败不报错、随后按名字找 CID，会把已存在的同名集群当成本次创建结果，
-  # 并对它跑 node-setup 停掉那批机器上的服务）。
+  # WORKERS is the total billable machine count. The platform requires one FE, which
+  # also acts as a worker, so request WORKERS-1 BEs.
+  # Never adopt an existing cluster by name. Without local state, down cannot safely
+  # release it, and provisioning could stop services on unrelated machines.
   PRE=$($API cid "$NAME" 2>/dev/null)
   if [ $CONT = 1 ]; then
-    # 续做时同名集群本来就该存在，而且必须正是我们记下的那一个。对不上说明记录和平台已经脱节，
-    # 这时候继续部署等于对别人的机器动手，停下来让人核对（自测抓到：同名守卫原本会把续做也一并挡掉）。
+    # A resumed initialization must find exactly the cluster recorded in local state.
+    # Stop on a mismatch rather than provisioning machines belonging to another cluster.
     [ "$PRE" = "$CID" ] || { echo "!! 记录里的 cluster_id=$CID，但平台上叫 $NAME 的是 ${PRE:-不存在}。"
                              echo "   两边对不上，不继续部署。请到平台核对后，sr farm down 清记录再重新 init。"; exit 1; }
   else
-    # 绝不认领同名集群
+    # Never adopt an existing cluster by name.
     [ -n "$PRE" ] && { echo "!! 平台上已存在同名集群 $NAME (id=$PRE)，不会认领它。"
                        echo "   若它是你的旧农场：先 sr farm down 释放；若本地已无记录，请到平台上核对后手工释放再重试。"; exit 1; }
   fi
   if [ $CONT = 0 ]; then
   echo "== 申请集群 $NAME（$WORKERS × $ITYPE，磁盘 ${DISK}G，全部当 worker；scheduler 跑在本容器）…"
-  # 创建失败只能断言"结果未确认"，不能断言"没建出来"：客户端返回非零也可能是平台已受理、只是响应超时/断连/解析失败，
-  # 那样会留下一台没有本地记录、无法 sr farm down 回收的计费集群（codex r15#1）。所以中止部署，但要求人工核对。
+  # A failed create response leaves the result uncertain: the platform may have
+  # accepted the request before a timeout or parsing failure. Stop provisioning and
+  # require manual verification so an untracked billable cluster is not overlooked.
   $API create "$NAME" "$(( WORKERS - 1 ))" 2 "$ITYPE" "$DISK" || {
     echo "!! 创建集群的请求未确认成功，已中止部署。"
     echo "   注意：这不代表平台上没建出来——响应超时或断连时集群可能已经创建并开始计费。"
     echo "   请按名字 $NAME 和创建时间到平台核对；若确实建出来了，手工释放后再重试 sr farm init。"; exit 1; }
-    # 自测抓到：原来要等完 Running 的那 15 分钟才取 CID、才落记录。这段时间里 Ctrl+C 或掉线，
-    # 集群已经在计费却没有任何本地记录，sr farm down 回收不了——正是 review#3 想堵的那个洞，只是堵晚了。
-    # 现在创建一返回就取 CID 并落最小记录；平台列表可能有几秒延迟，所以短轮询几次。
+    # Record the cluster ID immediately after creation, before waiting for Running.
+    # Otherwise interruption could leave a billable cluster that down cannot recover.
+    # Poll briefly because the platform's cluster list may lag behind creation.
     for i in $(seq 1 10); do ID=$($API cid "$NAME"); [ -n "$ID" ] && break; sleep 3; done
     [ -n "$ID" ] || { echo "!! 创建后取不到集群 $NAME 的 id（等了 30 秒）。可能创建未真正生效，也可能平台延迟。"
                       echo "   已中止，不做任何部署。请到平台核对是否有新建出来的 $NAME，有就手工释放后重试。"; exit 1; }
   fi
-  # review#3：拿到 CID 立刻落一份最小 state.env（initializing）。之后取节点/部署/连接检查任一步失败或被 Ctrl+C，
-  # sr farm down 都能凭这份 CID 回收集群；成功后下面再覆盖成完整记录。
-  # codex r15#2：这一步失败（盘满/不可写/mv 失败）原来被完全忽略，于是集群已经建出来在计费，本地却没有任何 CID 记录，
-  # sr farm down 无从回收。落盘失败必须立刻中止，并把 CID 和回收办法打给人。
+  # Save minimal state.env with the cluster ID and initializing status immediately.
+  # Then down can release the cluster if any later step fails or is interrupted.
+  # If saving fails, stop and report the ID and recovery steps; never silently leave
+  # a billable cluster without a local record.
   printf 'CLUSTER=%s\nCID=%s\nSCHED=%s\nWORKERS=%s\nNETNAME=%s\nSPORT=%s\nDPORT=%s\nFARM_STATUS=initializing\n' \
     "$NAME" "$ID" "$HOSTIP" "$WANTW" "$NETNAME" "$SPORT" "$DPORT" > "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE" || {
     rm -f "$STATE.tmp" 2>/dev/null
     echo "!! 写不下农场状态 $STATE（盘满？$FARM 不可写？），但集群已经建出来并开始计费。"
     echo "   集群名 $NAME，cluster_id=$ID。请到平台手工释放它，或腾出空间后用这个 id 重建记录。"
-    exit 1; }   # 原子写：读方不会看到半行
+    exit 1; }   # Atomic replacement prevents readers from seeing partial records.
   echo "== 等待 RUNNING（约 5-6 分钟）…"
-  # codex r15#7：原来不看等没等到就往下走。超时后平台可能还在 APPLYING，此时取到的节点列表是不全的，
-  # 后面又拿实际台数覆盖申请台数，于是"申请 5 台只回来 3 台"也会被报成就绪。
+  # Require Running before reading nodes. A timed-out APPLYING cluster may return
+  # an incomplete node list, which must not be mistaken for a fully provisioned farm.
   RUNOK=0
   for i in $(seq 1 45); do sleep 20; S=$($API row "$NAME"|cut -d'|' -f1); [ "$S" = Running ] && { RUNOK=1; break; }; done
-  # codex r15 终轮：超时（RUNOK!=1）时平台还在 APPLYING，这一步本来就静默失效，没必要发；
-  # 把就绪判定提到它前面，超时就直接停，不做无用调用。
+  # Check readiness before disabling cleanup; that API silently has no effect while APPLYING.
   if [ "$RUNOK" != 1 ]; then
     echo "!! 等了 15 分钟平台仍不是 Running（最后一次读到 '${S:-读不到}'）。已中止部署，状态留在 initializing。"
     echo "   集群 $ID 仍在——稍后**再跑一次 sr farm init** 会从断点继续，不会重新申请机器；确定不要了就 sr farm down 回收。"
     exit 1
   fi
-  # 必须在 RUNNING 之后调：APPLYING 阶段调用会静默失效（实测）
+  # Call only after RUNNING; the platform silently ignores it during APPLYING.
   $API op "$ID" disable_auto_release >/dev/null
   NODES=$($API nodes "$NAME")
   [ -n "$NODES" ] || { echo "取不到节点 IP，中止（集群 $ID 仍在，可 sr-farm down 清理）"; exit 1; }
@@ -381,9 +370,9 @@ EOF
   fi
   echo "   cluster_id=$ID  scheduler=$SCHED(本容器)  worker($NW): $NODES"
   echo "== 铺密钥 + 部署 icecc（顺便清掉 TSP 的 StarRocks：FE 的 -Xmx26g 会压垮 8c32g 节点）…"
-  # codex r15#6：provision_nodes 已经逐台收集了退出码，这里却整个忽略，只靠"连上几台"判成败。
-  # TCP 连上不等于配置写对了——节点上可能跑着旧配置的 daemon。两个条件都必须满足才算 running。
-  PROV_OK=1; provision_nodes 1 || PROV_OK=0   # 续做时也带 1：重复铺密钥是幂等的，而上次可能就断在铺密钥之前
+  # Require both successful provisioning and worker connections. A TCP connection
+  # alone does not prove the daemon loaded the intended configuration.
+  PROV_OK=1; provision_nodes 1 || PROV_OK=0   # Reinstall keys on retry too: it is idempotent, and the earlier attempt may have stopped before this step.
   WORKERS=$NW
   if wait_workers 30 && [ "$PROV_OK" = 1 ]; then INIT_STATUS=running
   else INIT_STATUS=degraded
@@ -391,7 +380,7 @@ EOF
        echo "!! 只有 $(dcount)/$NW 台 worker 连上 scheduler，已标 degraded。上面每行的 iceccd= 字段能看出哪台没装上。"
        echo "   修复：sr farm resume（会重新下发并校验）"
   fi
-  NCPU=$(node_jobs)   # 每台并发槽，供 sr-build 算总 J；nodes 已部署好，此处 ssh 能通
+  NCPU=$(node_jobs)   # Per-node slots for sr-build's total parallelism; SSH is available after provisioning.
   printf 'CLUSTER=%s\nCID=%s\nSCHED=%s\nNODES="%s"\nWORKERS=%s\nNCPU=%s\nNETNAME=%s\nSPORT=%s\nDPORT=%s\nFARM_STATUS=%s\n' \
          "$NAME" "$ID" "$SCHED" "$NODES" "$NW" "$NCPU" "$NETNAME" "$SPORT" "$DPORT" "$INIT_STATUS" > "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE" || {
     rm -f "$STATE.tmp" 2>/dev/null
@@ -399,19 +388,18 @@ EOF
     echo "   看门狗不会续约，它会在租期到点后被释放。腾出空间后再跑一次 sr farm init（会从断点继续）。"
     exit 1; }
   beat; wd_ensure
-  # 预热前先放生命周期锁：预热会编译几分钟，不该把 suspend/down 一直挡在外面（codex r9）
-  # 预热结果要参与就绪判定：原来无论预热跳过与否都打"农场就绪"，而跳过时 4 台 worker 的 speed 全是 0、
-  # scheduler 一个任务都不派，用户看到"就绪"却全压本机（2026-09-24 实测：远端 0/64，本容器 63 个 cc1plus）。
-  # codex 也独立指出"未完成预热不能伪装成全部就绪"。
+  # Release the lifecycle lock before warmup, which may take minutes, so suspend/down
+  # can proceed. Include warmup in readiness reporting: unscored workers may receive
+  # no tasks even though the cluster is running.
   { exec 8>&-; } 2>/dev/null; warm_workers; WARM_RC=$?
-  # 只影响报告，不改 FARM_STATUS：state.env 对它有白名单校验、看门狗也只认 running，
-  # 引入新状态值会破坏那两处。集群本身确实可用，"未预热"是使用姿势问题不是集群问题。
+  # Change only the report, not FARM_STATUS. State validation and the watchdog
+  # recognize running; incomplete warmup does not make the cluster itself unavailable.
   echo ""
   if [ "$INIT_STATUS" = degraded ]; then
     echo "== 初始化未完成（degraded）==============================="
   elif [ "${WARM_RC:-0}" = 2 ]; then
-    # 原来无论预热跳过与否都打"农场就绪"，而跳过时 4 台 worker 的 speed 全是 0、scheduler 一个任务都不派，
-    # 用户看到"就绪"却全压本机（2026-09-24 实测：远端 0/64，本容器 63 个 cc1plus 打满 16 核）。
+    # Report skipped warmup explicitly: zero-score workers may receive no tasks,
+    # leaving all compilation on the local container despite a running farm.
     echo "== 集群已建好，但【尚未预热】=============================="
     echo "   worker 的 speed 还是 0，scheduler 不会派活 —— 现在编译会全压本机。"
     echo "   跑一次 sr build（它会拉起本机 iceccd），再 sr farm rebalance 即可。"
@@ -430,16 +418,16 @@ EOF
   echo "======================================================"
   echo "== 看门狗每 ${RENEW_MIN} 分钟续约 ${RENEW_H} 小时；空闲 ${IDLE_MIN} 分钟自动休眠。"
   echo "   容器关闭 → 续约停止 → 农场 ${RENEW_H} 小时内自动释放。"
-  # review r7#8：degraded 已正确写入状态并保留看门狗以便恢复，但原来仍以最后一条 echo 的 0 退出，调用方以为成功
+  # Return failure for degraded readiness while preserving state and the watchdog for recovery.
   if [ "$INIT_STATUS" = degraded ]; then
     echo "!! 初始化未完成（degraded）：worker 未全部连上。状态与看门狗已保留，修好节点后 sr farm resume；本命令以非零退出。"; exit 2
   fi
   ;;
-# 资源视图：scheduler 文本口（端口 = SPORT+1，icecream 自带）+ 各节点 ssh 一跳 + 本容器 cgroup。--watch [秒] 循环刷新
+# Resource view: scheduler control port (SPORT+1), one SSH hop per node, and local cgroup. --watch [seconds] refreshes it.
 usage)
   [ -f "$STATE" ] || { echo "当前无农场"; exit 1; }
   { load_state || exit 1; }
-  CG=/sys/fs/cgroup   # sched_q 已提到全局定义
+  CG=/sys/fs/cgroup   # sched_q is defined globally.
   once(){
     local hdr cs jobs u0 u1 cores mem memmax
     cs=$(sched_q listcs 2>/dev/null); hdr=$(printf '%s\n' "$cs" | sed -n 's/^200-ICECC \([^:]*\): \([0-9]*\)s uptime, \([0-9]*\) hosts, \([0-9]*\) jobs in queue (\([0-9]*\) total).*/scheduler \1 · 已运行 \2s · \3 台 daemon · 排队 \4 · 累计派发 \5/p')
@@ -452,21 +440,21 @@ usage)
       | awk -v me="$HOSTIP" -v total="$total" '{tag=($2==me)?"(本机)":""; starving=($2!=me && $5+0==0 && total>200); if(starving) tag="<- 从未接到任务(speed=0)"; printf "   %-26s %-15s %-9s %5.1f%% %s %s\n", substr($1,1,26), $2, $3, $4/10, $5, tag; split($3,a,"/"); if($2!=me){cur+=a[1]; cap+=a[2]}; if(starving) idle++} END{printf "   远端合计 %d/%d 槽在用\n", cur, cap; if(idle>0) printf "   !! %d 台 worker 在 scheduler 已派发 %d 个任务后仍 speed=0：它一直没接到任务（多半是 env 缓存空，而 scheduler 有了其它主机的统计就不再试新主机）。\n      修复：sr farm rebalance（重启 scheduler，统计清零后随机分派、顺带给它装 env；进行中的任务会短暂回退本地）\n", idle, total}'
     jobs=$(sched_q listjobs 2>/dev/null | grep -vE '^200|^$'); [ -n "$jobs" ] && { echo "== 正在派发的任务（前 10）"; printf '%s\n' "$jobs" | head -10 | cut -c1-150 | sed 's/^/   /'; }
     echo "== 节点实际负载（ssh 一跳：loadavg 1m/5m · 内存 · 编译进程数）"
-    # 并行 ssh 但按 IP 排序输出：直接在子进程里打印的话，谁先返回谁先出现，每次刷新顺序都不一样，
-    # 盯 --watch 时很难比对。各自写进以 IP 命名的临时文件，全部结束后按 IP 的四段数值排序再打。
+    # Fetch node statistics in parallel but write each result to a temporary file
+    # named by IP. Print in numeric IP order so rows remain stable during --watch.
     NLD=$(mktemp -d /tmp/sr-nodeload.XXXXXX)
     for ip in $NODES; do
       ( r=$(timeout 8 ssh -n -i $KEY $SSHO $NUSER@$ip 'printf "%s %s|%s|%s|%s\n" $(cut -d" " -f1,2 /proc/loadavg) "$(free -m | awk "/^Mem:/{print \$3\"/\"\$2\"M\"}")" "$(pgrep -c cc1plus)" "$(nproc)"' 2>/dev/null)
         { [ -n "$r" ] && printf '   %-15s load %-12s mem %-14s cc1plus %-3s /%s 核\n' "$ip" "$(echo "$r"|cut -d'|' -f1)" "$(echo "$r"|cut -d'|' -f2)" "$(echo "$r"|cut -d'|' -f3)" "$(echo "$r"|cut -d'|' -f4)" \
                     || printf '   %-15s (ssh 不通)\n' "$ip"; } > "$NLD/$ip" ) &
     done; wait
-    # -t. -kN,Nn 四段各按数值排：纯字典序会把 .10 排在 .9 前面
+    # Sort all four IP components numerically; lexical order puts .10 before .9.
     for ip in $(printf '%s\n' $NODES | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n); do cat "$NLD/$ip" 2>/dev/null; done
     rm -rf "$NLD"
     echo "== 本容器"
     u0=$(awk '/^usage_usec/{print $2}' $CG/cpu.stat 2>/dev/null); sleep 1; u1=$(awk '/^usage_usec/{print $2}' $CG/cpu.stat 2>/dev/null)
     cores=$(awk -v a="${u0:-0}" -v b="${u1:-0}" 'BEGIN{printf "%.1f", (b-a)/1000000}')
-    # memory.current 含页缓存，空闲时也有十几 G，看 anon 才是编译真占的
+    # memory.current includes page cache; anon better reflects actual compiler memory use.
     mem=$(awk '/^anon /{print $2}' $CG/memory.stat 2>/dev/null || echo 0); memmax=$(cat $CG/memory.max 2>/dev/null || echo max)
     printf '   CPU %s 核在用 / 配额 %s   内存(anon) %.1fG / %s   本地 cc1plus %s\n' "$cores" "$(awk '{printf "%d", $1/$2}' $CG/cpu.max 2>/dev/null || echo ?)" "$(echo "${mem:-0}" | awk '{print $1/1073741824}')" "$([ "$memmax" = max ] && echo 不限 || echo "$memmax" | awk '{printf "%.0fG", $1/1073741824}')" "$(pgrep -c cc1plus)"
     local t; for f in /farm/sr-build.*.lock; do [ -e "$f" ] || continue; t=$(cat "$f.tree" 2>/dev/null); ( exec 8>"$f"; flock -n 8 ) 2>/dev/null || echo "   正在编译: ${t:-?}"; done
@@ -476,8 +464,8 @@ usage)
 status)
   [ -f "$STATE" ] || { echo "当前无农场"; exit 1; }
   { load_state || exit 1; }
-  # codex r15#11：原来 read <<< "$(...)" 把 API 的退出码丢了，于是"查询失败"和"集群真的没了"都表现为空状态，
-  # 一律建议清记录重建——凭据过期或网络抖一下就可能让人误删还活着的农场记录。先分开拿输出和退出码。
+  # Capture API output and exit status separately. A failed query must not look like
+  # a missing cluster and prompt removal of a valid farm record after a transient error.
   ROW=$($API row "$CLUSTER"); RROW=$?
   if [ $RROW -ne 0 ]; then
     echo "!! 查询平台失败（$API row 退出码 $RROW），无法确认集群 $CLUSTER (id=$CID) 现在的状态。"
@@ -485,7 +473,7 @@ status)
     exit 1
   fi
   IFS='|' read -r S T N <<<"$ROW"
-  # 查得到但这一行是空的 = 集群已不在（到期释放/被清扫），本地记录只是残影
+  # A successful query with no matching row means the cluster was released or cleaned up; only local state remains.
   if [ -z "$S" ]; then
     echo "!! 集群 $CLUSTER (id=$CID) 在平台上已不存在——很可能到期被释放（看门狗停过 3 小时以上？）。"
     echo "   本地记录状态=$FARM_STATUS 已失效。处理：sr farm down 清记录，再 sr farm init 重建。"
@@ -493,8 +481,8 @@ status)
   fi
   LB=$(stat -c %Y $FARM/last-build 2>/dev/null || echo 0)
   sched_ensure; D=$(dcount)
-  # 看门狗"进程还在"不等于"续约还成着"：凭据过期时它会一直在跑却一次也续不上（codex r15#3）。
-  # 所以把最近一次成功续约的时刻一起报出来，超过两个续约周期就明说不正常。
+  # A running watchdog does not prove renewals succeed. Report the last successful
+  # renewal and flag an age exceeding two renewal intervals.
   LR=$(cat "$FARM/.last-renew" 2>/dev/null); LR=${LR//[!0-9]/}
   if [ -n "$LR" ]; then
     RAGE=$(( ($(date +%s)-LR)/60 ))
@@ -509,23 +497,21 @@ status)
 resume|up)
   lifecycle_lock
   { load_state || exit 1; }
-  # review r7 存疑1：init 拿到 CID 后失败会留下 initializing（无 NODES），原地恢复超出逐条修补范围，明确挡住并指路
-  # initializing 由 init 自己认领续做（codex r15 复查#3）：resume 处理不了"还没拿到节点"的阶段
+  # Only init can continue an initializing farm that may not yet have nodes.
+  # Direct the user there instead of attempting resume.
   [ "${FARM_STATUS:-}" = initializing ] && { echo "!! 上次 sr farm init 未完成（状态 initializing）。再跑一次 sr farm init 会从断点继续，不会重新申请机器；确定不要了就 sr farm down 回收"; exit 1; }
   [ "${FARM_STATUS:-}" = releasing ] && { echo "!! 农场正在释放（上次 sr farm down 未确认完成），先 sr farm down 清理后再 init"; exit 1; }
   sched_ensure || exit 1
   pstate(){ $API row "$CLUSTER" 2>/dev/null | cut -d'|' -f1; }
-  # 平台还在 Updating（上一次 suspend 没落定）时发 start 会被静默丢掉（踩过：4 分钟后仍 Suspended）。
-  # 先等它落定，再 start，再轮询到 Running——每一步都实测，不猜。
+  # Wait for a pending suspend operation to settle before starting. The platform
+  # may silently ignore start while Updating; then wait explicitly for Running.
   for i in $(seq 1 30); do case "$(pstate)" in Updating|Stopping|Starting) sleep 5;; *) break;; esac; done
   [ "$(pstate)" = Running ] || $API op "$CID" start >/dev/null
   for i in $(seq 1 36); do [ "$(pstate)" = Running ] && break; sleep 5; done
   [ "$(pstate)" = Running ] || { echo "!! 平台 3 分钟内未到 Running（现在 $(pstate)），稍后再试 sr farm resume"; exit 1; }
-  # 状态必须实测，不能靠记录：原来 90 次循环超时也照样写 running，sr-build 便按 -j56 开工，
-  # 实际 worker 一台没连上，全落本地（踩过：跑了 21 分钟才发现是配置写错了）
-  # codex r15 复查#2：上次因"部署脚本失败但都连上了"标成 degraded 的农场，如果这里让 wait_workers
-  # 直接成功就跳过部署、写回 running，那个"连上了但配置可能没写对"的状态就永远被绕过去了。
-  # degraded 必须重新下发并校验过才能回到 running。
+  # Verify actual worker readiness before recording running; saved state alone is
+  # not enough. A degraded farm must be provisioned and verified again even if all
+  # workers reconnect, since a live daemon may still have stale configuration.
   if [ "${FARM_STATUS:-}" = degraded ]; then
     echo "== 上次标记为 degraded，强制重新下发节点配置（不能只看连接数）…"
     PROV_OK=1; provision_nodes 0 || PROV_OK=0
@@ -541,7 +527,7 @@ resume|up)
     echo "农场就绪：$WORKERS 台 worker 已连"
   else
     echo "== 120 秒内 worker 未全部连上（$(dcount)/$WORKERS），重新下发节点配置修复…"
-    # codex r15#6：部署脚本报失败时，即使随后都连上了也不能算修好——连上的可能是带着旧配置的 daemon。
+    # Provisioning failure remains a failure even if all daemons connect; they may be using old configuration.
     PROV_OK=1; provision_nodes 0 || PROV_OK=0
     if wait_workers 45 && [ "$PROV_OK" = 1 ]; then echo "修复后就绪：$WORKERS 台 worker 已连"
     else
@@ -552,15 +538,15 @@ resume|up)
       exit 1
     fi
   fi
-  # review latest#4：手动 resume 要重置空闲计时，否则看门狗按休眠前的 last-build 算空闲、刚醒又睡，用户拿不到 15 分钟准备窗口
+  # Reset the idle timer on manual resume so the watchdog does not immediately suspend the farm again.
   beat; sed -i 's/^FARM_STATUS=.*/FARM_STATUS=running/' "$STATE"; wd_ensure
-  { exec 8>&-; } 2>/dev/null; warm_workers ;;   # 放锁后再预热（休眠唤醒同样会让 worker 重新注册，可能出现零任务的机器）
+  { exec 8>&-; } 2>/dev/null; warm_workers ;;   # Release the lock before warmup; resumed workers may have lost their speed scores.
 suspend)
   lifecycle_lock
   { load_state || exit 1; }
-  # codex r15#4：看门狗那边"判空闲"和"真正动手"之间有窗口，构建可能刚好在这中间开工。
-  # 自动路径带 --if-idle，在拿到生命周期锁之后再复核一次；人手动 sr farm suspend 不带这个标志，照做不误。
-  # 复核之后到平台调用之间仍有毫秒级窗口，这是刻意接受的：判错的代价是白睡一次（构建退回本地），不是数据损坏。
+  # Automatic suspend passes --if-idle and rechecks activity under the lifecycle
+  # lock, since a build may start after the watchdog's initial check. Manual suspend
+  # is unconditional. A small remaining race is acceptable: builds fall back locally.
   if [ "${2:-}" = --if-idle ]; then
     LBN=$(stat -c %Y "$FARM/last-build" 2>/dev/null || echo 0)
     IDLEN=$(( ($(date +%s)-LBN)/60 ))
@@ -568,8 +554,8 @@ suspend)
       echo "$(date '+%F %T') 复核时发现有构建在跑（或刚开工 ${IDLEN} 分钟），取消这次自动休眠"; exit 0
     fi
   fi
-  # review#4：原来不看返回码就写 suspended——机器其实还在跑，看门狗却以为睡了、不再尝试休眠还继续续约。失败就保持原状态并返回非零，
-  # 下个空闲周期会再试（tspapi op 业务失败/HTTP 失败都以非零退出）
+  # Record suspended only after a successful platform operation. On failure, retain
+  # state and return nonzero so the next idle cycle can retry.
   if $API op "$CID" stop >/dev/null; then
     sed -i 's/^FARM_STATUS=.*/FARM_STATUS=suspended/' "$STATE"; echo "已休眠（仍继续续约，否则睡着也会到期）"
   else
@@ -578,15 +564,17 @@ suspend)
 down|release)
   lifecycle_lock
   if [ -f "$STATE" ]; then { load_state || exit 1; }
-    # 先看平台上还在不在（第二次 down 时集群可能已经没了，先发 release 会报错、本地记录永远清不掉）。
-    # exists 的退出码：0=存在(打印状态) 1=不存在 2=查询失败——查询失败绝不能当成"已消失"
+    # Check existence first so repeated down can clear state after the cluster is gone.
+    # exists returns 0 for present, 1 for absent, and 2 for query failure; never treat
+    # a failed query as proof that the cluster disappeared.
     $API exists "$CID" >/dev/null 2>&1; EX=$?
     case $EX in
       1) echo "平台上已无集群 $CID，清理本地记录" ;;
       2) echo "!! 查询平台失败，无法确认，保留状态（CID=$CID），稍后重试 sr farm down"; exit 1 ;;
       0) $API op "$CID" release >/dev/null || { echo "!! 释放请求失败，保留状态（CID=$CID），稍后重试 sr farm down"; exit 1; }
-         # "请求返回了"不等于"平台接受了"。只认两种证据：集群消失，或状态变成释放类（Releas*/Delet*/Destroy*/Terminat*/Remov*）。
-         # 观察到之前不标 releasing、不停续约；60 秒后仍是 Running/Suspended 就当释放被拒，状态原样保留（review：业务拒绝不能当释放中）。
+         # A returned request is not proof of acceptance. Wait for disappearance or a release
+         # state (Releas*/Delet*/Destroy*/Terminat*/Remov*) before marking releasing or
+         # stopping renewals. If neither appears within 60 seconds, retain the original state.
          ST=""; EX=0
          for i in $(seq 1 12); do sleep 5; ST=$($API exists "$CID" 2>/dev/null); EX=$?
            [ $EX = 0 ] || break
@@ -606,28 +594,28 @@ down|release)
   fi
   pkill -f "[s]r-farm _watchdog" 2>/dev/null
   rm -f "$STATE"; echo "已释放并停止看门狗" ;;
-# 重启 scheduler：icecc 有了各主机的统计后不再"试"没统计的新主机（比如 env 缓存被清过的 worker），它会一直零任务。
-# 重启后统计清零，前几轮随机分派，顺带把 env 装到所有主机。进行中的编译会短暂回退本地（软降级），几秒后恢复。
+# Restart the scheduler to reset scores that can starve new or unscored workers.
+# Initial assignments repopulate environments across workers. Active builds briefly
+# fall back to local compilation until connections recover.
 rebalance)
   lifecycle_lock; [ -f "$STATE" ] || { echo "当前无农场"; exit 1; }; { load_state || exit 1; }
   pkill -x icecc-scheduler 2>/dev/null; sleep 1; sched_ensure || exit 1
   echo "scheduler 已重启（:$SPORT）。worker 在 1~3 分钟内重连…"
-  { exec 8>&-; } 2>/dev/null; warm_workers   # 重启 scheduler 正是"重连晚的那台被饿死"的高发时刻，直接预热掉
+  { exec 8>&-; } 2>/dev/null; warm_workers   # Warm up after restart so late reconnecting workers do not remain unscored and starved.
   echo "完成。sr farm usage 里各台 speed 应都 > 0" ;;
 _wd) wd_ensure; exit 0 ;;
 _watchdog)
-  # 单例锁，持有整个进程生命周期；拿不到说明已经有一个在跑，直接退出。
-  # fd 6 专供此用：8 是生命周期锁、9 是 sr-build 的构建锁（wd_ensure 已经关掉了）。
+  # Hold the singleton lock for the watchdog's entire lifetime; exit if already held.
+  # Reserve fd 6 for this lock; fd 8 is the lifecycle lock and fd 9 the build lock.
   { exec 6>"$FARM/watchdog.lock"; } 2>/dev/null || { echo "$(date '+%F %T') 打不开看门狗单例锁，退出" >>"$LOGF"; exit 1; }
-  # 拿不到锁通常就是已经有一个在跑；但也可能是某个继承了 fd 6 的子进程还攥着（上面各处 6>&- 就是为了
-  # 杜绝这种情况，但预热等路径仍可能短暂继承）。所以先重试几次再放弃（codex r15 复查#1 / 终轮）。
+  # Retry briefly: another watchdog usually holds the lock, but a short-lived child
+  # may still have inherited fd 6. Persistent children explicitly close it.
   WDGOT=0
   for _i in 1 2 3 4 5; do flock -n 6 && { WDGOT=1; break; }; sleep 3; done
   if [ $WDGOT = 0 ]; then
-    # 这里不再试图判断"是不是真有另一个看门狗在跑"。codex r15 终轮指出 pgrep 会匹配到自己；
-    # 而排掉自己之后仍会匹配到 timeout / setsid 之类带着同样命令行的包装进程（自测抓到），
-    # 判不准。告警的意义是让卡住的情形可见，宁可多记一行：真有另一个看门狗时这行只是噪音，
-    # 而 wd_ensure 已经用 pgrep 做过快速路径，正常情况下根本不会走到这里。
+    # Log lock contention without trying to identify another watchdog with pgrep.
+    # It can match this process or timeout/setsid wrappers, so attribution is unreliable.
+    # wd_ensure already handles the common case with a fast process check.
     echo "$(date '+%F %T') 拿不到看门狗单例锁（重试 15 秒）。若确有另一个看门狗在跑，这行可忽略；" >>"$LOGF"
     echo "$(date '+%F %T')   否则可能有子进程继承了锁 fd，续约会停摆——下次 sr build 会再拉一次，或手动 sr farm resume" >>"$LOGF"
     exit 0
@@ -635,50 +623,50 @@ _watchdog)
   RENEW_FAILS=0
   while true; do
     [ -f "$STATE" ] || exit 0
-    # 热加载站点配置：看门狗是常驻进程，只在启动时读一次的话，改了 IDLE_MIN/RENEW_MIN/RENEW_H 同步进来也不生效
-    # （codex r8 存疑1）。放在 load_state 之前，两者键不重叠。
-    # 复位到"纯环境"基线再 source，配置里删掉的项才能回到默认值（re-source 不会清除已消失的变量）
+    # Reload site configuration each cycle so timer changes reach the persistent
+    # watchdog. Reset to the original environment first: sourcing alone does not clear
+    # removed settings. Load before state.env; their keys do not overlap.
     IDLE_MIN=$ENVBASE_IDLE_MIN; RENEW_MIN=$ENVBASE_RENEW_MIN; RENEW_H=$ENVBASE_RENEW_H
     [ -f "$SRCONF" ] && { set -a; . "$SRCONF"; set +a; }
     IDLE_MIN=${IDLE_MIN:-15}; RENEW_MIN=${RENEW_MIN:-15}; RENEW_H=${RENEW_H:-3}
     load_state || { echo "$(date '+%F %T') state.env 解析失败（损坏或被篡改），看门狗退出，停止续约" >>"$LOGF"; exit 1; }
-    # 正在释放的集群不能再续约/唤醒：看门狗自己识别状态退出，不依赖 down 那一次 pkill
+    # Stop renewing or waking a releasing cluster; do not rely solely on down having killed the watchdog.
     [ "${FARM_STATUS:-}" = releasing ] && { echo "$(date '+%F %T') 农场正在释放，看门狗停止续约并退出" >>"$LOGF"; exit 0; }
     [ "${FARM_STATUS:-}" = running ] && sched_ensure
-    # codex r15#3：原来续约的退出码和输出全丢掉，凭据过期或平台不可达时看门狗照样"在跑"，
-    # 而节点会在租期到点后被平台释放——正编到一半农场没了，还找不到任何线索。
-    # 现在：记成功时间、连续失败计数，失败就写日志并缩短下一轮间隔；status 会把这些读出来。
+    # Record successful renewal time and consecutive failures. Log errors and retry
+    # sooner so expired credentials or platform outages are visible through status
+    # before the lease expires during a build.
     RWAIT=$RENEW_MIN
-    if RENEW_ERR=$($API op "$CID" renew $RENEW_H 2>&1 >/dev/null); then   # 重置为 now+RENEW_H 小时
+    if RENEW_ERR=$($API op "$CID" renew $RENEW_H 2>&1 >/dev/null); then   # Reset expiry to now + RENEW_H hours.
       RENEW_FAILS=0; date +%s > "$FARM/.last-renew" 2>/dev/null; chmod 666 "$FARM/.last-renew" 2>/dev/null
     else
-      RENEW_FAILS=$((RENEW_FAILS+1)); RWAIT=1        # 失败后一分钟就重试，别等满一个周期
+      RENEW_FAILS=$((RENEW_FAILS+1)); RWAIT=1        # Retry failures after one minute rather than waiting a full renewal interval.
       echo "$(date '+%F %T') !! 续约失败（连续第 $RENEW_FAILS 次）：${RENEW_ERR:0:200}" >>"$LOGF"
       [ "$RENEW_FAILS" = 3 ] && echo "$(date '+%F %T') !! 已连续 3 次续约失败，农场会在租期到点后被平台释放。请检查 ~/.tsp 凭据与平台可达性。" >>"$LOGF"
     fi
-    # 平台每天 0 点把 auto-release 重置为 true，不重发的话农场会在某天 22 点被清掉。
-    # 幂等且便宜，索性每轮都发一次。
+    # The platform resets auto-release at midnight and may clean up the farm at 22:00.
+    # Reapply this inexpensive, idempotent setting each cycle.
     $API op "$CID" disable_auto_release >/dev/null 2>&1 \
       || echo "$(date '+%F %T') !! disable_auto_release 失败，农场可能在 22 点被平台清扫" >>"$LOGF"
-    # 手动唤醒钩子：仓库里没有任何地方写这个文件，它是留给人用的——
-    # `touch /farm/resume-request` 就能让看门狗在下一轮把农场叫醒，不必自己去跑 sr farm resume。
+    # Manual wakeup hook: touch /farm/resume-request to request resume on the next
+    # watchdog cycle. No repository code creates this file automatically.
     if [ -f "$FARM/resume-request" ]; then
       rm -f "$FARM/resume-request"; "$0" resume >>"$LOGF" 2>&1 6>&-
     else
       LB=$(stat -c %Y $FARM/last-build 2>/dev/null || echo 0)
       IDLE=$(( ($(date +%s)-LB)/60 ))
-      # codex r15#4：这里判完到 suspend 真正动手之间有个窗口，新构建可能刚好在这中间开工。
-      # 所以只在这里做粗筛，最终判据交给 suspend 在生命周期锁内复核一次（--if-idle）。
-      # 6>&-：别把看门狗的单例锁带进子进程，否则它活着的时候锁一直被占。
+      # This is only a preliminary idle check; suspend rechecks under its lifecycle lock
+      # with --if-idle in case a build has started. Close fd 6 in the child so it cannot
+      # retain the watchdog's singleton lock.
       if [ "$IDLE" -ge "$IDLE_MIN" ] && [ "${FARM_STATUS:-}" = running ] && ! busy; then
         echo "$(date '+%F %T') 空闲 ${IDLE} 分钟 -> 休眠" >>"$LOGF"
         SR_IDLE_MIN_AT_DECIDE=$IDLE_MIN "$0" suspend --if-idle >>"$LOGF" 2>&1 6>&-
       fi
     fi
-    # scheduler 探活要比续费勤得多：它一死，所有任务立刻退回本地（实测仍能编完、
-    # 不会 OOM，因为本地 daemon 把并发卡在 -m 16），但全程降级。等 15 分钟才发现太亏了。
+    # Check scheduler health more frequently than lease renewal. Its failure sends all
+    # tasks to the local daemon, which still limits parallelism but reduces throughput.
     for _ in $(seq 1 $((RWAIT))); do
-      sleep 60 6>&-      # sleep 是子进程，继承了单例锁会让"杀掉看门狗后立刻重起"最多失败 60 秒
+      sleep 60 6>&-      # Close the singleton lock in sleep so restarting a killed watchdog does not have to wait up to 60 seconds.
       [ -f "$STATE" ] || exit 0
       [ "${FARM_STATUS:-}" = running ] && { sched_ensure; warm_if_starving; }
     done

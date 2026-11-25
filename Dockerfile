@@ -1,17 +1,18 @@
-# 单镜像：一个容器编所有版本。
-#   版本差异靠两样东西解决，都不需要换容器：
-#     - thirdparty: 公共目录 $SR_TPDIR/<digest>/ 整体挂成 /tp，编译时把所选版本 bind 到规范路径 /var/local/thirdparty
-#     - 编译器:     镜像里备齐 gcc 11/12/13/14，用哪个由 STARROCKS_GCC_HOME 指
-#   这样 scheduler 和 iceccd 常驻不被杀，多版本还能并发编。
-# base 用 toolchains 而不是 dev-env：官方 dev-env 自己就是 FROM toolchains 再加编好的 thirdparty，
-# 我们按版本挂 thirdparty，所以只要 toolchains 那层（2.56G vs 14G），cmake/JDK/maven 版本由上游维护。
-# base 镜像与 apt 源由 sr image 从 srdev.conf 以 --build-arg 传入，这里只是兜底默认值
+# One image and one persistent container serve all supported versions.
+# Mount the shared $SR_TPDIR cache at /tp, then bind the selected digest's
+# thirdparty installation to /var/local/thirdparty for each build.
+# Bundle GCC 11/12/13/14 and select the compiler through STARROCKS_GCC_HOME.
+# This keeps the scheduler and iceccd running while different versions build concurrently.
+# Use the toolchains base rather than dev-env: dev-env adds prebuilt thirdparty,
+# which we mount per version instead. The smaller base retains upstream CMake/JDK/Maven.
+# sr image passes the base and apt mirror from srdev.conf as build arguments;
+# the values here are fallbacks.
 ARG BASE=starrocks/toolchains-ubuntu:main-latest
 FROM ${BASE}
 ARG APT_MIRROR=
 
-# 内网机器常连不上 archive.ubuntu.com（apt-get update 会静默挂很久）：APT_MIRROR 非空时换源。
-# 22.04 用 sources.list，24.04 用 deb822 的 *.sources，两种都处理。
+# Use APT_MIRROR when the default Ubuntu repositories are unreachable.
+# Handle both sources.list on 22.04 and deb822 *.sources on 24.04.
 RUN if [ -n "$APT_MIRROR" ]; then \
       sed -i "s|http://\(archive\|security\).ubuntu.com|http://$APT_MIRROR|g" \
         /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null; true; fi; \
@@ -23,15 +24,15 @@ RUN if [ -n "$APT_MIRROR" ]; then \
       gcc-11 g++-11 gcc-12 g++-12 gcc-13 g++-13 \
  && rm -rf /var/lib/apt/lists/*
 
-# 老分支（如 3.x）的 CMake 只链 -lbfd，而 24.04 的 binutils 把 sframe 拆了出去，
-# 会缺 sframe_* 符号。把 libsframe 的 object 合进 libbfd.a，对新分支无害。
+# Older branches link only -lbfd, but Ubuntu 24.04 splits sframe into a separate
+# library. Merge its objects into libbfd.a to resolve sframe_* symbols; newer branches remain compatible.
 RUN cd /tmp && mkdir -p mbfd && cd mbfd \
  && ar x /usr/lib/x86_64-linux-gnu/libbfd.a \
  && ar x /usr/lib/x86_64-linux-gnu/libsframe.a \
  && ar rcs /usr/lib/x86_64-linux-gnu/libbfd.a *.o \
  && cd / && rm -rf /tmp/mbfd
 
-# env.sh 用 $STARROCKS_GCC_HOME/bin/gcc，给每个版本造一个只含自己的 bin 目录
+# env.sh uses $STARROCKS_GCC_HOME/bin/gcc; provide a separate bin directory for each version.
 RUN for v in 11 12 13; do mkdir -p /opt/gcc$v/bin \
       && ln -sf /usr/bin/gcc-$v /opt/gcc$v/bin/gcc \
       && ln -sf /usr/bin/g++-$v /opt/gcc$v/bin/g++ \
@@ -53,9 +54,9 @@ COPY files/linkgate    /usr/local/bin/linkgate
 COPY files/tspapi.py   /usr/local/bin/tspapi.py
 COPY files/node-setup.sh /usr/local/bin/node-setup.sh
 
-# 每个 gcc 版本各生成一份 icecc 工具链包：客户端把自己的编译器传给 worker，
-# 所以编 3.5 时传 gcc11 的包、编 main 时传 gcc14 的包，不能混
-# 任何一份生成失败即镜像构建失败——运行时绝不拿别的 gcc 的包顶替（worker 用错编译器且不报错）
+# Build one icecc toolchain archive per GCC version. Workers must receive the
+# same compiler as the client, such as GCC 11 for 3.5 and GCC 14 for main.
+# Fail the image build if any archive is missing; substituting another compiler can silently miscompile code.
 RUN set -e; TS=$(ls -d /opt/gcc-toolset-* 2>/dev/null); [ -n "$TS" ] || { echo "base image has no /opt/gcc-toolset-*"; exit 1; }; \
     mkdir -p /opt/icecc; \
     for g in /opt/gcc11 /opt/gcc12 /opt/gcc13 $TS; do \
@@ -66,11 +67,11 @@ RUN set -e; TS=$(ls -d /opt/gcc-toolset-* 2>/dev/null); [ -n "$TS" ] || { echo "
       echo "toolchain $n: $(ls *.tar.gz)"; \
     done
 
-# 挂载点：每次编译在私有 mount ns 里把 /tp/<digest>/installed bind 到这里（thirdparty 的规范路径）
+# Each build bind-mounts /tp/<digest>/installed here in a private mount namespace.
 RUN mkdir -p /var/local/thirdparty/installed
-# clangd / LLDB 使用 LLVM 20；clangd 18 在泛型 lambda 的约束检查中会崩溃。
-# libclang-rt-20-dev 提供 ASAN 配置需要的 sanitizer/*.h。
-# 工具运行库独立于 SR thirdparty 中的 LLVM；signed-by 将密钥限定于官方 LLVM 源。
+# Use LLVM 20 for clangd/LLDB; clangd 18 can crash during generic-lambda constraint checks.
+# libclang-rt-20-dev supplies sanitizer/*.h for ASAN configuration.
+# These tool runtimes are independent of thirdparty's LLVM; signed-by scopes the key to the LLVM repository.
 RUN set -e; . /etc/os-release; \
     install -d -m 755 /usr/share/keyrings; \
     curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 \
